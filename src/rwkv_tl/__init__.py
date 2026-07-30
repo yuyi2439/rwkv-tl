@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .kernels.tile_kernels import fused_lerp6
 from .tokenizer import Tokenizer
 
 # Precomputed constant for the w decay gate: exp(-sigmoid(...) / sqrt(e)).
@@ -109,9 +110,6 @@ def DPLR_RWKV(
 
     Returns:
         (y, S): output `[H, N]` and updated state `[H, N, N]`.
-
-    Callers:
-        - `rwkv_tl.__init__:RWKV7.make_TMIX`: each layer's state update.
     """
     S = (
         torch.einsum("hvk,hk->hvk", S, W)
@@ -212,14 +210,8 @@ class RWKV7:
     def make_TMIX(self, i: int):
         p, W, H, N = f"blocks.{i}.att.", self.W, self.H, self.N
         lnW, lnB = W[f"blocks.{i}.ln1.weight"], W[f"blocks.{i}.ln1.bias"]
-        x_r, x_w, x_k, x_v, x_a, x_g = (
-            W[p + "x_r"],
-            W[p + "x_w"],
-            W[p + "x_k"],
-            W[p + "x_v"],
-            W[p + "x_a"],
-            W[p + "x_g"],
-        )
+        # Weights stored as (1,1,N_EMBD); flatten to 1D for the fused LERP kernel.
+        x_x = tuple(W[p + n].reshape(-1) for n in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"))
         rW, kW, vW, oW = (
             W[p + "receptance.weight"].T,
             W[p + "key.weight"].T,
@@ -252,8 +244,8 @@ class RWKV7:
         ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
             x = LAYER_NORM(x0, lnW, lnB)
             prev, state["x"] = state["x"], x
-            xr, xw, xk = LERP(x, prev, x_r), LERP(x, prev, x_w), LERP(x, prev, x_k)
-            xv, xa, xg = LERP(x, prev, x_v), LERP(x, prev, x_a), LERP(x, prev, x_g)
+            # Fuse 6 token-shift LERPs into a single tilelang kernel.
+            xr, xw, xk, xv, xa, xg = fused_lerp6(x, prev, *x_x)
 
             r, k, v = xr @ rW, xk @ kW, xv @ vW
             if v_first is None:
@@ -280,7 +272,7 @@ class RWKV7:
         lnW, lnB, x_k, kW, vW = (
             W[f"blocks.{i}.ln2.weight"],
             W[f"blocks.{i}.ln2.bias"],
-            W[p + "x_k"],
+            W[p + "x_k"].reshape(-1),  # Flatten (1,1,N_EMBD) -> 1D to match TMIX fused_lerp6.
             W[p + "key.weight"].T,
             W[p + "value.weight"].T,
         )
