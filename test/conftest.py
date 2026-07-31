@@ -1,6 +1,10 @@
-"""Shared pytest fixtures for rwkv-tl tests."""
+"""Shared pytest fixtures for rwkv-tl tests.
+
+RWKV_CHECKPOINT_PATH must be set to a valid RWKV7 checkpoint path for tests that require a model checkpoint.
+"""
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +23,10 @@ def repo_root() -> Path:
 
 @pytest.fixture(scope="session")
 def ckpt_path() -> str:
-    return "/home/yuyi2439/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth"
+    ckpt_path = os.environ.get("RWKV_CHECKPOINT_PATH")
+    if not ckpt_path:
+        raise RuntimeError("RWKV_CHECKPOINT_PATH must be set for tests that need a checkpoint")
+    return ckpt_path
 
 
 @pytest.fixture(scope="session")

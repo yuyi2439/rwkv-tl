@@ -6,10 +6,10 @@ divergence, the two must be bit-exact.
 """
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
-from rwkv_tl.kernels.tile_kernels import fused_lerp6
+from rwkv_tl.kernels import fused_lerp6
 
 N_EMBD = 768
 SEED_BASE = 42
