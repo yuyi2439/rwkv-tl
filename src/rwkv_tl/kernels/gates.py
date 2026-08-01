@@ -83,23 +83,6 @@ def _fused_a_kk_k(
 _fused_a_kk_k_kernel = tilelang.compile(_fused_a_kk_k, out_idx=[5, 6, 7])
 
 
-@T.prim_func
-def _fused_neg_kk_a(
-    kk: T.Tensor((C,), "bfloat16"),
-    a: T.Tensor((C,), "bfloat16"),
-    b: T.Tensor((C,), "bfloat16"),
-):
-    """Fused negation + multiply: B = -kk * a."""
-    for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):
-        for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-            i = bx * BLOCK + tx
-            if i < C:
-                b[i] = T.cast(-(T.cast(kk[i], "float32") * T.cast(a[i], "float32")), "bfloat16")
-
-
-_fused_neg_kk_a_kernel = tilelang.compile(_fused_neg_kk_a, out_idx=[2])
-
-
 # --------------------------------------------------------------------------- #
 #  Python wrappers with CPU fallback
 # --------------------------------------------------------------------------- #
@@ -158,16 +141,3 @@ def fused_a_kk_k(
     return _fused_a_kk_k_kernel(a0, a_x, k, k_k, k_a)
 
 
-def fused_neg_kk_a(kk: Tensor, a: Tensor) -> Tensor:
-    """Fused negation + multiply: B = -kk * a.
-
-    Args:
-        kk: Normalized kk, [C].
-        a: Activation gate, [C].
-
-    Returns:
-        B: -kk * a, [C], bf16.
-    """
-    if kk.device.type != "cuda":
-        return -kk * a
-    return _fused_neg_kk_a_kernel(kk, a)

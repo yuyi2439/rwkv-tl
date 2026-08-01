@@ -11,6 +11,7 @@ import tilelang.language as T
 from torch import Tensor
 
 from ._common import BLOCK
+from .gemm import fused_rkv_gemm
 
 C = T.dynamic("C")
 
@@ -88,24 +89,6 @@ _fused_lerp6_copy_kernel = tilelang.compile(_fused_lerp6_copy, out_idx=[9, 10, 1
 
 
 @T.prim_func
-def _fused_lerp1(
-    x: T.Tensor((C,), "bfloat16"),
-    prev: T.Tensor((C,), "bfloat16"),
-    w: T.Tensor((C,), "bfloat16"),
-    out: T.Tensor((C,), "bfloat16"),
-):
-    """Fused single LERP: out = x + w * (prev - x)."""
-    for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):
-        for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-            i = bx * BLOCK + tx
-            if i < C:
-                out[i] = x[i] + w[i] * (prev[i] - x[i])
-
-
-_fused_lerp1_kernel = tilelang.compile(_fused_lerp1, out_idx=[3])
-
-
-@T.prim_func
 def _fused_lerp1_copy(
     x: T.Tensor((C,), "bfloat16"),
     prev: T.Tensor((C,), "bfloat16"),
@@ -175,22 +158,6 @@ def fused_lerp6_copy(
     return _fused_lerp6_copy_kernel(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
 
 
-def fused_lerp1(x: Tensor, prev: Tensor, w: Tensor) -> Tensor:
-    """Fused single LERP: out = x + w * (prev - x).
-
-    Args:
-        x: Current value, [C].
-        prev: previous value, [C].
-        w: LERP weight, [C].
-
-    Returns:
-        Interpolated value, [C], bf16.
-    """
-    if x.device.type != "cuda":
-        return x + w * (prev - x)
-    return _fused_lerp1_kernel(x, prev, w)
-
-
 def fused_lerp1_copy(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tensor:
     """Fused single LERP + copy x to x_copy buffer (in-place).
 
@@ -233,8 +200,6 @@ def fused_lerp6_rkv_copy(
     Returns:
         (r, k, v, xv, xw, xa, xg), each [C].
     """
-    from .gemm import fused_rkv_gemm
-
     xr, xw, xk, xv, xa, xg = fused_lerp6_copy(
         x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
     )

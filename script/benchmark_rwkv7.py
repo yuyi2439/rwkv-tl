@@ -454,20 +454,35 @@ def run_benchmark(args):
 
         try:
             for B, T in parsed_cases:
-                if mode == "decode":
-                    if B != 1:
-                        print(
-                            f"SKIP label={target}({device.type}) B={B} T={T} reason=graph_decoder_requires_B1",
-                            flush=True,
+                if mode == "decode" and B != 1:
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} reason=graph_decoder_requires_B1",
+                        flush=True,
+                    )
+                    continue
+                try:
+                    if mode == "decode":
+                        p10, p50, p90, tok_s = bench_case_graph_decoder(
+                            model, T, args.warmup, args.iters
                         )
-                        continue
-                    p10, p50, p90, tok_s = bench_case_graph_decoder(
-                        model, T, args.warmup, args.iters
+                    else:
+                        p10, p50, p90, tok_s = bench_case(
+                            model, B, T, args.warmup, args.iters, device
+                        )
+                except RuntimeError as exc:
+                    # A single case OOM-ing must not abort the whole benchmark
+                    # run; skip it and keep going so later (smaller) cases and
+                    # other targets still get measured.
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} reason=oom",
+                        flush=True,
                     )
-                else:
-                    p10, p50, p90, tok_s = bench_case(
-                        model, B, T, args.warmup, args.iters, device
-                    )
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device=device)
+                        torch.cuda.empty_cache()
+                    continue
                 _print_row(
                     f"{target}({device.type})", B, T, args.iters, p10, p50, p90, tok_s
                 )
