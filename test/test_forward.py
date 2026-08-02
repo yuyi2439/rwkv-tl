@@ -1,92 +1,85 @@
-"""End-to-end forward numerical consistency: tilelang vs pure-torch LERP.
+"""End-to-end forward numerical consistency: rwkv_tl vs pure-torch reference.
 
-Runs the full RWKV7 forward over a fixed 32-token sequence twice:
-  1. with the integrated tilelang fused_lerp6
-  2. with fused_lerp6 monkey-patched to a pure-torch 6x LERP reference
+Runs the full RWKV7 forward over a fixed 32-token sequence through both the
+rwkv_tl implementation (tilelang fused kernels) and the pure-PyTorch reference
+(``script/pure_torch_rwkv7.py``), on both the batched-prefill path and the
+per-token decode path.
 
-Acceptance: bit-exact logits (max_abs == 0), matching argmax and top-5 set.
+The fused kernels accumulate in fp32 but cast to bf16 at the store and evaluate
+gates in a fused kernel rather than discrete torch ops, so the two are not
+bit-exact. Acceptance: matching argmax and top-5 token sets, with the logit
+difference bounded by a loose tolerance (observed ~0.2 on 0.1B).
 """
+
 from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
-import rwkv_tl
 from rwkv_tl import RWKV7
+
+# The pure-torch reference lives under script/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "script"))
+from pure_torch_rwkv7 import RWKV7Torch
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
+MAX_ABS_TOL = 4.0  # bf16 rounding across 12 recurrent layers stays << this
 
 
-def _lerp6_ref(x, prev, x_r, x_w, x_k, x_v, x_a, x_g):
-    """Pure-torch 6x LERP, signature-matched to fused_lerp6."""
-    diff = prev - x
-    return (
-        x + x_r * diff,
-        x + x_w * diff,
-        x + x_k * diff,
-        x + x_v * diff,
-        x + x_a * diff,
-        x + x_g * diff,
-    )
-
-
-def _run_forward(model: RWKV7, tokens: list[int]) -> torch.Tensor:
-    # zero_state must run under the cuda device context so state tensors land on
-    # GPU; tilelang kernels require cuda inputs.
+def _run_decode(model, tokens) -> torch.Tensor:
     with torch.device("cuda"):
         S = model.zero_state()
-        logits, _ = model.forward(tokens, S)
+        logits = None
+        for t in tokens:
+            logits, S = model._eager_run_one(t, S)
+    return logits.float().cpu()
+
+
+def _run_prefill(model, tokens) -> torch.Tensor:
+    with torch.device("cuda"):
+        S = model.zero_state()
+        logits, _ = model.forward_prefill(tokens, S)
     return logits.float().cpu()
 
 
 @pytest.fixture(scope="module")
-def model(ckpt_path: str, vocab_path: str) -> RWKV7:
+def models(ckpt_path: str, vocab_path: str) -> tuple[RWKV7, RWKV7Torch]:
     with torch.device("cuda"):
-        return RWKV7(ckpt_path, vocab_path)
+        return RWKV7(ckpt_path, vocab_path), RWKV7Torch(ckpt_path, vocab_path)
 
 
-def test_forward_logits_bit_exact(model: RWKV7) -> None:
-    """Forward logits must be bit-identical between tilelang and torch LERP."""
-    logits_tl = _run_forward(model, TOKENS)
-
-    orig = rwkv_tl.fused_lerp6
-    rwkv_tl.fused_lerp6 = _lerp6_ref
-    try:
-        logits_ref = _run_forward(model, TOKENS)
-    finally:
-        rwkv_tl.fused_lerp6 = orig
-
-    diff = (logits_tl - logits_ref).abs()
-    assert diff.max().item() == 0.0, f"max_abs={diff.max().item()}"
-    assert diff.mean().item() == 0.0, f"mean_abs={diff.mean().item()}"
+def _assert_consistent(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:
+    diff = (got - ref).abs()
+    assert diff.max().item() <= MAX_ABS_TOL, (
+        f"{label}: max_abs={diff.max().item()} (tol={MAX_ABS_TOL})"
+    )
+    assert int(got.argmax()) == int(ref.argmax()), (
+        f"{label}: argmax mismatch {int(got.argmax())} vs {int(ref.argmax())}"
+    )
+    top5_got = set(torch.topk(got, 5).indices.tolist())
+    top5_ref = set(torch.topk(ref, 5).indices.tolist())
+    assert top5_got == top5_ref, f"{label}: top-5 mismatch"
 
 
-def test_forward_argmax_match(model: RWKV7) -> None:
-    """Argmax of final logits must match between the two implementations."""
-    logits_tl = _run_forward(model, TOKENS)
-
-    orig = rwkv_tl.fused_lerp6
-    rwkv_tl.fused_lerp6 = _lerp6_ref
-    try:
-        logits_ref = _run_forward(model, TOKENS)
-    finally:
-        rwkv_tl.fused_lerp6 = orig
-
-    assert int(logits_tl.argmax()) == int(logits_ref.argmax())
+def test_decode_consistent(models) -> None:
+    """Per-token decode must match the pure-torch reference (argmax/top-5)."""
+    tl, ref = models
+    _assert_consistent(_run_decode(tl, TOKENS), _run_decode(ref, TOKENS), "decode")
 
 
-def test_forward_top5_match(model: RWKV7) -> None:
-    """Top-5 token set of final logits must match between implementations."""
-    logits_tl = _run_forward(model, TOKENS)
+def test_prefill_consistent(models) -> None:
+    """Batched prefill must match the pure-torch reference (argmax/top-5)."""
+    tl, ref = models
+    _assert_consistent(_run_prefill(tl, TOKENS), _run_prefill(ref, TOKENS), "prefill")
 
-    orig = rwkv_tl.fused_lerp6
-    rwkv_tl.fused_lerp6 = _lerp6_ref
-    try:
-        logits_ref = _run_forward(model, TOKENS)
-    finally:
-        rwkv_tl.fused_lerp6 = orig
 
-    top5_tl = set(torch.topk(logits_tl.reshape(-1), 5).indices.tolist())
-    top5_ref = set(torch.topk(logits_ref.reshape(-1), 5).indices.tolist())
-    assert top5_tl == top5_ref
+def test_decode_matches_prefill(models) -> None:
+    """Decode and prefill paths of the same model must agree."""
+    tl, _ = models
+    _assert_consistent(
+        _run_decode(tl, TOKENS), _run_prefill(tl, TOKENS), "decode-vs-prefill"
+    )

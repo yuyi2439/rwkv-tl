@@ -23,6 +23,7 @@ Args via argparse:
     --cases: comma-separated BxT cases
     --warmup / --iters: warmup and timing iterations
 """
+
 from __future__ import annotations
 
 import argparse
@@ -203,7 +204,12 @@ def _build_materialized_checkpoint(checkpoint_path: Path, device: torch.device) 
 
 
 def bench_case(
-    model, batch_size: int, seq_len: int, warmup: int, iters: int, device: torch.device
+    model,
+    batch_size: int,
+    seq_len: int,
+    warmup: int,
+    iters: int,
+    device: torch.device,
 ):
     """对单个 (B, T) 用例做 warmup + iters 次前向计时。
 
@@ -319,7 +325,9 @@ def build_project_model(checkpoint_path: Path, vocab_path: Path, device: torch.d
     return model
 
 
-def build_pure_torch_model(checkpoint_path: Path, vocab_path: Path, device: torch.device):
+def build_pure_torch_model(
+    checkpoint_path: Path, vocab_path: Path, device: torch.device
+):
     """Build the pure PyTorch RWKV7 baseline on the requested device."""
     tmp_path = _build_materialized_checkpoint(checkpoint_path, device)
 
@@ -418,10 +426,14 @@ def run_benchmark(args):
 
     for target in targets:
         if target == "faster3a_2607":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "faster3a_2607 requires CUDA, but it is unavailable"
+            # Albatross is CUDA-only: skip (not error) when unavailable or when
+            # the user explicitly requested --device cpu for tl/pure.
+            if rwkv_device.type != "cuda" or not torch.cuda.is_available():
+                print(
+                    f"SKIP label=faster3a_2607 reason=cuda_only_device={rwkv_device.type}",
+                    flush=True,
                 )
+                continue
             model = build_fast_model(
                 Path(args.fast_script) / "rwkv7_fast_v3a.py", args.project_checkpoint
             )
@@ -440,8 +452,13 @@ def run_benchmark(args):
             device = rwkv_device
             mode = "forward"
         elif target == "graph_decoder":
-            if not torch.cuda.is_available():
-                raise RuntimeError("graph_decoder requires CUDA, but it is unavailable")
+            # GraphDecoder is CUDA-only: skip when unavailable or --device cpu.
+            if rwkv_device.type != "cuda" or not torch.cuda.is_available():
+                print(
+                    f"SKIP label=graph_decoder reason=cuda_only_device={rwkv_device.type}",
+                    flush=True,
+                )
+                continue
             model = build_graph_decoder(Path(args.project_checkpoint), Path(args.vocab))
             device = torch.device("cuda")
             mode = "decode"
@@ -501,7 +518,9 @@ def main():
         - 命令行: `python script/benchmark_rwkv7.py`
     """
     default_vocab = str(REPO_ROOT / "asset" / "rwkv_vocab_v20230424.txt")
-    parser = argparse.ArgumentParser(description="Benchmark multiple RWKV7 implementations")
+    parser = argparse.ArgumentParser(
+        description="Benchmark multiple RWKV7 implementations"
+    )
     parser.add_argument(
         "--project-checkpoint",
         default=os.environ.get("RWKV_CHECKPOINT_PATH"),
@@ -524,7 +543,7 @@ def main():
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="仅作用于 rwkv_tl 实现: cpu | cuda",
+        help="Controls rwkv_tl/pure_torch device: cpu | cuda. CUDA-only targets (faster3a_2607, graph_decoder) auto-skip on cpu.",
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
@@ -535,7 +554,9 @@ def main():
     args = parser.parse_args()
 
     if not args.project_checkpoint:
-        parser.error("--project-checkpoint is required or RWKV_CHECKPOINT_PATH must be set")
+        parser.error(
+            "--project-checkpoint is required or RWKV_CHECKPOINT_PATH must be set"
+        )
     parsed_targets = parse_targets(args.targets)
     if "faster3a_2607" in parsed_targets and not args.fast_script:
         parser.error("--fast-script is required or RWKV_FAST_SCRIPT_PATH must be set")

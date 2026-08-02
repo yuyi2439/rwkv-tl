@@ -7,6 +7,7 @@ Usage:
 
 Extra argv after the script name is forwarded to pytest.
 """
+
 from __future__ import annotations
 
 import sys

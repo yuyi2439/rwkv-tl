@@ -15,6 +15,10 @@ The weight tensor is pre-stacked once at model construction ([3, C, C]) and
 passed in directly, so neither the tilelang nor the bmm path re-stacks per call.
 A single compilation serves any RWKV7 model via T.dynamic shapes (C and T_LEN).
 """
+
+# tilelang's @T.prim_func DSL uses call expressions (T.Tensor(...)) in type
+# positions and tilelang-only intrinsics; pyright cannot type-check those.
+# pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
 import torch
@@ -34,8 +38,8 @@ def _torch_bmm_rkv(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
     to cuBLAS strided batched GEMM with fp32 accumulation, which is bit-exact
     with three separate mm calls but saves two kernel launches.
     """
-    Xb = torch.stack([xr, xk, xv], dim=0)        # [3, T, C]
-    return torch.bmm(Xb, Wb)                     # [3, T, C]
+    Xb = torch.stack([xr, xk, xv], dim=0)  # [3, T, C]
+    return torch.bmm(Xb, Wb)  # [3, T, C]
 
 
 def _gpu_supports_tl_bf16_gemm() -> bool:
@@ -80,7 +84,7 @@ def _try_compile_tl_rkv():
     try:
         import tilelang
         import tilelang.language as T
-    except Exception:
+    except Exception:  # noqa: BLE001  (tilelang optional; fall back to bmm)
         _TL_AVAILABLE = False
         return None
     _TL_AVAILABLE = True
@@ -131,10 +135,8 @@ def _try_compile_tl_rkv():
             T.copy(C_local, rkv[bz, by * BLOCK_M, bx * BLOCK_N])
 
     try:
-        _TL_RKV_KERNEL = tilelang.compile(
-            _fused_rkv_gemm, out_idx=[4], target=target
-        )
-    except Exception:
+        _TL_RKV_KERNEL = tilelang.compile(_fused_rkv_gemm, out_idx=[4], target=target)
+    except Exception:  # noqa: BLE001  (compilation failure -> bmm fallback)
         _TL_RKV_KERNEL = None
     return _TL_RKV_KERNEL
 

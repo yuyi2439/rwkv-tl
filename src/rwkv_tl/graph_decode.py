@@ -8,6 +8,7 @@ time on MX450), this gives the largest single speedup.
 Requires in-place state updates (see ``RWKV7.reset_state``) so that state
 tensor addresses stay fixed across replays.
 """
+
 from __future__ import annotations
 
 import torch
@@ -67,6 +68,7 @@ class GraphDecoder:
         """
         self.token_buf[0] = token_id
         self.graph.replay()
+        assert self.logits is not None
         return self.logits
 
     # ------------------------------------------------------------------ #

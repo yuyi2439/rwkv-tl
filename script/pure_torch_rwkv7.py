@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from rwkv_tl._compat import maybe_torch_compile
 from rwkv_tl.tokenizer import Tokenizer
 
 
@@ -80,6 +81,9 @@ class RWKV7Torch:
             (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
             for i in range(self.n_layer)
         ]
+        # torch.compile is applied lazily by the @maybe_torch_compile decorator
+        # on run_one (native-bf16 devices only). Eager refs kept for testing.
+        self._eager_run_one = self.run_one.__wrapped__.__get__(self, type(self))
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -115,6 +119,7 @@ class RWKV7Torch:
     def HEAD(self, X: Tensor) -> Tensor:
         return self.head @ X
 
+    @maybe_torch_compile
     def run_one(
         self, token: int, S: list[list[dict[str, Tensor]]]
     ) -> tuple[Tensor, list[list[dict[str, Tensor]]]]:

@@ -5,6 +5,7 @@ Kernels are split by function: LERP chains (lerp.py), elementwise gates
 residual, DPLR state update (dplr.py). All kernels use T.dynamic shapes so a
 single compilation serves any RWKV7 model.
 """
+
 from __future__ import annotations
 
 from .dplr import (

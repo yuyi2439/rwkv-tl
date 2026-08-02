@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import TypedDict
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from . import operators  # noqa: F401  (registers torch.library custom ops)
+from ._compat import maybe_torch_compile, supports_native_bf16
 from .kernels import (
     fused_a_kk_k,
     fused_dplr,
@@ -16,6 +21,41 @@ from .kernels import (
     fused_w_gate,
 )
 from .tokenizer import Tokenizer
+
+
+class _TmixCache(TypedDict):
+    lnW: Tensor
+    lnB: Tensor
+    x_x: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+    oW: Tensor
+    rWt_stack: Tensor
+    oWt: Tensor
+    w0: Tensor
+    w1: Tensor
+    w2: Tensor
+    a0: Tensor
+    a1: Tensor
+    a2: Tensor
+    v0: Tensor
+    v1: Tensor
+    v2: Tensor
+    g1: Tensor
+    g2: Tensor
+    k_k: Tensor
+    k_a: Tensor
+    r_k: Tensor
+    ln_xW: Tensor
+    ln_xB: Tensor
+
+
+class _CMixCache(TypedDict):
+    lnW: Tensor
+    lnB: Tensor
+    x_k: Tensor
+    kW: Tensor
+    vW: Tensor
+    kWt: Tensor
+    vWt: Tensor
 
 
 def SIGMOID(x: Tensor) -> Tensor:
@@ -61,7 +101,7 @@ def LAYER_NORM(x: Tensor, w: Tensor, b: Tensor) -> Tensor:
     Returns:
         The normalized tensor.
     """
-    return F.layer_norm(x, (x.shape[-1],), w, b, 1e-5)
+    return F.layer_norm(x, (x.shape[-1],), w, b)
 
 
 def GROUP_NORM(x: Tensor, w: Tensor, b: Tensor, eps: float) -> Tensor:
@@ -142,17 +182,29 @@ class RWKV7:
             W["ln_out.bias"],
             W["head.weight"],  # [V, C] contiguous; HEAD does head @ x
         )
-        self._tmix_cache: dict[int, dict[str, Tensor | tuple[Tensor, ...]]] = {}
-        self._cmix_cache: dict[int, dict[str, Tensor]] = {}
+        self._tmix_cache: dict[int, _TmixCache] = {}
+        self._cmix_cache: dict[int, _CMixCache] = {}
         self._init_layer_caches(W)
+        # The decode closures dispatch through the registered custom ops
+        # (rwkv_tl::*) only when torch.compile is enabled for this device, so
+        # dynamo can trace a single graph. On devices where we stay eager
+        # (no native bf16), the closures call the raw tilelang kernels to avoid
+        # the per-call custom-op dispatch overhead.
+        use_custom_ops = supports_native_bf16(self.emb.device.type)
+        self._use_custom_ops = use_custom_ops
         self.layers = [
-            (self.make_TMIX(i), self.make_CMIX(i)) for i in range(self.n_layer)
+            (self.make_TMIX(i, use_custom_ops), self.make_CMIX(i, use_custom_ops))
+            for i in range(self.n_layer)
         ]
         # Prefill path is built eagerly, but both paths reuse shared caches.
         self.layers_batch = [
             (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
             for i in range(self.n_layer)
         ]
+        # torch.compile is applied lazily by the @maybe_torch_compile decorator
+        # on run_one (native-bf16 devices only, e.g. sm_80+ / AMD MI). The
+        # eager method is kept for testing and comparison.
+        self._eager_run_one = self.run_one.__wrapped__.__get__(self, type(self))  # type: ignore[attr-defined]
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
@@ -190,9 +242,10 @@ class RWKV7:
                     v.zero_()
         return S
 
-    def HEAD(self, X: Tensor) -> Tensor:
-        return self.head @ X
+    def HEAD(self, x: Tensor) -> Tensor:
+        return self.head @ x
 
+    @maybe_torch_compile
     def run_one(
         self, token: int, S: list[list[dict[str, Tensor]]]
     ) -> tuple[Tensor, list[list[dict[str, Tensor]]]]:
@@ -205,13 +258,15 @@ class RWKV7:
         Returns:
             Updated logits and state.
         """
-        X = self.EMB(token)
+        x = self.EMB(token)
         v_first: Tensor | None = None
 
         for (TM, CM), s in zip(self.layers, S):
-            X, v_first, s[0] = TM(X, v_first, s[0])
-            X, s[1] = CM(X, s[1])
-        return self.HEAD(self.NORM(X)), S
+            x, v_first, s[0] = TM(x, v_first, s[0])
+            x, s[1] = CM(x, s[1])
+
+        x = LAYER_NORM(x, self.ln_outW, self.ln_outB)
+        return self.HEAD(x), S
 
     def forward(
         self,
@@ -289,13 +344,13 @@ class RWKV7:
                 "vWt": W[p_ffn + "value.weight"].T,
             }
 
-    def _get_tmix_cache(self, i: int) -> dict[str, Tensor | tuple[Tensor, ...]]:
+    def _get_tmix_cache(self, i: int) -> _TmixCache:
         return self._tmix_cache[i]
 
-    def _get_cmix_cache(self, i: int) -> dict[str, Tensor]:
+    def _get_cmix_cache(self, i: int) -> _CMixCache:
         return self._cmix_cache[i]
 
-    def make_TMIX(self, i: int):
+    def make_TMIX(self, i: int, use_custom_ops: bool):
         H, N = self.H, self.N
         c = self._get_tmix_cache(i)
         lnW, lnB = c["lnW"], c["lnB"]
@@ -309,47 +364,73 @@ class RWKV7:
         k_k, k_a, r_k = c["k_k"], c["k_a"], c["r_k"]
         ln_xW, ln_xB = c["ln_xW"], c["ln_xB"]
 
+        # Dispatch through the registered custom ops only when torch.compile is
+        # active (dynamo traces them as single-graph nodes). Eager calls go
+        # straight to the raw tilelang kernels to avoid the custom-op dispatch
+        # overhead per kernel launch.
+        _rkv: Callable[
+            ..., tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+        ]
+        _akk: Callable[..., tuple[Tensor, Tensor, Tensor]]
+        _l2kk: Callable[..., tuple[Tensor, Tensor]]
+        _vgate: Callable[..., Tensor]
+        _wgate: Callable[..., Tensor]
+        _gn: Callable[..., Tensor]
+        if use_custom_ops:
+            _rkv = torch.ops.rwkv_tl.fused_lerp6_rkv_copy
+            _vgate = torch.ops.rwkv_tl.fused_v_gate
+            _wgate = torch.ops.rwkv_tl.fused_w_gate
+            _akk = torch.ops.rwkv_tl.fused_a_kk_k
+            _l2kk = torch.ops.rwkv_tl.fused_l2norm_neg_kk_a
+            _gn = torch.ops.rwkv_tl.fused_gn_rkrk
+        else:
+            _rkv = fused_lerp6_rkv_copy
+            _vgate = fused_v_gate
+            _wgate = fused_w_gate
+            _akk = fused_a_kk_k
+            _l2kk = fused_l2norm_neg_kk_a
+            _gn = fused_gn_rkrk
+
+        def _dplr(
+            rnn: Tensor,
+            r: Tensor,
+            w: Tensor,
+            k: Tensor,
+            v: Tensor,
+            kk: Tensor,
+            b: Tensor,
+        ) -> Tensor:
+            if use_custom_ops:
+                return torch.ops.rwkv_tl.fused_dplr(rnn, r, w, k, v, kk, b)
+            y, _ = fused_dplr(rnn, r, w, k, v, kk, b)
+            return y
+
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
         ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
             x = LAYER_NORM(x0, lnW, lnB)
             prev = state["x"]
-            r, k, v, xv, xw, xa, xg = fused_lerp6_rkv_copy(
-                x, prev, *x_x, state["x"], rWt_stack
-            )
+            r, k, v, xv, xw, xa, xg = _rkv(x, prev, *x_x, state["x"], rWt_stack)
 
             if v_first is None:
                 v_first = v
             else:
-                v = fused_v_gate(v, v_first, v0, xv @ v1 @ v2)
-            w = fused_w_gate(torch.tanh(xw @ w1) @ w2, w0)
-            a, kk, k = fused_a_kk_k(a0, xa @ a1 @ a2, k, k_k, k_a)
+                v = _vgate(v, v_first, v0, xv @ v1 @ v2)
+            w = _wgate(torch.tanh(xw @ w1) @ w2, w0)
+            a, kk, k = _akk(a0, xa @ a1 @ a2, k, k_k, k_a)
             r, w, k, v, kk, a = [z.reshape(H, N) for z in (r, w, k, v, kk, a)]
-            # Fused L2-normalize + neg*kk*a: replaces L2_RWKV + fused_neg_kk_a
-            B = fused_l2norm_neg_kk_a(kk, a)
-            y, _ = fused_dplr(state["rnn"], r, w, k, v, kk, B)
-            # state["rnn"] is updated in-place by fused_dplr; no copy needed.
+            # Fused L2-normalize + neg*kk*a: B = -kk_norm * a, and returns the
+            # normalized kk for the DPLR A term (S@kk_norm@(-kk_norm*a)).
+            kk_norm, B = _l2kk(kk, a)
+            y = _dplr(state["rnn"], r, w, k, v, kk_norm, B)
+            # state["rnn"] is updated in-place by _dplr; no copy needed.
             # Fused GroupNorm + r*k*r_k residual: replaces GROUP_NORM + y+=
-            y = fused_gn_rkrk(y, r, k, v, r_k, ln_xW, ln_xB)
+            y = _gn(y, r, k, v, r_k, ln_xW, ln_xB)
             g = torch.sigmoid(xg @ g1) @ g2
             # addmv fuses (x0 + oW @ (y*g)) into a single GEMV+bias call
-            return torch.addmv(x0, oW, (y * g)), v_first, state
-
-        return layer
-
-    def make_CMIX(self, i: int):
-        c = self._get_cmix_cache(i)
-        lnW, lnB = c["lnW"], c["lnB"]
-        x_k, kW, vW = c["x_k"], c["kW"], c["vW"]
-
-        def layer(
-            x0: Tensor, state: dict[str, Tensor]
-        ) -> tuple[Tensor, dict[str, Tensor]]:
-            x_ln = LAYER_NORM(x0, lnW, lnB)
-            prev = state["x"]
-            # Fused single LERP + copy x_ln to state["x"] in-place.
-            x = fused_lerp1_copy(x_ln, prev, x_k, state["x"])
-            return torch.addmv(x0, vW, RELUSQ(torch.mv(kW, x))), state
+            # v_first is always a Tensor here: the None case is replaced with v
+            # above and the else branch narrows it to Tensor.
+            return torch.addmv(x0, oW, (y * g)), v_first, state  # type: ignore[return-value]
 
         return layer
 
@@ -405,12 +486,15 @@ class RWKV7:
 
             r, w, k, v, kk, a = [z.view(T_len, H, N) for z in (r, w, k, v, kk, a)]
             den = torch.sqrt((kk * kk).sum(dim=2, keepdim=True))
-            B = -(kk / torch.clamp(den, min=1e-12)) * a
+            kk_norm = kk / torch.clamp(den, min=1e-12)
+            B = -kk_norm * a
 
             # DPLR: serial over T (state-dependent), reuses fused_dplr kernel.
             y = torch.empty(T_len, H, N, dtype=x0.dtype, device=x0.device)
             for t in range(T_len):
-                y_t, _ = fused_dplr(state["rnn"], r[t], w[t], k[t], v[t], kk[t], B[t])
+                y_t, _ = fused_dplr(
+                    state["rnn"], r[t], w[t], k[t], v[t], kk_norm[t], B[t]
+                )
                 y[t] = y_t
 
             y_flat = F.group_norm(y.reshape(T_len, H * N), H, ln_xW, ln_xB, 64e-5)
@@ -418,6 +502,25 @@ class RWKV7:
             y_out = (y_flat.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
             g = torch.sigmoid(xg @ g1) @ g2
             return x0 + (y_out * g) @ oWt, v_first, state
+
+        return layer
+
+    def make_CMIX(self, i: int, use_custom_ops: bool):
+        c = self._get_cmix_cache(i)
+        lnW, lnB = c["lnW"], c["lnB"]
+        x_k, kW, vW = c["x_k"], c["kW"], c["vW"]
+        _lerp1 = (
+            torch.ops.rwkv_tl.fused_lerp1_copy if use_custom_ops else fused_lerp1_copy
+        )
+
+        def layer(
+            x0: Tensor, state: dict[str, Tensor]
+        ) -> tuple[Tensor, dict[str, Tensor]]:
+            x_ln = LAYER_NORM(x0, lnW, lnB)
+            prev = state["x"]
+            # Fused single LERP + copy x_ln to state["x"] in-place.
+            x = _lerp1(x_ln, prev, x_k, state["x"])
+            return torch.addmv(x0, vW, RELUSQ(torch.mv(kW, x))), state
 
         return layer
 
@@ -456,9 +559,9 @@ class RWKV7:
         if tok.numel() == 0:
             raise RuntimeError("forward_prefill received an empty token sequence")
         # GPU tensor indexing keeps the whole prefill path CUDA-side (graph-safe).
-        X = self.emb[tok]
+        x = self.emb[tok]
         v_first: Tensor | None = None
         for (TM, CM), s in zip(self.layers_batch, S):
-            X, v_first, s[0] = TM(X, v_first, s[0])
-            X, s[1] = CM(X, s[1])
-        return self.HEAD(self.NORM(X[-1])), S
+            x, v_first, s[0] = TM(x, v_first, s[0])
+            x, s[1] = CM(x, s[1])
+        return self.HEAD(self.NORM(x[-1])), S

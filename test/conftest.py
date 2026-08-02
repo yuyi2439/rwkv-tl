@@ -2,6 +2,7 @@
 
 RWKV_CHECKPOINT_PATH must be set to a valid RWKV7 checkpoint path for tests that require a model checkpoint.
 """
+
 from __future__ import annotations
 
 import os
@@ -25,7 +26,9 @@ def repo_root() -> Path:
 def ckpt_path() -> str:
     ckpt_path = os.environ.get("RWKV_CHECKPOINT_PATH")
     if not ckpt_path:
-        raise RuntimeError("RWKV_CHECKPOINT_PATH must be set for tests that need a checkpoint")
+        raise RuntimeError(
+            "RWKV_CHECKPOINT_PATH must be set for tests that need a checkpoint"
+        )
     return ckpt_path
 
 

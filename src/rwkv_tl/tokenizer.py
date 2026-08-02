@@ -61,6 +61,7 @@ class Tokenizer:
         src_len = len(src)
         while idx < src_len:
             u = root_to[src[idx]]
+            assert u is not None
             j = idx + 1
             token = u.token
             end = j

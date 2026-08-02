@@ -4,6 +4,7 @@ Compares the fused kernel against the plain torch LERP form `x + w*(prev-x)`
 on bf16/cuda. Since the kernel uses the identical expression with no algorithmic
 divergence, the two must be bit-exact.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -36,5 +37,5 @@ def test_fused_lerp6_exact(seed: int) -> None:
 
     for name, r, o in zip(("xr", "xw", "xk", "xv", "xa", "xg"), ref, got):
         assert torch.equal(r, o), (
-            f"{name} not bit-exact: max_abs={(r-o).abs().max().item()}"
+            f"{name} not bit-exact: max_abs={(r - o).abs().max().item()}"
         )

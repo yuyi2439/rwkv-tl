@@ -5,12 +5,18 @@ head count H vary by model size (e.g. 0.1B: C=768,H=12; 0.4B: C=1024,H=16).
 Reduction kernels use T.dynamic for H and elementwise kernels for C, so a
 single compilation serves any RWKV7 model.
 """
+
 from __future__ import annotations
 
-import math
-
-HEAD_DIM = 64                  # N: per-head dimension, constant across RWKV7
-BLOCK = 256                    # threads per block for elementwise kernels
-WARP = 32                      # warp width (matches warp_reduce_sum)
-SERIAL = HEAD_DIM // WARP      # 2: elements processed per thread in [H, N] kernels
-_SQRT_E = math.sqrt(math.e)    # exp decay gate constant
+HEAD_DIM = 64  # N: per-head dimension, constant across RWKV7
+BLOCK = 256  # threads per block for elementwise kernels
+# Logical warp width for tilelang's `warp_reduce_sum`. tilelang lowers this to
+# 32-lane shuffles on BOTH NVIDIA and AMD (see src/tl_templates/{cuda,hip}/reduce.h;
+# the HIP backend intentionally keeps 32-lane logical-warp semantics on CDNA
+# wave64). So 32 is correct on every backend, and the [H, N] reduction kernels
+# run one logical warp per block with 32 threads. Do NOT set this to the AMD
+# hardware wavefront (64): tilelang's reduce would then cover only lanes 0-31
+# and silently drop half the reduction. If tilelang ever adds a true wave64
+# reduce, bump WARP here and the kernels' `threads=`.
+WARP = 32
+SERIAL = HEAD_DIM // WARP  # 2: elements processed per thread in [H, N] kernels

@@ -1,0 +1,32 @@
+name: Publish Package to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build package
+        run: uv build
+
+      - name: Verify version consistency
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(grep '^version' pyproject.toml | head -1 | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          echo "Tag: v${TAG_VERSION}, Package: ${PKG_VERSION}"
+          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "Version mismatch!"
+            exit 1
+          fi
+
+      - name: Publish to PyPI
+        run: uv publish --token ${{ secrets.PYPI_API_TOKEN }}
