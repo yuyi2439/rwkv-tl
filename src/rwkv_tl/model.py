@@ -104,7 +104,14 @@ class RWKV7Weight(nn.Module):
 
     def __init__(self, model_path: str, device: str | torch.device | None = None):
         super().__init__()
+        # Checkpoints are bf16; convert to fp16 once at load (Albatross
+        # approach): fp16 tensor cores work on sm_75+, and fp16's 10-bit mantissa
+        # beats bf16's 7-bit. Accumulation stays fp32 inside every kernel.
         W = torch.load(model_path, map_location=device)
+        W = {
+            k: v.to(torch.float16) if isinstance(v, torch.Tensor) else v
+            for k, v in W.items()
+        }
 
         self.emb = W["emb.weight"]
         self.head = W["head.weight"]

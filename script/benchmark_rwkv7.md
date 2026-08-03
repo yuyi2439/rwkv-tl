@@ -20,7 +20,7 @@ uv run python script/benchmark_rwkv7.py \
 | GPU (目标卡) | NVIDIA RTX 3060 (sm_86, 12GB GDDR6) |
 | GPU (旧参考) | NVIDIA MX450 (sm_75, 2GB GDDR6) |
 | 模型 | rwkv7-g1d-0.1b (C=768, H=12, L=12), rwkv7-g1d-0.4b (C=1024, H=16, L=24) |
-| 精度 | bfloat16 (CUDA), float32 (CPU) |
+| 精度 | float16 (CUDA), float32 (CPU) |
 | 实现 | faster3a_2607 (Albatross), rwkv_tl (本项目), pure_torch (纯 PyTorch 基线), graph_decoder (CUDA Graph 解码) |
 
 ## 实现说明

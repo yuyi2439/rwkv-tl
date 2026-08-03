@@ -59,9 +59,11 @@ def _run_prefill(model, tokens) -> torch.Tensor:
 
 @pytest.fixture(scope="module")
 def models(ckpt_path: str) -> tuple[RWKV7, RWKV7Torch]:
+    # Correctness tests run eager (is_torch_compile=False): torch.compile of
+    # decode is validated separately on the target GPU (see benchmark --compile).
     with torch.device("cuda"):
         w = RWKV7Weight(ckpt_path)
-        return RWKV7(w), RWKV7Torch(w)
+        return RWKV7(w, is_torch_compile=False), RWKV7Torch(w, is_torch_compile=False)
 
 
 def _assert_consistent(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:

@@ -1,4 +1,4 @@
-"""Device capability detection helpers with caching."""
+"""Helpers for optional torch.compile of the decode path."""
 
 from __future__ import annotations
 
@@ -8,27 +8,14 @@ from collections.abc import Callable
 import torch
 
 
-@functools.cache
-def supports_native_bf16(device_type: str) -> bool:
-    match device_type:
-        case "cpu":
-            return False
-        case "cuda":
-            return torch.cuda.is_bf16_supported(including_emulation=False)
-        case "mps":
-            return True
-        case _:
-            raise ValueError(f"Unknown device type: {device_type}")
-
-
 def maybe_torch_compile(fn: Callable) -> Callable:
     """Decorator: optionally wrap a method with ``torch.compile``.
 
     Whether compilation happens is decided per-instance via
-    ``self._is_torch_compile``: if False the method runs eagerly; if True (and
-    the device supports native bf16) the first call compiles the method and
-    caches the compiled callable on the instance under
-    ``self._{fn.__name__}_impl``.
+    ``self._is_torch_compile``: if False the method runs eagerly; if True the
+    first call compiles the method (via the registered custom ops, so dynamo
+    traces a single graph) and caches the compiled callable on the instance
+    under ``self._{fn.__name__}_impl``.
 
     Usage::
 
@@ -49,10 +36,7 @@ def maybe_torch_compile(fn: Callable) -> Callable:
         impl = self.__dict__.get(cache_key)
         if impl is None:
             eager = fn.__get__(self, type(self))
-            if supports_native_bf16(self.emb.device.type):
-                impl = torch.compile(eager, fullgraph=True)
-            else:
-                impl = eager
+            impl = torch.compile(eager, fullgraph=True)
             self.__dict__[cache_key] = impl
         return impl(*args, **kwargs)
 

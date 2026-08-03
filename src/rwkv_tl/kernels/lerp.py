@@ -23,20 +23,20 @@ from .gemm import fused_rkv_gemm
 def _lerp6_kernel(C: int):
     @T.prim_func
     def _impl(
-        x: T.Tensor((C,), "bfloat16"),
-        prev: T.Tensor((C,), "bfloat16"),
-        x_r: T.Tensor((C,), "bfloat16"),
-        x_w: T.Tensor((C,), "bfloat16"),
-        x_k: T.Tensor((C,), "bfloat16"),
-        x_v: T.Tensor((C,), "bfloat16"),
-        x_a: T.Tensor((C,), "bfloat16"),
-        x_g: T.Tensor((C,), "bfloat16"),
-        xr: T.Tensor((C,), "bfloat16"),
-        xw: T.Tensor((C,), "bfloat16"),
-        xk: T.Tensor((C,), "bfloat16"),
-        xv: T.Tensor((C,), "bfloat16"),
-        xa: T.Tensor((C,), "bfloat16"),
-        xg: T.Tensor((C,), "bfloat16"),
+        x: T.Tensor((C,), "float16"),
+        prev: T.Tensor((C,), "float16"),
+        x_r: T.Tensor((C,), "float16"),
+        x_w: T.Tensor((C,), "float16"),
+        x_k: T.Tensor((C,), "float16"),
+        x_v: T.Tensor((C,), "float16"),
+        x_a: T.Tensor((C,), "float16"),
+        x_g: T.Tensor((C,), "float16"),
+        xr: T.Tensor((C,), "float16"),
+        xw: T.Tensor((C,), "float16"),
+        xk: T.Tensor((C,), "float16"),
+        xv: T.Tensor((C,), "float16"),
+        xa: T.Tensor((C,), "float16"),
+        xg: T.Tensor((C,), "float16"),
     ):
         """Fused 6x LERP: out_i = x + w_i * (prev - x)."""
         for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
@@ -59,21 +59,21 @@ def _lerp6_kernel(C: int):
 def _lerp6_copy_kernel(C: int):
     @T.prim_func
     def _impl(
-        x: T.Tensor((C,), "bfloat16"),
-        prev: T.Tensor((C,), "bfloat16"),
-        x_r: T.Tensor((C,), "bfloat16"),
-        x_w: T.Tensor((C,), "bfloat16"),
-        x_k: T.Tensor((C,), "bfloat16"),
-        x_v: T.Tensor((C,), "bfloat16"),
-        x_a: T.Tensor((C,), "bfloat16"),
-        x_g: T.Tensor((C,), "bfloat16"),
-        x_copy: T.Tensor((C,), "bfloat16"),
-        xr: T.Tensor((C,), "bfloat16"),
-        xw: T.Tensor((C,), "bfloat16"),
-        xk: T.Tensor((C,), "bfloat16"),
-        xv: T.Tensor((C,), "bfloat16"),
-        xa: T.Tensor((C,), "bfloat16"),
-        xg: T.Tensor((C,), "bfloat16"),
+        x: T.Tensor((C,), "float16"),
+        prev: T.Tensor((C,), "float16"),
+        x_r: T.Tensor((C,), "float16"),
+        x_w: T.Tensor((C,), "float16"),
+        x_k: T.Tensor((C,), "float16"),
+        x_v: T.Tensor((C,), "float16"),
+        x_a: T.Tensor((C,), "float16"),
+        x_g: T.Tensor((C,), "float16"),
+        x_copy: T.Tensor((C,), "float16"),
+        xr: T.Tensor((C,), "float16"),
+        xw: T.Tensor((C,), "float16"),
+        xk: T.Tensor((C,), "float16"),
+        xv: T.Tensor((C,), "float16"),
+        xa: T.Tensor((C,), "float16"),
+        xg: T.Tensor((C,), "float16"),
     ):
         """Fused 6x LERP + copy x to x_copy buffer (in-place)."""
         for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
@@ -97,11 +97,11 @@ def _lerp6_copy_kernel(C: int):
 def _lerp1_copy_kernel(C: int):
     @T.prim_func
     def _impl(
-        x: T.Tensor((C,), "bfloat16"),
-        prev: T.Tensor((C,), "bfloat16"),
-        w: T.Tensor((C,), "bfloat16"),
-        x_copy: T.Tensor((C,), "bfloat16"),
-        out: T.Tensor((C,), "bfloat16"),
+        x: T.Tensor((C,), "float16"),
+        prev: T.Tensor((C,), "float16"),
+        w: T.Tensor((C,), "float16"),
+        x_copy: T.Tensor((C,), "float16"),
+        out: T.Tensor((C,), "float16"),
     ):
         """Fused single LERP + copy x to x_copy buffer (in-place)."""
         for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
@@ -135,7 +135,7 @@ def fused_lerp6(
         x_r/x_w/x_k/x_v/x_a/x_g: six LERP weights, each [C].
 
     Returns:
-        (xr, xw, xk, xv, xa, xg), each [C], bf16.
+        (xr, xw, xk, xv, xa, xg), each [C], fp16.
     """
     if x.device.type != "cuda":
         diff = prev - x
@@ -173,7 +173,7 @@ def fused_lerp6_copy(
         x_copy: caller-supplied buffer (state["x"]) written in-place, [C].
 
     Returns:
-        (xr, xw, xk, xv, xa, xg), each [C], bf16.
+        (xr, xw, xk, xv, xa, xg), each [C], fp16.
     """
     if x.device.type != "cuda":
         diff = prev - x
@@ -199,7 +199,7 @@ def fused_lerp1_copy(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tens
         x_copy: caller-supplied buffer (state["x"]) written in-place, [C].
 
     Returns:
-        Interpolated value, [C], bf16.
+        Interpolated value, [C], fp16.
     """
     if x.device.type != "cuda":
         # Compute the lerp first: prev aliases x_copy (both state["x"]), so an

@@ -3,7 +3,7 @@
 RWKV7 inference with TileLang fused CUDA kernels and CUDA Graph. The goal is to make decode and prefill faster than the pure PyTorch baseline and approach the performance of the Albatross reference implementation.
 
 - Model: RWKV7-g1d (0.1B and 0.4B variants)
-- Precision: bfloat16 compute with float32 accumulation in the DPLR state update
+- Precision: float16 compute with float32 accumulation (DPLR state stays fp32), matching Albatross
 - Paths:
   - Decode (T=1): fused TMIX/CMIX kernels plus GraphDecoder
   - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM

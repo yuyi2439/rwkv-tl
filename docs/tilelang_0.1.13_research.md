@@ -23,7 +23,7 @@
 | 3× 独立 torch.mm | 0.576 ms |
 | tilelang `T.gemm`（0.1.13 sm_75 fallback） | **0.614 ms** |
 
-tilelang 的 sm_75 fallback 走 FMA（非 TensorCore），比 cuBLAS 慢。**结论：sm_75 继续走 cuBLAS bmm，`_gpu_supports_tl_bf16_gemm()` 的 sm_80+ 门控保持不变。**
+tilelang 的 sm_75 fallback 走 FMA（非 TensorCore），比 cuBLAS 慢。**结论：sm_75 继续走 cuBLAS bmm，`_gpu_supports_tl_fp16_gemm()` 的 sm_80+ 门控保持不变。**
 
 ### `T.__exp` 修正（#2696）— 不影响本项目
 

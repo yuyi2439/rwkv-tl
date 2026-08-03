@@ -4,7 +4,7 @@ Reduction kernels operate over [H, N] (N=HEAD_DIM fixed). Model constants H and
 C (= H*N) are baked at COMPILE time: each kernel is compiled per (H) and cached,
 so a model's kernels are specialized to its head count (0.1B H=12, 0.4B H=16,
 ...). Only per-call sizes (token count T) stay dynamic. All arithmetic
-accumulates in fp32; results are cast to bf16 only when written back, trading
+accumulates in fp32; results are cast to fp16 only when written back, trading
 bit-exactness with PyTorch eager for fewer casts and better throughput.
 """
 
@@ -24,21 +24,22 @@ from ._common import HEAD_DIM, SERIAL, WARP
 N = HEAD_DIM
 
 
-@tilelang.jit(out_idx=[2])
+@tilelang.jit(out_idx=[2, 3])
 def _l2norm_kernel(H: int):
     @T.prim_func
     def _impl(
-        kk: T.Tensor((H, N), "bfloat16"),
-        a: T.Tensor((H, N), "bfloat16"),
-        b: T.Tensor((H, N), "bfloat16"),
+        kk: T.Tensor((H, N), "float16"),
+        a: T.Tensor((H, N), "float16"),
+        kk_norm_out: T.Tensor((H, N), "float16"),
+        b: T.Tensor((H, N), "float16"),
     ):
-        """Fused L2-normalize(kk) in place + neg*multiply: B = -(kk/||kk||) * a.
+        """Fused L2-normalize(kk) + neg*multiply: B = -(kk/||kk||) * a.
 
-        kk is overwritten with its L2-normalized value (kk/||kk||) so the caller
-        can feed it to the DPLR state update as the A ("kk-normalized key") term,
+        Writes the L2-normalized kk (kk/||kk||) to kk_norm_out so the caller can
+        feed it to the DPLR state update as the A ("kk-normalized key") term,
         matching the reference DPLR formula S' = S*W + (S@kk_norm)@(-kk_norm*a)
-        + V (x) K. Only B is kernel-allocated; the write-back to kk is race-free
-        (each thread reads kk[h, idx] before writing the same indices).
+        + V (x) K. Both outputs are fresh (kernel-allocated) buffers: the custom
+        op contract forbids returning an output that aliases an input.
         """
         with T.Kernel(H, threads=WARP) as h:
             n = T.get_thread_binding(0)
@@ -54,10 +55,8 @@ def _l2norm_kernel(H: int):
             for j in T.serial(SERIAL):
                 idx = n * SERIAL + j
                 kk_norm = T.cast(kk[h, idx], "float32") / den
-                kk[h, idx] = T.cast(kk_norm, "bfloat16")
-                b[h, idx] = T.cast(
-                    -(kk_norm * T.cast(a[h, idx], "float32")), "bfloat16"
-                )
+                kk_norm_out[h, idx] = T.cast(kk_norm, "float16")
+                b[h, idx] = T.cast(-(kk_norm * T.cast(a[h, idx], "float32")), "float16")
 
     return _impl
 
@@ -66,14 +65,14 @@ def _l2norm_kernel(H: int):
 def _gn_rkrk_kernel(H: int):
     @T.prim_func
     def _impl(
-        y: T.Tensor((H, N), "bfloat16"),
-        r: T.Tensor((H, N), "bfloat16"),
-        k: T.Tensor((H, N), "bfloat16"),
-        v: T.Tensor((H, N), "bfloat16"),
-        r_k: T.Tensor((H, N), "bfloat16"),
-        ln_xW: T.Tensor((H * N,), "bfloat16"),
-        ln_xB: T.Tensor((H * N,), "bfloat16"),
-        out: T.Tensor((H * N,), "bfloat16"),
+        y: T.Tensor((H, N), "float16"),
+        r: T.Tensor((H, N), "float16"),
+        k: T.Tensor((H, N), "float16"),
+        v: T.Tensor((H, N), "float16"),
+        r_k: T.Tensor((H, N), "float16"),
+        ln_xW: T.Tensor((H * N,), "float16"),
+        ln_xB: T.Tensor((H * N,), "float16"),
+        out: T.Tensor((H * N,), "float16"),
     ):
         """Fused GroupNorm + r*k*r_k residual: y_norm + (sum r*k*r_k) * v."""
         with T.Kernel(H, threads=WARP) as h:
@@ -112,7 +111,7 @@ def _gn_rkrk_kernel(H: int):
                     ln_xB[flat], "float32"
                 )
                 residual = total_rkrk * T.cast(v[h, idx], "float32")
-                out[flat] = T.cast(y_aff + residual, "bfloat16")
+                out[flat] = T.cast(y_aff + residual, "float16")
 
     return _impl
 
@@ -122,19 +121,19 @@ def _dplr_kernel(H: int):
     @T.prim_func
     def _impl(
         S: T.Tensor((H, N, N), "float32"),
-        W: T.Tensor((H, N), "bfloat16"),
-        A: T.Tensor((H, N), "bfloat16"),
-        B: T.Tensor((H, N), "bfloat16"),
-        V: T.Tensor((H, N), "bfloat16"),
-        K: T.Tensor((H, N), "bfloat16"),
-        R: T.Tensor((H, N), "bfloat16"),
+        W: T.Tensor((H, N), "float16"),
+        A: T.Tensor((H, N), "float16"),
+        B: T.Tensor((H, N), "float16"),
+        V: T.Tensor((H, N), "float16"),
+        K: T.Tensor((H, N), "float16"),
+        R: T.Tensor((H, N), "float16"),
         S_out: T.Tensor((H, N, N), "float32"),
-        y_out: T.Tensor((H, N), "bfloat16"),
+        y_out: T.Tensor((H, N), "float16"),
     ):
         """Fused DPLR state update: S_new = S*W + (S@A)*B + V (x) K; y = S_new @ R.
 
-        The RNN state S is fp32 (fp32io16: state fp32, IO bf16), matching
-        Albatross: the state is not bf16-rounded after each step, avoiding
+        The RNN state S is fp32 (fp32io16: state fp32, IO fp16), matching
+        Albatross: the state is not fp16-rounded after each step, avoiding
         long-context precision loss.
         """
         with T.Kernel(H, N, threads=WARP) as (h, v_n):
@@ -163,7 +162,7 @@ def _dplr_kernel(H: int):
                 p_y[0] += s_new * T.cast(R[h, k_idx], "float32")
             y_val = T.warp_reduce_sum(p_y[0])
             if n == 0:
-                y_out[h, v_n] = T.cast(y_val, "bfloat16")
+                y_out[h, v_n] = T.cast(y_val, "float16")
 
     # In-place variant: only y_out (arg 8) is kernel-allocated; S_out (arg 7) is
     # caller-supplied. Passing the SAME tensor as S (arg 0) and S_out (arg 7)
@@ -179,14 +178,14 @@ def _dplr_T_kernel(H: int):
     @T.prim_func
     def _impl(
         S: T.Tensor((H, N, N), "float32"),
-        R: T.Tensor((T_LEN, H, N), "bfloat16"),
-        W: T.Tensor((T_LEN, H, N), "bfloat16"),
-        A: T.Tensor((T_LEN, H, N), "bfloat16"),
-        B: T.Tensor((T_LEN, H, N), "bfloat16"),
-        V: T.Tensor((T_LEN, H, N), "bfloat16"),
-        K: T.Tensor((T_LEN, H, N), "bfloat16"),
+        R: T.Tensor((T_LEN, H, N), "float16"),
+        W: T.Tensor((T_LEN, H, N), "float16"),
+        A: T.Tensor((T_LEN, H, N), "float16"),
+        B: T.Tensor((T_LEN, H, N), "float16"),
+        V: T.Tensor((T_LEN, H, N), "float16"),
+        K: T.Tensor((T_LEN, H, N), "float16"),
         S_out: T.Tensor((H, N, N), "float32"),
-        y_out: T.Tensor((T_LEN, H, N), "bfloat16"),
+        y_out: T.Tensor((T_LEN, H, N), "float16"),
     ):
         """Single-shot DPLR over a whole token sequence.
 
@@ -225,7 +224,7 @@ def _dplr_T_kernel(H: int):
                     p_y[0] += s_new * T.cast(R[t, h, k_idx], "float32")
                 y_val = T.warp_reduce_sum(p_y[0])
                 if n == 0:
-                    y_out[t, h, v_n] = T.cast(y_val, "bfloat16")
+                    y_out[t, h, v_n] = T.cast(y_val, "float16")
 
     return _impl
 
@@ -234,27 +233,23 @@ def _dplr_T_kernel(H: int):
 #  Python wrappers with CPU fallback
 # --------------------------------------------------------------------------- #
 def fused_l2norm_neg_kk_a(kk: Tensor, a: Tensor) -> tuple[Tensor, Tensor]:
-    """Fused L2-normalize(kk) in place + neg*multiply: B = -(kk/||kk||) * a.
-
-    kk is overwritten with its L2-normalized value; the returned first element
-    aliases kk.
+    """Fused L2-normalize(kk) + neg*multiply: B = -(kk/||kk||) * a.
 
     Args:
-        kk: Key-key tensor, [H, N] (overwritten with the normalized value).
+        kk: Key-key tensor, [H, N].
         a: Activation gate, [H, N].
 
     Returns:
-        (kk_norm, B): the L2-normalized key (kk/||kk||, same buffer as kk) and
-        -kk_norm * a, each [H, N], bf16. kk_norm feeds the DPLR A term; B is
-        the decayed key-key contribution.
+        (kk_norm, B): the L2-normalized key (kk/||kk||) and -kk_norm * a,
+        each [H, N], fp16. kk_norm feeds the DPLR A term; B is the decayed
+        key-key contribution. Both are fresh tensors (no aliasing), required
+        by the custom-op contract.
     """
     if kk.device.type != "cuda":
         den = torch.sqrt(torch.sum(kk * kk, dim=1, keepdim=True))
         kk_norm = kk / torch.clamp(den, min=1e-12)
-        kk.copy_(kk_norm)
-        return kk, -(kk_norm) * a
-    b = _l2norm_kernel(kk.shape[0])(kk, a)
-    return kk, b
+        return kk_norm, -(kk_norm) * a
+    return _l2norm_kernel(kk.shape[0])(kk, a)
 
 
 def fused_gn_rkrk(
@@ -278,7 +273,7 @@ def fused_gn_rkrk(
         ln_xW/ln_xB: GroupNorm affine params, [H*N].
 
     Returns:
-        Output, [H*N], bf16.
+        Output, [H*N], fp16.
     """
     if y.device.type != "cuda":
         h, n = y.shape
@@ -314,7 +309,7 @@ def fused_dplr(S, R, W, K, V, A, B):
         )
         y = torch.einsum("hvk,hk->hv", S_new, R.float())
         S.copy_(S_new)
-        return y.bfloat16(), S
+        return y.half(), S
     kernel = _dplr_kernel(S.shape[0])
     y = kernel(S, W, A, B, V, K, R, S)
     return y, S
@@ -328,7 +323,7 @@ def fused_dplr_T(S, R, W, K, V, A, B):
 
     Args:
         S: State, [H, N, N], fp32 (updated in-place).
-        R/W/K/V/A/B: batched per-token tensors, each [T, H, N], bf16.
+        R/W/K/V/A/B: batched per-token tensors, each [T, H, N], fp16.
 
     Returns:
         (y, S): outputs [T, H, N] and updated state [H, N, N].

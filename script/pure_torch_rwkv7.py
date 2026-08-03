@@ -6,6 +6,7 @@ from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
 from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.sampling import sample_logits
 from rwkv_tl.state import State
 
 
@@ -51,7 +52,7 @@ def _dplr_rwkv(
         + torch.einsum("hv,hk->hvk", V.float(), K.float())
     )
     y = torch.einsum("hvk,hk->hv", S_new, R.float())
-    return y.bfloat16(), S_new
+    return y.half(), S_new
 
 
 class RWKV7Torch:
@@ -147,11 +148,23 @@ class RWKV7Torch:
         tokens: list[int] | Tensor,
         S: State,
         max_tokens: int = 32,
+        *,
+        temperature: float | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
     ) -> tuple[list[int], State]:
         logits, S = self.forward(tokens, S)
         out: list[int] = []
         for _ in range(max_tokens):
-            token = int(torch.argmax(logits))
+            token = sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seen=out,
+            )
             out.append(token)
             logits, S = self.decode(token, S)
         return out, S
@@ -191,17 +204,11 @@ class RWKV7Torch:
                 v = _lerp(
                     v,
                     v_first,
-                    _sigmoid(
-                        att.v0.reshape(-1)
-                        + xv @ att.v1 @ att.v2
-                    ),
+                    _sigmoid(att.v0.reshape(-1) + xv @ att.v1 @ att.v2),
                 )
 
             w = torch.exp(
-                -_sigmoid(
-                    att.w0.reshape(-1)
-                    + torch.tanh(xw @ att.w1) @ att.w2
-                )
+                -_sigmoid(att.w0.reshape(-1) + torch.tanh(xw @ att.w1) @ att.w2)
                 / (torch.e**0.5)
             )
             a = _sigmoid(att.a0.reshape(-1) + xa @ att.a1 @ att.a2)
@@ -213,9 +220,7 @@ class RWKV7Torch:
 
             y, state["rnn"] = _dplr_rwkv(state["rnn"], r, w, k, v, kk, -kk * a)
             y = _group_norm(y, att.ln_x.w, att.ln_x.b, 64e-5)
-            y += (
-                torch.sum(r * k * att.r_k, dim=1, keepdim=True) * v
-            ).reshape(-1)
+            y += (torch.sum(r * k * att.r_k, dim=1, keepdim=True) * v).reshape(-1)
             g = torch.mv(
                 att.g2.T.contiguous(),
                 torch.sigmoid(torch.mv(att.g1.T.contiguous(), xg)),
@@ -235,9 +240,7 @@ class RWKV7Torch:
             x = _lerp(x_ln, prev, ffn.x_k.reshape(-1))
             state["x"].copy_(x_ln)
             return (
-                torch.addmv(
-                    x0, ffn.value_weight, _relusq(torch.mv(ffn.key_weight, x))
-                ),
+                torch.addmv(x0, ffn.value_weight, _relusq(torch.mv(ffn.key_weight, x))),
                 state,
             )
 
@@ -292,10 +295,7 @@ class RWKV7Torch:
                 )
 
             w = torch.exp(
-                -_sigmoid(
-                    att.w0.reshape(-1)
-                    + torch.tanh(xw @ w1) @ w2
-                )
+                -_sigmoid(att.w0.reshape(-1) + torch.tanh(xw @ w1) @ w2)
                 / (torch.e**0.5)
             )
             a = _sigmoid(att.a0.reshape(-1) + xa @ a1 @ a2)

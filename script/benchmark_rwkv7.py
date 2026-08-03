@@ -44,11 +44,11 @@ for path in (SCRIPT_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pure_torch_rwkv7 import RWKV7Torch  # noqa: E402
+from pure_torch_rwkv7 import RWKV7Torch
 
-from rwkv_tl import RWKV7 as ProjectRWKV7  # noqa: E402
-from rwkv_tl.model import RWKV7Weight  # noqa: E402
-from rwkv_tl.state import State  # noqa: E402
+from rwkv_tl import RWKV7 as ProjectRWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 
 def percentile(values, q):
@@ -113,20 +113,35 @@ def _fresh_logits(
     return logits.reshape(-1).float()
 
 
+# Top-2 logit gap below which argmax is considered a near-tie (unreliable
+# between correct implementations); not reported as a correctness failure.
+NEAR_TIE_GAP = 0.05
+
+
 def _check_correctness(
     got: torch.Tensor, ref: torch.Tensor, label: str, tol: float
 ) -> None:
-    """Verify ``got`` matches the reference; raise CorrectnessError otherwise."""
+    """Verify ``got`` matches the reference; raise CorrectnessError otherwise.
+
+    A large logit diff (> tol) always fails. When the diff is within tol but
+    argmax differs, fail only if the top-2 logits are clearly separated (gap >
+    NEAR_TIE_GAP): a near-tie can flip argmax between two correct fp16/fp32
+    implementations (accumulation order), so it is not evidence of breakage.
+    """
     if got.shape != ref.shape:
         raise CorrectnessError(
             f"{label}: shape mismatch {tuple(got.shape)} vs {tuple(ref.shape)}"
         )
     diff = (got - ref).abs().max().item()
-    argmax_ok = int(got.argmax()) == int(ref.argmax())
-    if not (argmax_ok and diff <= tol):
+    if diff > tol:
+        raise CorrectnessError(f"{label}: max_abs={diff:.4f} (tol={tol})")
+    if int(got.argmax()) == int(ref.argmax()):
+        return
+    top2 = torch.topk(got, 2).values
+    gap = float(top2[0] - top2[1])
+    if gap > NEAR_TIE_GAP:
         raise CorrectnessError(
-            f"{label}: argmax {'ok' if argmax_ok else 'MISMATCH'} "
-            f"max_abs={diff:.4f} (tol={tol})"
+            f"{label}: argmax MISMATCH max_abs={diff:.4f} (tol={tol})"
         )
 
 
@@ -407,9 +422,7 @@ def build_graph_decoder(
     """Build rwkv_tl GraphDecoder on CUDA."""
     from rwkv_tl.graph_decode import GraphDecoder
 
-    model = build_project_model(
-        checkpoint_path, torch.device("cuda"), False, w
-    )
+    model = build_project_model(checkpoint_path, torch.device("cuda"), False, w)
     return GraphDecoder(model)
 
 
@@ -497,9 +510,7 @@ def run_benchmark(args):
     def _get_shared_w() -> RWKV7Weight:
         nonlocal shared_w
         if shared_w is None:
-            shared_w = RWKV7Weight(
-                str(args.project_checkpoint), device=rwkv_device
-            )
+            shared_w = RWKV7Weight(str(args.project_checkpoint), device=rwkv_device)
         return shared_w
 
     for target in targets:

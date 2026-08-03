@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from . import operators  # noqa: F401  (registers torch.library custom ops)
-from ._compat import maybe_torch_compile, supports_native_bf16
+from ._compat import maybe_torch_compile
 from .kernels import (
     fused_a_kk_k,
     fused_dplr,
@@ -21,6 +21,7 @@ from .kernels import (
     fused_w_gate,
 )
 from .model import LNWeight, RWKV7Weight
+from .sampling import sample_logits
 from .state import State
 
 
@@ -58,13 +59,11 @@ class RWKV7:
 
         self.emb = LAYER_NORM(self.w.emb, self.w.ln_in)
         # The decode closures dispatch through the registered custom ops
-        # (rwkv_tl::*) only when torch.compile is enabled for this device, so
-        # dynamo can trace a single graph. On devices where we stay eager
-        # (no native bf16), the closures call the raw tilelang kernels to avoid
-        # the per-call custom-op dispatch overhead.
-        use_custom_ops = self._is_torch_compile and supports_native_bf16(
-            self.emb.device.type
-        )
+        # (rwkv_tl::*) only when torch.compile is enabled, so dynamo can trace a
+        # single graph. Eager instances (is_torch_compile=False) call the raw
+        # tilelang kernels directly to avoid per-call custom-op dispatch
+        # overhead.
+        use_custom_ops = self._is_torch_compile
         self._use_custom_ops = use_custom_ops
         self.layers = [
             (self.make_TMIX(i, use_custom_ops), self.make_CMIX(i, use_custom_ops))
@@ -156,14 +155,24 @@ class RWKV7:
         self,
         tokens: list[int] | Tensor,
         S: State,
-        max_tokens: int,
+        max_tokens: int = 32,
+        *,
+        temperature: float | None = None,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
     ) -> tuple[list[int], State]:
         """Generate autoregressively from a prompt.
 
         Args:
-            tokens: Prompt tokens, then greedily continued.
+            tokens: Prompt tokens, then continued.
             S: Model state.
             max_tokens: Number of tokens to generate after the prompt.
+            temperature: Softmax temperature; None or <= 0 = greedy.
+            top_k: Top-k sampling (0 = off).
+            top_p: Nucleus sampling threshold (1.0 = off).
+            repetition_penalty: Standard repetition penalty on generated tokens
+                (1.0 = off). Helps avoid degenerate repetition loops.
 
         Returns:
             (generated tokens, final state).
@@ -171,7 +180,14 @@ class RWKV7:
         logits, S = self.forward(tokens, S)
         out: list[int] = []
         for _ in range(max_tokens):
-            token = int(torch.argmax(logits))
+            token = sample_logits(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seen=out,
+            )
             out.append(token)
             logits, S = self.decode(token, S)
         return out, S
@@ -207,7 +223,7 @@ class RWKV7:
         # active (dynamo traces them as single-graph nodes). Eager calls go
         # straight to the raw tilelang kernels to avoid the custom-op dispatch
         # overhead per kernel launch.
-        _rkv: Callable[
+        _fused_lerp6_rkv_copy: Callable[
             ..., tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
         ]
         _akk: Callable[..., tuple[Tensor, Tensor, Tensor]]
@@ -216,14 +232,14 @@ class RWKV7:
         _wgate: Callable[..., Tensor]
         _gn: Callable[..., Tensor]
         if use_custom_ops:
-            _rkv = torch.ops.rwkv_tl.fused_lerp6_rkv_copy
+            _fused_lerp6_rkv_copy = torch.ops.rwkv_tl.fused_lerp6_rkv_copy
             _vgate = torch.ops.rwkv_tl.fused_v_gate
             _wgate = torch.ops.rwkv_tl.fused_w_gate
             _akk = torch.ops.rwkv_tl.fused_a_kk_k
             _l2kk = torch.ops.rwkv_tl.fused_l2norm_neg_kk_a
             _gn = torch.ops.rwkv_tl.fused_gn_rkrk
         else:
-            _rkv = fused_lerp6_rkv_copy
+            _fused_lerp6_rkv_copy = fused_lerp6_rkv_copy
             _vgate = fused_v_gate
             _wgate = fused_w_gate
             _akk = fused_a_kk_k
@@ -249,7 +265,9 @@ class RWKV7:
         ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
             x = LAYER_NORM(x0, ln_pre)
             prev = state["x"]
-            r, k, v, xv, xw, xa, xg = _rkv(x, prev, *x_x, state["x"], rWt_stack)
+            r, k, v, xv, xw, xa, xg = _fused_lerp6_rkv_copy(
+                x, prev, *x_x, state["x"], rWt_stack
+            )
 
             if v_first is None:
                 v_first = v

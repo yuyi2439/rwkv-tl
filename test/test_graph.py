@@ -24,8 +24,9 @@ MAX_ABS_TOL = 4.0
 
 @pytest.fixture(scope="module")
 def model(ckpt_path: str) -> RWKV7:
+    # Eager instance (see test_forward fixture note).
     with torch.device("cuda"):
-        return RWKV7(RWKV7Weight(ckpt_path))
+        return RWKV7(RWKV7Weight(ckpt_path), is_torch_compile=False)
 
 
 def _baseline_logits(model: RWKV7, tokens: list[int]) -> torch.Tensor:

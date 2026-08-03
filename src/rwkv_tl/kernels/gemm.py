@@ -5,11 +5,11 @@ launch. Dispatch by device and GPU arch:
 
 - CPU: stacked eager matmul (no CUDA dependency).
 - CUDA sm_80+ (Ampere/Hopper/Blackwell): tilelang T.gemm kernel on TensorCore.
-  bf16 MMA (m16n8k16, TransB layout) is supported on these archs, so the three
+  fp16 MMA (m16n8k16, TransB layout) is supported on these archs, so the three
   matmuls run in a single kernel launch with blockIdx.z as the batch dim.
 - CUDA sm_75 (Turing) and any GPU where the tilelang kernel is unavailable:
   torch.bmm -> cuBLAS strided batched GEMM (TensorCore, fp32 accumulate).
-  sm_75 lacks the bf16 TransB MMA atom tilelang infers, so we fall back.
+  sm_75 lacks the fp16 TransB MMA atom tilelang infers, so we fall back.
 
 The weight tensor is pre-stacked once at model construction ([3, C, C]) and
 passed in directly, so neither the tilelang nor the bmm path re-stacks per call.
@@ -39,10 +39,10 @@ def _torch_bmm_rkv(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
     return torch.bmm(Xb, Wb)  # [3, T, C]
 
 
-def _gpu_supports_tl_bf16_gemm() -> bool:
-    """Whether the current CUDA GPU supports the tilelang bf16 T.gemm path.
+def _gpu_supports_tl_fp16_gemm() -> bool:
+    """Whether the current CUDA GPU supports the tilelang fp16 T.gemm path.
 
-    sm_80+ (Ampere/Hopper/Blackwell) supports the m16n8k16 bf16 MMA atom with
+    sm_80+ (Ampere/Hopper/Blackwell) supports the m16n8k16 fp16 MMA atom with
     the TransB layout tilelang infers. sm_75 (Turing) only supports
     m16n8k8 with TransB=false, which tilelang does not emit, so the kernel
     fails to compile there and we must fall back to cuBLAS bmm.
@@ -50,7 +50,7 @@ def _gpu_supports_tl_bf16_gemm() -> bool:
     if not torch.cuda.is_available():
         return False
     major, minor = torch.cuda.get_device_capability()
-    # sm_80+ required for bf16 m16n8k16 MMA with TransB.
+    # sm_80+ required for fp16 m16n8k16 MMA with TransB.
     return (major, minor) >= (8, 0)
 
 
@@ -60,7 +60,7 @@ def _try_compile_tl_rkv(C: int):
 
     C is a model constant baked at compile time; T_LEN stays dynamic. Compiled
     lazily on first call (per-C, cached by tilelang's JIT). Only reached on
-    sm_80+ where the bf16 TransB MMA is available; target arch is auto-detected
+    sm_80+ where the fp16 TransB MMA is available; target arch is auto-detected
     from the current CUDA device (WGMMA on Hopper, TCGEN5MMA on Blackwell,
     Ampere MMA otherwise).
     """
@@ -72,11 +72,11 @@ def _try_compile_tl_rkv(C: int):
 
     @T.prim_func
     def _impl(
-        xr: T.Tensor((T_LEN, C), "bfloat16"),
-        xk: T.Tensor((T_LEN, C), "bfloat16"),
-        xv: T.Tensor((T_LEN, C), "bfloat16"),
-        Wb: T.Tensor((3, C, C), "bfloat16"),
-        rkv: T.Tensor((3, T_LEN, C), "bfloat16"),
+        xr: T.Tensor((T_LEN, C), "float16"),
+        xk: T.Tensor((T_LEN, C), "float16"),
+        xv: T.Tensor((T_LEN, C), "float16"),
+        Wb: T.Tensor((3, C, C), "float16"),
+        rkv: T.Tensor((3, T_LEN, C), "float16"),
     ):
         """Fused r/k/v GEMM: rkv[b] = X[b] @ Wb[b] for b in {0,1,2}.
 
@@ -90,8 +90,8 @@ def _try_compile_tl_rkv(C: int):
             3,
             threads=128,
         ) as (bx, by, bz):
-            A_shared = T.alloc_shared((BLOCK_M, BLOCK_K), "bfloat16")
-            B_shared = T.alloc_shared((BLOCK_K, BLOCK_N), "bfloat16")
+            A_shared = T.alloc_shared((BLOCK_M, BLOCK_K), "float16")
+            B_shared = T.alloc_shared((BLOCK_K, BLOCK_N), "float16")
             C_local = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
             T.clear(C_local)
             for k in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=3):
@@ -122,16 +122,16 @@ def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
       torch.bmm -> cuBLAS strided batched GEMM (TensorCore, fp32 accumulate).
 
     Args:
-        xr/xk/xv: LERP-interpolated activations, each [T, C], bf16.
-        Wb: Pre-stacked transposed projection weights, [3, C, C], bf16.
+        xr/xk/xv: LERP-interpolated activations, each [T, C], fp16.
+        Wb: Pre-stacked transposed projection weights, [3, C, C], fp16.
             Wb[0]=rWt, Wb[1]=kWt, Wb[2]=vWt (each [C, C]).
 
     Returns:
-        Stacked [3, T, C] tensor (rkv[0]=r, rkv[1]=k, rkv[2]=v), bf16.
+        Stacked [3, T, C] tensor (rkv[0]=r, rkv[1]=k, rkv[2]=v), fp16.
     """
     if xr.device.type != "cuda":
         return _torch_bmm_rkv(xr, xk, xv, Wb)
-    if not _gpu_supports_tl_bf16_gemm():
+    if not _gpu_supports_tl_fp16_gemm():
         return _torch_bmm_rkv(xr, xk, xv, Wb)
     try:
         return _try_compile_tl_rkv(xr.shape[1])(xr, xk, xv, Wb)

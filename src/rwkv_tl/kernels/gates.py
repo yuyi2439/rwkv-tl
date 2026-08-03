@@ -1,6 +1,6 @@
 """Fused gate kernels (elementwise over the embedding dim C).
 
-All gate math (sigmoid / exp / LERP) runs in fp32 and is cast to bf16 only at
+All gate math (sigmoid / exp / LERP) runs in fp32 and is cast to fp16 only at
 the store, favouring throughput over bit-exactness with PyTorch eager. C is a
 model constant baked at compile time (compiled per-C, cached).
 """
@@ -26,9 +26,9 @@ _SQRT_E = math.sqrt(math.e)  # exp decay gate constant
 def _w_gate_kernel(C: int):
     @T.prim_func
     def _impl(
-        x: T.Tensor((C,), "bfloat16"),
-        w0: T.Tensor((C,), "bfloat16"),
-        out: T.Tensor((C,), "bfloat16"),
+        x: T.Tensor((C,), "float16"),
+        w0: T.Tensor((C,), "float16"),
+        out: T.Tensor((C,), "float16"),
     ):
         """Fused w decay gate: w = exp(-sigmoid(w0 + x) / sqrt(e))."""
         for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
@@ -37,7 +37,7 @@ def _w_gate_kernel(C: int):
                 if i < C:
                     s = T.cast(x[i], "float32") + T.cast(w0[i], "float32")
                     out[i] = T.cast(
-                        T.exp(-T.sigmoid(s) / T.float32(_SQRT_E)), "bfloat16"
+                        T.exp(-T.sigmoid(s) / T.float32(_SQRT_E)), "float16"
                     )
 
     return _impl
@@ -47,11 +47,11 @@ def _w_gate_kernel(C: int):
 def _v_gate_kernel(C: int):
     @T.prim_func
     def _impl(
-        v: T.Tensor((C,), "bfloat16"),
-        v_first: T.Tensor((C,), "bfloat16"),
-        v0: T.Tensor((C,), "bfloat16"),
-        v12: T.Tensor((C,), "bfloat16"),
-        out: T.Tensor((C,), "bfloat16"),
+        v: T.Tensor((C,), "float16"),
+        v_first: T.Tensor((C,), "float16"),
+        v0: T.Tensor((C,), "float16"),
+        v12: T.Tensor((C,), "float16"),
+        out: T.Tensor((C,), "float16"),
     ):
         """Fused v residual gate: v + sigmoid(v0 + v12) * (v_first - v)."""
         for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
@@ -63,7 +63,7 @@ def _v_gate_kernel(C: int):
                         T.cast(v0[i], "float32") + T.cast(v12[i], "float32")
                     )
                     out[i] = T.cast(
-                        vf + sig * (T.cast(v_first[i], "float32") - vf), "bfloat16"
+                        vf + sig * (T.cast(v_first[i], "float32") - vf), "float16"
                     )
 
     return _impl
@@ -73,14 +73,14 @@ def _v_gate_kernel(C: int):
 def _a_kk_k_kernel(C: int):
     @T.prim_func
     def _impl(
-        a0: T.Tensor((C,), "bfloat16"),
-        a_x: T.Tensor((C,), "bfloat16"),
-        k: T.Tensor((C,), "bfloat16"),
-        k_k: T.Tensor((C,), "bfloat16"),
-        k_a: T.Tensor((C,), "bfloat16"),
-        a_out: T.Tensor((C,), "bfloat16"),
-        kk_out: T.Tensor((C,), "bfloat16"),
-        k_out: T.Tensor((C,), "bfloat16"),
+        a0: T.Tensor((C,), "float16"),
+        a_x: T.Tensor((C,), "float16"),
+        k: T.Tensor((C,), "float16"),
+        k_k: T.Tensor((C,), "float16"),
+        k_a: T.Tensor((C,), "float16"),
+        a_out: T.Tensor((C,), "float16"),
+        kk_out: T.Tensor((C,), "float16"),
+        k_out: T.Tensor((C,), "float16"),
     ):
         """Fused a-gate + kk + k LERP.
 
@@ -94,10 +94,10 @@ def _a_kk_k_kernel(C: int):
                     a_val = T.sigmoid(
                         T.cast(a0[i], "float32") + T.cast(a_x[i], "float32")
                     )
-                    a_out[i] = T.cast(a_val, "bfloat16")
-                    kk_out[i] = T.cast(kf * T.cast(k_k[i], "float32"), "bfloat16")
+                    a_out[i] = T.cast(a_val, "float16")
+                    kk_out[i] = T.cast(kf * T.cast(k_k[i], "float32"), "float16")
                     k_out[i] = T.cast(
-                        kf + T.cast(k_a[i], "float32") * (kf * a_val - kf), "bfloat16"
+                        kf + T.cast(k_a[i], "float32") * (kf * a_val - kf), "float16"
                     )
 
     return _impl
@@ -114,7 +114,7 @@ def fused_w_gate(x: Tensor, w0: Tensor) -> Tensor:
         w0: Bias vector, [C].
 
     Returns:
-        w: Decay gate, [C], bf16.
+        w: Decay gate, [C], fp16.
     """
     if x.device.type != "cuda":
         return torch.exp(-torch.sigmoid(w0 + x) / _SQRT_E)
@@ -131,7 +131,7 @@ def fused_v_gate(v: Tensor, v_first: Tensor, v0: Tensor, v12: Tensor) -> Tensor:
         v12: Matmul result (xv @ v1 @ v2), [C].
 
     Returns:
-        Gated value, [C], bf16.
+        Gated value, [C], fp16.
     """
     if v.device.type != "cuda":
         return v + torch.sigmoid(v0 + v12) * (v_first - v)
@@ -157,7 +157,7 @@ def fused_a_kk_k(
         k_a: k LERP weight, [C].
 
     Returns:
-        (a, kk, new_k), each [C], bf16.
+        (a, kk, new_k), each [C], fp16.
     """
     if k.device.type != "cuda":
         a = torch.sigmoid(a0 + a_x)
