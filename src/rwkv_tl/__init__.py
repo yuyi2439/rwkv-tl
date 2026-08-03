@@ -197,6 +197,9 @@ class RWKV7:
             for i in range(self.n_layer)
         ]
         # Prefill path is built eagerly, but both paths reuse shared caches.
+        # forward_prefill is NOT torch.compile'd: each distinct prompt length
+        # would recompile a fresh graph (minutes on 0.4B, GPU idle meanwhile)
+        # for a <1.5x win, which is not worth it. Keep it eager.
         self.layers_batch = [
             (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
             for i in range(self.n_layer)

@@ -27,20 +27,26 @@ uv sync
 
 ## Benchmark status
 
-The numbers below were collected on an NVIDIA MX450. They are useful for relative comparisons on the same hardware, but they are not the final target validation numbers.
-
-The next validation run will be on an RTX 3060.
+The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
+target validation GPU. `rwkv_tl` and `pure_torch` run the eager path; the
+benchmark harness routes through the raw methods so a sweep does not recompile
+a fresh graph per token count.
 
 | Case | rwkv_tl | pure_torch | graph_decoder |
 |---|---:|---:|---:|
-| 1x1 | 58.21 ms / 17.18 tok/s | 22.76 ms / 43.93 tok/s | 8.35 ms / 119.79 tok/s |
-| 8x8 | 265.70 ms / 240.87 tok/s | 398.34 ms / 160.67 tok/s | not supported |
-| 16x16 | 899.69 ms / 284.54 tok/s | 1341.51 ms / 190.83 tok/s | not supported |
+| 1x1 | 40.48 ms / 24.70 tok/s | 13.74 ms / 72.77 tok/s | 2.11 ms / 473.14 tok/s |
+| 1x32 | 118.12 ms / 270.92 tok/s | 98.20 ms / 325.87 tok/s | 58.78 ms / 544.42 tok/s |
+| 8x8 | 206.94 ms / 309.26 tok/s | 171.77 ms / 372.58 tok/s | not supported |
+| 16x16 | 758.45 ms / 337.53 tok/s | 609.80 ms / 419.81 tok/s | not supported |
 
 Key points:
 - GraphDecoder is best for single-token decode latency.
 - rwkv_tl is the only path that supports both batched prefill and decode.
-- The pure-torch baseline was substantially improved by batching the prefill path.
+- The Albatross reference (faster3a_2607) still leads all cases by a wide
+  margin (4.32 ms on 1x1, ~7.5 ms on all prefill cases for 0.1B).
+- Compiling `forward_prefill` gives 1.11-1.43x on 0.1B, but recompiles a
+  fresh graph per prompt length (minutes), so it stays eager. See
+  `script/benchmark_rwkv7.md` and `docs/benchmark_rwkv7_experiments.md`.
 
 ## Run benchmark
 

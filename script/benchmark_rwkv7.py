@@ -237,6 +237,25 @@ def _build_materialized_checkpoint(checkpoint_path: Path, device: torch.device) 
         return Path(tmp.name)
 
 
+def _eager_dispatch(model, input_tokens, state):
+    """Dispatch to the eager run_one / forward_prefill when available.
+
+    rwkv_tl and pure_torch wrap their prefill/decode methods with
+    @maybe_torch_compile, so `model.forward` would recompile a new graph for
+    every distinct token count (T) inside a benchmark sweep -- minutes per case
+    with the GPU idle. The benchmark measures the eager implementation, so route
+    through the raw methods. Other targets (faster3a, graph_decoder) keep
+    `model.forward`.
+    """
+    eager_run_one = getattr(model, "_eager_run_one", None)
+    eager_prefill = getattr(model, "_eager_forward_prefill", None)
+    if eager_run_one is None or eager_prefill is None:
+        return model.forward(input_tokens, state)
+    if input_tokens.numel() == 1:
+        return eager_run_one(int(input_tokens.item()), state)
+    return eager_prefill(input_tokens, state)
+
+
 def bench_case(
     model,
     batch_size: int,
@@ -285,7 +304,7 @@ def bench_case(
         _check_correctness(got, ref, type(model).__name__, correctness_tol)
 
     for _ in range(warmup):
-        _ = model.forward(input_tokens, state)
+        _ = _eager_dispatch(model, input_tokens, state)
 
     if device.type == "cuda":
         torch.cuda.synchronize(device=device)
@@ -296,13 +315,13 @@ def bench_case(
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            _ = model.forward(input_tokens, state)
+            _ = _eager_dispatch(model, input_tokens, state)
             end.record()
             torch.cuda.synchronize(device=device)
             times.append(float(start.elapsed_time(end)))
         else:
             t0 = time.perf_counter()
-            _ = model.forward(input_tokens, state)
+            _ = _eager_dispatch(model, input_tokens, state)
             times.append((time.perf_counter() - t0) * 1000.0)
 
     p10 = percentile(times, 10)

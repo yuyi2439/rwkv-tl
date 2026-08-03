@@ -25,7 +25,8 @@ def maybe_torch_compile(fn: Callable) -> Callable:
     """Decorator: lazily wrap a method with ``torch.compile`` on its device.
 
     The device is only known at runtime (``self.emb.device``), so the compile
-    decision is made on the first call per instance and cached on the instance.
+    decision is made on the first call per instance and cached on the instance
+    under ``self._{fn.__name__}_impl`` (e.g. ``run_one`` -> ``_run_one_impl``).
     The raw method stays reachable via ``self._eager_run_one`` (set by the
     caller from ``self.run_one.__wrapped__``).
 
@@ -38,14 +39,15 @@ def maybe_torch_compile(fn: Callable) -> Callable:
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        impl = self.__dict__.get("_run_one_impl")
+        cache_key = f"_{fn.__name__}_impl"
+        impl = self.__dict__.get(cache_key)
         if impl is None:
             eager = fn.__get__(self, type(self))
             if supports_native_bf16(self.emb.device.type):
                 impl = torch.compile(eager, fullgraph=True)
             else:
                 impl = eager
-            self.__dict__["_run_one_impl"] = impl
+            self.__dict__[cache_key] = impl
         return impl(*args, **kwargs)
 
     return wrapper

@@ -162,7 +162,9 @@ def main():
             model._eager_run_one, (TOKENS[0], s_d), f"{label} decode (run_one)"
         )
 
-        # prefill: forward_prefill with 32 tokens
+        # prefill: forward_prefill with 32 tokens. Not torch.compile'd (each
+        # prompt length would recompile a graph for <1.5x; kept eager), so this
+        # traces the eager closures, which still graph-break on the raw kernels.
         tok_p = torch.tensor(TOKENS, dtype=torch.long, device=DEVICE)
         s_p = fresh_state(model)
         detect_breaks(

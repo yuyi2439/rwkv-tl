@@ -17,7 +17,8 @@ uv run python script/benchmark_rwkv7.py \
 
 | 项目 | 值 |
 |---|---|
-| GPU | NVIDIA MX450 (sm_75, 2GB GDDR6) |
+| GPU (目标卡) | NVIDIA RTX 3060 (sm_86, 12GB GDDR6) |
+| GPU (旧参考) | NVIDIA MX450 (sm_75, 2GB GDDR6) |
 | 模型 | rwkv7-g1d-0.1b (C=768, H=12, L=12), rwkv7-g1d-0.4b (C=1024, H=16, L=24) |
 | 精度 | bfloat16 (CUDA), float32 (CPU) |
 | 实现 | faster3a_2607 (Albatross), rwkv_tl (本项目), pure_torch (纯 PyTorch 基线), graph_decoder (CUDA Graph 解码) |
@@ -38,7 +39,32 @@ uv run python script/benchmark_rwkv7.py \
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 
-### MX450 (CUDA)
+### RTX 3060 (CUDA, sm_86, 目标卡)
+
+warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触发 torch.compile 重编译）。
+
+| 实现 | B×T | p50 (ms) | tok/s |
+|---|---|---|---|
+| faster3a_2607 | 1×1 | 4.32 | 231.50 |
+| faster3a_2607 | 1×8 | 6.23 | 1284.88 |
+| faster3a_2607 | 1×32 | 7.49 | 4274.21 |
+| faster3a_2607 | 8×8 | 7.64 | 8380.39 |
+| faster3a_2607 | 16×16 | 7.64 | 33526.74 |
+| rwkv_tl | 1×1 | 40.48 | 24.70 |
+| rwkv_tl | 1×8 | 40.48 | 197.63 |
+| rwkv_tl | 1×32 | 118.12 | 270.92 |
+| rwkv_tl | 8×8 | 206.94 | 309.26 |
+| rwkv_tl | 16×16 | 758.45 | 337.53 |
+| pure_torch | 1×1 | 13.74 | 72.77 |
+| pure_torch | 1×8 | 29.59 | 270.37 |
+| pure_torch | 1×32 | 98.20 | 325.87 |
+| pure_torch | 8×8 | 171.77 | 372.58 |
+| pure_torch | 16×16 | 609.80 | 419.81 |
+| graph_decoder | 1×1 | 2.11 | 473.14 |
+| graph_decoder | 1×8 | 14.76 | 541.88 |
+| graph_decoder | 1×32 | 58.78 | 544.42 |
+
+### MX450 (CUDA, sm_75, 旧参考)
 
 > 注：MX450 是笔记本 GPU，长时满载会热降频（SM 时钟从 1800MHz 降到 ~1155MHz），
 > 绝对延迟在不同会话间波动较大（本次数值整体比旧记录高 ~50%，系降频所致）；
@@ -76,7 +102,32 @@ uv run python script/benchmark_rwkv7.py \
 
 ## 结果：0.4B (rwkv7-g1d-0.4b-20260210-ctx8192)
 
-### MX450 (CUDA)
+### RTX 3060 (CUDA, sm_86, 目标卡)
+
+warmup=10, iters=20。
+
+| 实现 | B×T | p50 (ms) | tok/s |
+|---|---|---|---|
+| faster3a_2607 | 1×1 | 6.50 | 153.94 |
+| faster3a_2607 | 1×8 | 13.78 | 580.62 |
+| faster3a_2607 | 1×32 | 16.25 | 1969.52 |
+| faster3a_2607 | 8×8 | 16.28 | 3931.92 |
+| faster3a_2607 | 16×16 | 16.84 | 15198.95 |
+| rwkv_tl | 1×1 | 85.09 | 11.75 |
+| rwkv_tl | 1×8 | 69.66 | 114.84 |
+| rwkv_tl | 1×32 | 179.03 | 178.74 |
+| rwkv_tl | 8×8 | 307.36 | 208.23 |
+| rwkv_tl | 16×16 | 1128.89 | 226.77 |
+| pure_torch | 1×1 | 8.69 | 115.01 |
+| pure_torch | 1×8 | 72.56 | 110.25 |
+| pure_torch | 1×32 | 175.51 | 182.33 |
+| pure_torch | 8×8 | 347.61 | 184.11 |
+| pure_torch | 16×16 | 1294.50 | 197.76 |
+| graph_decoder | 1×1 | 4.60 | 217.18 |
+| graph_decoder | 1×8 | 36.24 | 220.72 |
+| graph_decoder | 1×32 | 144.16 | 221.97 |
+
+### MX450 (CUDA, sm_75, 旧参考)
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
@@ -109,6 +160,14 @@ uv run python script/benchmark_rwkv7.py \
 | pure_torch | 1×32 | 1084.44 | 29.51 |
 
 ## 简要解释
+
+### CUDA (RTX 3060, sm_86, 目标卡)
+
+- T=1 decode 时 graph_decoder 最快（0.1B 2.11ms、0.4B 4.60ms），CUDA Graph 消除 launch 开销的效果在 sm_86 上依旧成立。
+- eager rwkv_tl 的 T=1 仍明显慢于 pure_torch（0.1B 40.5 vs 13.7ms；0.4B 85.1 vs 8.7ms），说明 fused kernel 的逐 token dispatch 开销在小模型上依旧占主导。
+- prefill（T≥32）rwkv_tl 与 pure_torch 接近（0.1B 1×32 118 vs 98ms；0.4B 1×32 179 vs 176ms），fused GEMM 批处理与纯 PyTorch 的 batched 路径基本打平，收益不如 MX450 上明显。
+- faster3a_2607 在所有 case 上大幅领先：prefill 已是 kernel 内串行的 T 维处理，B×T 增大几乎不影响单次延迟（0.4B 1×32 到 16×16 都约 16ms）。
+- 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `forward_prefill` 保持 eager。详见 docs/benchmark_rwkv7_experiments.md。
 
 ### CUDA (MX450, sm_75)
 
