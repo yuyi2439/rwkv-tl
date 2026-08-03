@@ -108,19 +108,13 @@ done yet. When working on the related area, remind the user whether to proceed.
   in-place `state` dict. This is clearer, autograd-friendly, and matches the
   FlashRWKV `rwkv7(..., initial_state=, output_final_state=)` contract. Apply
   this pattern to new ops; migrate existing ones when refactoring.
-- **Make benchmarks correctness-gated.** A benchmark run must verify numerical
-  correctness before reporting latency. If outputs do not match the reference,
-  skip the case (or fail) and do NOT emit a latency number. This prevents
-  silently reporting speed for broken code. **DONE 2026-08**: added to
-  `script/benchmark_rwkv7.py` (per-case, `--no-correctness-check` /
-  `--correctness-tol`) and `script/bench_decode.py`; the reference is pure_torch.
 
-## Open verification (TODO.md)
+## Verified on RTX 3060 (sm_86)
 
-Resolved on RTX 3060 (sm_86): compiled-prefill perf and the `forward`
-`Tensor.item()` graph break are now verified and documented. The compiled
-prefill was measured faster (1.11-1.43x) but kept eager due to per-length
-recompile cost; see TODO.md (now archived) and docs/benchmark_rwkv7_experiments.md.
+- Compiled-prefill perf and the `forward` `Tensor.item()` graph break were
+  verified on the RTX 3060 and are documented in
+  `docs/benchmark_rwkv7_experiments.md`. Compiled prefill was faster
+  (1.11-1.43x) but kept eager due to per-length recompile cost.
 
 ## Reference
 [docs](/docs/)
