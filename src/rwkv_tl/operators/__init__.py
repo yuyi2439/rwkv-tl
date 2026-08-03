@@ -1,23 +1,70 @@
 """PyTorch custom operators wrapping tilelang fused kernels.
 
-Each fused kernel is registered as a `torch.library.custom_op` so that
-`torch.compile` (dynamo) treats it as an opaque op instead of graph-breaking
-on tilelang internal objects (PrimExprWithOp, Var).
+Each fused kernel is registered via ``torch.library.define`` + ``torch.library.impl``
+(the low-level, low-dispatch-overhead form) instead of ``torch.library.custom_op``.
+Measured on RTX 3060 / C=768: `custom_op` adds ~14 us/call of Python-dispatch
+overhead over the raw kernel; `define`+`impl` adds only ~2-4 us. This matters
+for the small decode kernels (10-40 us) once they run through the op dispatch
+(e.g. the future training path); inference still calls the raw kernels directly.
 
-Ops with in-place state mutation (fused_dplr, fused_lerp6_copy,
-fused_lerp1_copy) declare `mutates_args` accurately so dynamo preserves the
-mutation semantics across the compiled graph.
+Every op gets three impls:
+- CUDA: invokes the tilelang kernel (inference/main path).
+- CPU: plain-torch fallback (used when inputs are not on CUDA).
+- Meta: shape-only fake implementation for torch.compile/dynamo tracing
+  (the equivalent of `custom_op`'s `register_fake`; required, else compiled
+  graphs cannot infer shapes).
 
-Fake implementations (register_fake) provide shape inference for dynamo
-tracing without invoking the real kernel.
+In-place ops declare mutation with the schema alias syntax `Tensor(a!)` so
+dynamo preserves the in-place semantics across a compiled graph. The op's
+CUDA impl returns a fresh (non-aliasing) tensor where the wrapped kernel
+updates state in place, matching the old `custom_op` behavior.
+
+Differentiable ops can later get autograd support either by adding a
+`CompositeImplicitAutograd` impl (must be composed of plain torch ops) or by
+registering an explicit backward; see docs/benchmark_rwkv7_experiments.md for
+the training-direction notes.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 from torch import Tensor
 
 _OPS_REGISTERED = False
+
+
+def _register(
+    name: str,
+    schema: str,
+    cuda: Callable[..., object],
+    cpu: Callable[..., object],
+    meta: Callable[..., object],
+) -> None:
+    """Define one op with CUDA / CPU / Meta implementations.
+
+    Args:
+        name: ``namespace::op`` fully-qualified operator name.
+        schema: torch op schema string, e.g. ``(Tensor x) -> Tensor``. Use
+            ``Tensor(a!)`` aliases to declare in-place mutation.
+        cuda: implementation dispatched on CUDA (usually a tilelang kernel).
+        cpu: fallback for non-CUDA devices (plain torch ops).
+        meta: fake implementation producing correctly-shaped empty outputs.
+    """
+    torch.library.define(name, schema)
+
+    @torch.library.impl(name, "CUDA")
+    def _cuda_impl(*args, **kwargs):
+        return cuda(*args, **kwargs)
+
+    @torch.library.impl(name, "CPU")
+    def _cpu_impl(*args, **kwargs):
+        return cpu(*args, **kwargs)
+
+    @torch.library.impl(name, "Meta")
+    def _meta_impl(*args, **kwargs):
+        return meta(*args, **kwargs)
 
 
 def _ensure_ops_registered() -> None:
@@ -29,173 +76,201 @@ def _ensure_ops_registered() -> None:
 
     # ---- lerp.py ----
 
-    @torch.library.custom_op("rwkv_tl::fused_lerp6_copy", mutates_args=("x_copy",))
-    def fused_lerp6_copy_op(
-        x: Tensor,
-        prev: Tensor,
-        x_r: Tensor,
-        x_w: Tensor,
-        x_k: Tensor,
-        x_v: Tensor,
-        x_a: Tensor,
-        x_g: Tensor,
-        x_copy: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def _lerp6_copy_cuda(
+        x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
+    ) -> tuple[Tensor, ...]:
         from ..kernels.lerp import fused_lerp6_copy
 
         return fused_lerp6_copy(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
 
-    @fused_lerp6_copy_op.register_fake
-    def _(
-        x: Tensor,
-        prev: Tensor,
-        x_r: Tensor,
-        x_w: Tensor,
-        x_k: Tensor,
-        x_v: Tensor,
-        x_a: Tensor,
-        x_g: Tensor,
-        x_copy: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        return tuple(torch.empty_like(x) for _ in range(6))  # pyright: ignore[reportReturnType]
+    def _lerp6_copy_cpu(
+        x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
+    ) -> tuple[Tensor, ...]:
+        diff = prev - x
+        x_copy.copy_(x)
+        return (
+            x + x_r * diff,
+            x + x_w * diff,
+            x + x_k * diff,
+            x + x_v * diff,
+            x + x_a * diff,
+            x + x_g * diff,
+        )
 
-    @torch.library.custom_op("rwkv_tl::fused_lerp1_copy", mutates_args=("x_copy",))
-    def fused_lerp1_copy_op(
-        x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor
-    ) -> Tensor:
+    def _lerp6_copy_meta(x, *_) -> tuple[Tensor, ...]:
+        return tuple(torch.empty_like(x) for _ in range(6))
+
+    _register(
+        "rwkv_tl::fused_lerp6_copy",
+        "(Tensor x, Tensor prev, Tensor x_r, Tensor x_w, Tensor x_k,"
+        " Tensor x_v, Tensor x_a, Tensor x_g, Tensor(a!) x_copy)"
+        " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+        _lerp6_copy_cuda,
+        _lerp6_copy_cpu,
+        _lerp6_copy_meta,
+    )
+
+    def _lerp1_copy_cuda(x, prev, w, x_copy) -> Tensor:
         from ..kernels.lerp import fused_lerp1_copy
 
         return fused_lerp1_copy(x, prev, w, x_copy)
 
-    @fused_lerp1_copy_op.register_fake
-    def _(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tensor:
+    def _lerp1_copy_cpu(x, prev, w, x_copy) -> Tensor:
+        x_copy.copy_(x)
+        return x + w * (prev - x)
+
+    def _lerp1_copy_meta(x, *_args) -> Tensor:
         return torch.empty_like(x)
+
+    _register(
+        "rwkv_tl::fused_lerp1_copy",
+        "(Tensor x, Tensor prev, Tensor w, Tensor(a!) x_copy) -> Tensor",
+        _lerp1_copy_cuda,
+        _lerp1_copy_cpu,
+        _lerp1_copy_meta,
+    )
 
     # ---- gates.py ----
 
-    @torch.library.custom_op("rwkv_tl::fused_w_gate", mutates_args=())
-    def fused_w_gate_op(x: Tensor, w0: Tensor) -> Tensor:
+    def _w_gate_cuda(x, w0) -> Tensor:
         from ..kernels.gates import fused_w_gate
 
         return fused_w_gate(x, w0)
 
-    @fused_w_gate_op.register_fake
-    def _(x: Tensor, w0: Tensor) -> Tensor:
+    def _w_gate_cpu(x, w0) -> Tensor:
+        import math
+
+        return torch.exp(-torch.sigmoid(w0 + x) / math.sqrt(math.e))
+
+    def _w_gate_meta(x, *_args) -> Tensor:
         return torch.empty_like(x)
 
-    @torch.library.custom_op("rwkv_tl::fused_v_gate", mutates_args=())
-    def fused_v_gate_op(v: Tensor, v_first: Tensor, v0: Tensor, v12: Tensor) -> Tensor:
+    _register(
+        "rwkv_tl::fused_w_gate",
+        "(Tensor x, Tensor w0) -> Tensor",
+        _w_gate_cuda,
+        _w_gate_cpu,
+        _w_gate_meta,
+    )
+
+    def _v_gate_cuda(v, v_first, v0, v12) -> Tensor:
         from ..kernels.gates import fused_v_gate
 
         return fused_v_gate(v, v_first, v0, v12)
 
-    @fused_v_gate_op.register_fake
-    def _(v: Tensor, v_first: Tensor, v0: Tensor, v12: Tensor) -> Tensor:
+    def _v_gate_cpu(v, v_first, v0, v12) -> Tensor:
+        return v + torch.sigmoid(v0 + v12) * (v_first - v)
+
+    def _v_gate_meta(v, *_args) -> Tensor:
         return torch.empty_like(v)
 
-    @torch.library.custom_op("rwkv_tl::fused_a_kk_k", mutates_args=())
-    def fused_a_kk_k_op(
-        a0: Tensor,
-        a_x: Tensor,
-        k: Tensor,
-        k_k: Tensor,
-        k_a: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    _register(
+        "rwkv_tl::fused_v_gate",
+        "(Tensor v, Tensor v_first, Tensor v0, Tensor v12) -> Tensor",
+        _v_gate_cuda,
+        _v_gate_cpu,
+        _v_gate_meta,
+    )
+
+    def _a_kk_k_cuda(a0, a_x, k, k_k, k_a) -> tuple[Tensor, Tensor, Tensor]:
         from ..kernels.gates import fused_a_kk_k
 
         return fused_a_kk_k(a0, a_x, k, k_k, k_a)
 
-    @fused_a_kk_k_op.register_fake
-    def _(
-        a0: Tensor,
-        a_x: Tensor,
-        k: Tensor,
-        k_k: Tensor,
-        k_a: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        return torch.empty_like(a0), torch.empty_like(k), torch.empty_like(k)
+    def _a_kk_k_cpu(a0, a_x, k, k_k, k_a) -> tuple[Tensor, Tensor, Tensor]:
+        a = torch.sigmoid(a0 + a_x)
+        return a, k * k_k, k + k_a * (k * a - k)
+
+    def _a_kk_k_meta(a0, *_args) -> tuple[Tensor, Tensor, Tensor]:
+        return torch.empty_like(a0), torch.empty_like(a0), torch.empty_like(a0)
+
+    _register(
+        "rwkv_tl::fused_a_kk_k",
+        "(Tensor a0, Tensor a_x, Tensor k, Tensor k_k, Tensor k_a)"
+        " -> (Tensor, Tensor, Tensor)",
+        _a_kk_k_cuda,
+        _a_kk_k_cpu,
+        _a_kk_k_meta,
+    )
 
     # ---- dplr.py ----
 
-    @torch.library.custom_op("rwkv_tl::fused_l2norm_neg_kk_a", mutates_args=())
-    def fused_l2norm_neg_kk_a_op(kk: Tensor, a: Tensor) -> tuple[Tensor, Tensor]:
+    def _l2norm_cuda(kk, a) -> tuple[Tensor, Tensor]:
         from ..kernels.dplr import fused_l2norm_neg_kk_a
 
         return fused_l2norm_neg_kk_a(kk, a)
 
-    @fused_l2norm_neg_kk_a_op.register_fake
-    def _(kk: Tensor, a: Tensor) -> tuple[Tensor, Tensor]:
+    def _l2norm_cpu(kk, a) -> tuple[Tensor, Tensor]:
+        den = torch.sqrt(torch.sum(kk * kk, dim=1, keepdim=True))
+        kk_norm = kk / torch.clamp(den, min=1e-12)
+        return kk_norm, -(kk_norm) * a
+
+    def _l2norm_meta(kk, *_args) -> tuple[Tensor, Tensor]:
         return torch.empty_like(kk), torch.empty_like(kk)
 
-    @torch.library.custom_op("rwkv_tl::fused_gn_rkrk", mutates_args=())
-    def fused_gn_rkrk_op(
-        y: Tensor,
-        r: Tensor,
-        k: Tensor,
-        v: Tensor,
-        r_k: Tensor,
-        ln_xW: Tensor,
-        ln_xB: Tensor,
-    ) -> Tensor:
+    _register(
+        "rwkv_tl::fused_l2norm_neg_kk_a",
+        "(Tensor kk, Tensor a) -> (Tensor, Tensor)",
+        _l2norm_cuda,
+        _l2norm_cpu,
+        _l2norm_meta,
+    )
+
+    def _gn_cuda(y, r, k, v, r_k, ln_xW, ln_xB) -> Tensor:
         from ..kernels.dplr import fused_gn_rkrk
 
         return fused_gn_rkrk(y, r, k, v, r_k, ln_xW, ln_xB)
 
-    @fused_gn_rkrk_op.register_fake
-    def _(
-        y: Tensor,
-        r: Tensor,
-        k: Tensor,
-        v: Tensor,
-        r_k: Tensor,
-        ln_xW: Tensor,
-        ln_xB: Tensor,
-    ) -> Tensor:
+    def _gn_cpu(y, r, k, v, r_k, ln_xW, ln_xB) -> Tensor:
+        import torch.nn.functional as F
+
+        h, n = y.shape
+        y_flat = F.group_norm(y.reshape(1, h * n), h, ln_xW, ln_xB, 64e-5).reshape(-1)
+        rkrk = torch.sum(r * k * r_k, dim=1, keepdim=True)
+        return y_flat + (rkrk * v).reshape(-1)
+
+    def _gn_meta(y, *_args) -> Tensor:
         # Output is flattened [H*N] for decode, or [T, H*N] for batched.
         return torch.empty(
             y.shape[:-2] + (y.shape[-2] * y.shape[-1],), dtype=y.dtype, device=y.device
         )
 
-    @torch.library.custom_op("rwkv_tl::fused_dplr", mutates_args=("S",))
-    def fused_dplr_op(
-        S: Tensor,
-        R: Tensor,
-        W: Tensor,
-        K: Tensor,
-        V: Tensor,
-        A: Tensor,
-        B: Tensor,
-    ) -> Tensor:
+    _register(
+        "rwkv_tl::fused_gn_rkrk",
+        "(Tensor y, Tensor r, Tensor k, Tensor v, Tensor r_k,"
+        " Tensor ln_xW, Tensor ln_xB) -> Tensor",
+        _gn_cuda,
+        _gn_cpu,
+        _gn_meta,
+    )
+
+    def _dplr_cuda(S, R, W, K, V, A, B) -> Tensor:
         from ..kernels.dplr import fused_dplr
 
         y, _ = fused_dplr(S, R, W, K, V, A, B)
         return y
 
-    @fused_dplr_op.register_fake
-    def _(
-        S: Tensor,
-        R: Tensor,
-        W: Tensor,
-        K: Tensor,
-        V: Tensor,
-        A: Tensor,
-        B: Tensor,
-    ) -> Tensor:
+    def _dplr_cpu(S, R, W, K, V, A, B) -> Tensor:
+        from ..kernels.dplr import fused_dplr
+
+        y, _ = fused_dplr(S, R, W, K, V, A, B)
+        return y
+
+    def _dplr_meta(S, R, *_args) -> Tensor:
         return torch.empty_like(R)
 
-    @torch.library.custom_op("rwkv_tl::fused_lerp6_rkv_copy", mutates_args=("x_copy",))
-    def fused_lerp6_rkv_copy_op(
-        x: Tensor,
-        prev: Tensor,
-        x_r: Tensor,
-        x_w: Tensor,
-        x_k: Tensor,
-        x_v: Tensor,
-        x_a: Tensor,
-        x_g: Tensor,
-        x_copy: Tensor,
-        rWt_stack: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    _register(
+        "rwkv_tl::fused_dplr",
+        "(Tensor(a!) S, Tensor R, Tensor W, Tensor K, Tensor V,"
+        " Tensor A, Tensor B) -> Tensor",
+        _dplr_cuda,
+        _dplr_cpu,
+        _dplr_meta,
+    )
+
+    def _lerp6_rkv_cuda(
+        x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy, rWt_stack
+    ) -> tuple[Tensor, ...]:
         from ..kernels.lerp import fused_lerp6_rkv_copy
 
         r, k, v, xv, xw, xa, xg = fused_lerp6_rkv_copy(
@@ -204,36 +279,51 @@ def _ensure_ops_registered() -> None:
         # r/k/v are views of the same stacked tensor; clone to avoid aliasing.
         return r.clone(), k.clone(), v.clone(), xv, xw, xa, xg
 
-    @fused_lerp6_rkv_copy_op.register_fake
-    def _(
-        x: Tensor,
-        prev: Tensor,
-        x_r: Tensor,
-        x_w: Tensor,
-        x_k: Tensor,
-        x_v: Tensor,
-        x_a: Tensor,
-        x_g: Tensor,
-        x_copy: Tensor,
-        rWt_stack: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        # r, k, v have shape [C]; xv, xw, xa, xg have shape [C]
-        return tuple(torch.empty_like(x) for _ in range(7))  # pyright: ignore[reportReturnType]
+    def _lerp6_rkv_cpu(
+        x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy, rWt_stack
+    ) -> tuple[Tensor, ...]:
+        xr, xw, xk, xv, xa, xg = _lerp6_copy_cpu(
+            x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
+        )
+        rkv = torch.stack([xr, xk, xv], dim=0) @ rWt_stack
+        return rkv[0], rkv[1], rkv[2], xv, xw, xa, xg
+
+    def _lerp6_rkv_meta(x, *_) -> tuple[Tensor, ...]:
+        return tuple(torch.empty_like(x) for _ in range(7))
+
+    _register(
+        "rwkv_tl::fused_lerp6_rkv_copy",
+        "(Tensor x, Tensor prev, Tensor x_r, Tensor x_w, Tensor x_k,"
+        " Tensor x_v, Tensor x_a, Tensor x_g, Tensor(a!) x_copy, Tensor rWt_stack)"
+        " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+        _lerp6_rkv_cuda,
+        _lerp6_rkv_cpu,
+        _lerp6_rkv_meta,
+    )
 
     # ---- gemm.py ----
 
-    @torch.library.custom_op("rwkv_tl::fused_rkv_gemm", mutates_args=())
-    def fused_rkv_gemm_op(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
+    def _rkv_gemm_cuda(xr, xk, xv, Wb) -> Tensor:
         from ..kernels.gemm import fused_rkv_gemm
 
         return fused_rkv_gemm(xr, xk, xv, Wb)
 
-    @fused_rkv_gemm_op.register_fake
-    def _(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
+    def _rkv_gemm_cpu(xr, xk, xv, Wb) -> Tensor:
+        return torch.stack([xr, xk, xv], dim=0) @ Wb
+
+    def _rkv_gemm_meta(xr, *_args) -> Tensor:
         # Output: [3, T, C]
         return torch.empty(
             3, xr.shape[0], xr.shape[1], dtype=xr.dtype, device=xr.device
         )
+
+    _register(
+        "rwkv_tl::fused_rkv_gemm",
+        "(Tensor xr, Tensor xk, Tensor xv, Tensor Wb) -> Tensor",
+        _rkv_gemm_cuda,
+        _rkv_gemm_cpu,
+        _rkv_gemm_meta,
+    )
 
 
 _ensure_ops_registered()

@@ -28,7 +28,7 @@ def _l2_rwkv(x: Tensor) -> Tensor:
 
 
 def _layer_norm(x: Tensor, w: Tensor, b: Tensor) -> Tensor:
-    return F.layer_norm(x, (x.shape[-1],), w, b, 1e-5)
+    return F.layer_norm(x, (x.shape[-1],), w, b)
 
 
 def _group_norm(x: Tensor, w: Tensor, b: Tensor, eps: float) -> Tensor:
@@ -164,101 +164,82 @@ class RWKV7Torch:
 
     def make_TMIX(self, i: int):
         b, att, H, N = self.w.blocks[i], self.w.blocks[i].att, self.H, self.N
-        lnW, lnB = b.ln1.w, b.ln1.b
-        x_r, x_w, x_k, x_v, x_a, x_g = (
-            att.x_r.reshape(-1),
-            att.x_w.reshape(-1),
-            att.x_k.reshape(-1),
-            att.x_v.reshape(-1),
-            att.x_a.reshape(-1),
-            att.x_g.reshape(-1),
-        )
-        rW, kW, vW, oW = (
-            att.receptance_weight,
-            att.key_weight,
-            att.value_weight,
-            att.output_weight,
-        )
-        w0, w1, w2, a0, a1, a2, v0, v1, v2 = (
-            att.w0.reshape(-1),
-            att.w1,
-            att.w2,
-            att.a0.reshape(-1),
-            att.a1,
-            att.a2,
-            att.v0.reshape(-1),
-            att.v1,
-            att.v2,
-        )
-        g1_t, g2_t, k_k, k_a, r_k, ln_xW, ln_xB = (
-            att.g1.T.contiguous(),
-            att.g2.T.contiguous(),
-            att.k_k.reshape(-1),
-            att.k_a.reshape(-1),
-            att.r_k,
-            att.ln_x_weight,
-            att.ln_x_bias,
-        )
 
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
         ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
-            x = _layer_norm(x0, lnW, lnB)
+            x = _layer_norm(x0, b.ln_pret.w, b.ln_pret.b)
             prev = state["x"]
 
-            xr = _lerp(x, prev, x_r)
-            xw = _lerp(x, prev, x_w)
-            xk = _lerp(x, prev, x_k)
-            xv = _lerp(x, prev, x_v)
-            xa = _lerp(x, prev, x_a)
-            xg = _lerp(x, prev, x_g)
+            xr = _lerp(x, prev, att.x_r.reshape(-1))
+            xw = _lerp(x, prev, att.x_w.reshape(-1))
+            xk = _lerp(x, prev, att.x_k.reshape(-1))
+            xv = _lerp(x, prev, att.x_v.reshape(-1))
+            xa = _lerp(x, prev, att.x_a.reshape(-1))
+            xg = _lerp(x, prev, att.x_g.reshape(-1))
             # copy after reading prev: state["x"] aliases prev, so an
             # earlier in-place copy_ here would corrupt prev before use.
             state["x"].copy_(x)
 
-            r = torch.mv(rW, xr)
-            k = torch.mv(kW, xk)
-            v = torch.mv(vW, xv)
+            r = torch.mv(att.receptance_weight, xr)
+            k = torch.mv(att.key_weight, xk)
+            v = torch.mv(att.value_weight, xv)
 
             if v_first is None:
                 v_first = v
             else:
-                v = _lerp(v, v_first, _sigmoid(v0 + xv @ v1 @ v2))
+                v = _lerp(
+                    v,
+                    v_first,
+                    _sigmoid(
+                        att.v0.reshape(-1)
+                        + xv @ att.v1 @ att.v2
+                    ),
+                )
 
-            w = torch.exp(-_sigmoid(w0 + torch.tanh(xw @ w1) @ w2) / (torch.e**0.5))
-            a = _sigmoid(a0 + xa @ a1 @ a2)
-            kk = k * k_k
-            k = _lerp(k, k * a, k_a)
+            w = torch.exp(
+                -_sigmoid(
+                    att.w0.reshape(-1)
+                    + torch.tanh(xw @ att.w1) @ att.w2
+                )
+                / (torch.e**0.5)
+            )
+            a = _sigmoid(att.a0.reshape(-1) + xa @ att.a1 @ att.a2)
+            kk = k * att.k_k.reshape(-1)
+            k = _lerp(k, k * a, att.k_a.reshape(-1))
 
             r, w, k, v, kk, a = [z.reshape(H, N) for z in (r, w, k, v, kk, a)]
             kk = _l2_rwkv(kk)
 
             y, state["rnn"] = _dplr_rwkv(state["rnn"], r, w, k, v, kk, -kk * a)
-            y = _group_norm(y, ln_xW, ln_xB, 64e-5)
-            y += (torch.sum(r * k * r_k, dim=1, keepdim=True) * v).reshape(-1)
-            g = torch.mv(g2_t, torch.sigmoid(torch.mv(g1_t, xg)))
-            return torch.addmv(x0, oW, (y * g)), v_first, state
+            y = _group_norm(y, att.ln_x.w, att.ln_x.b, 64e-5)
+            y += (
+                torch.sum(r * k * att.r_k, dim=1, keepdim=True) * v
+            ).reshape(-1)
+            g = torch.mv(
+                att.g2.T.contiguous(),
+                torch.sigmoid(torch.mv(att.g1.T.contiguous(), xg)),
+            )
+            return torch.addmv(x0, att.output_weight, (y * g)), v_first, state
 
         return layer
 
     def make_CMIX(self, i: int):
         b, ffn = self.w.blocks[i], self.w.blocks[i].ffn
-        lnW, lnB, x_k, kW, vW = (
-            b.ln2.w,
-            b.ln2.b,
-            ffn.x_k.reshape(-1),
-            ffn.key_weight,
-            ffn.value_weight,
-        )
 
         def layer(
             x0: Tensor, state: dict[str, Tensor]
         ) -> tuple[Tensor, dict[str, Tensor]]:
-            x_ln = _layer_norm(x0, lnW, lnB)
+            x_ln = _layer_norm(x0, b.ln_prec.w, b.ln_prec.b)
             prev = state["x"]
-            x = _lerp(x_ln, prev, x_k)
+            x = _lerp(x_ln, prev, ffn.x_k.reshape(-1))
             state["x"].copy_(x_ln)
-            return torch.addmv(x0, vW, _relusq(torch.mv(kW, x))), state
+            return (
+                torch.addmv(
+                    x0, ffn.value_weight, _relusq(torch.mv(ffn.key_weight, x))
+                ),
+                state,
+            )
 
         return layer
 
@@ -266,54 +247,35 @@ class RWKV7Torch:
         # Batched TMIX for prefill: [T, C] GEMM path instead of per-token GEMV.
         # DPLR recurrence stays serial over T (state-dependent).
         b, att, H, N = self.w.blocks[i], self.w.blocks[i].att, self.H, self.N
-        lnW, lnB = b.ln1.w, b.ln1.b
-        x_r, x_w, x_k, x_v, x_a, x_g = (
-            att.x_r.reshape(-1),
-            att.x_w.reshape(-1),
-            att.x_k.reshape(-1),
-            att.x_v.reshape(-1),
-            att.x_a.reshape(-1),
-            att.x_g.reshape(-1),
-        )
         rWt, kWt, vWt, oWt = (
             att.receptance_weight.T.contiguous(),
             att.key_weight.T.contiguous(),
             att.value_weight.T.contiguous(),
             att.output_weight.T.contiguous(),
         )
-        w0, w1, w2, a0, a1, a2, v0, v1, v2 = (
-            att.w0.reshape(-1),
+        w1, w2, a1, a2, v1, v2, g1, g2 = (
             att.w1,
             att.w2,
-            att.a0.reshape(-1),
             att.a1,
             att.a2,
-            att.v0.reshape(-1),
             att.v1,
             att.v2,
-        )
-        g1, g2, k_k, k_a, r_k, ln_xW, ln_xB = (
             att.g1,
             att.g2,
-            att.k_k.reshape(-1),
-            att.k_a.reshape(-1),
-            att.r_k,
-            att.ln_x_weight,
-            att.ln_x_bias,
         )
 
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
         ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
             T_len = x0.shape[0]
-            x = _layer_norm(x0, lnW, lnB)
+            x = _layer_norm(x0, b.ln_pret.w, b.ln_pret.b)
             prev = torch.cat([state["x"].unsqueeze(0), x[:-1]], dim=0)
-            xr = _lerp(x, prev, x_r)
-            xw = _lerp(x, prev, x_w)
-            xk = _lerp(x, prev, x_k)
-            xv = _lerp(x, prev, x_v)
-            xa = _lerp(x, prev, x_a)
-            xg = _lerp(x, prev, x_g)
+            xr = _lerp(x, prev, att.x_r.reshape(-1))
+            xw = _lerp(x, prev, att.x_w.reshape(-1))
+            xk = _lerp(x, prev, att.x_k.reshape(-1))
+            xv = _lerp(x, prev, att.x_v.reshape(-1))
+            xa = _lerp(x, prev, att.x_a.reshape(-1))
+            xg = _lerp(x, prev, att.x_g.reshape(-1))
             state["x"] = x[-1]
 
             r = xr @ rWt
@@ -323,12 +285,22 @@ class RWKV7Torch:
             if v_first is None:
                 v_first = v
             else:
-                v = _lerp(v, v_first, _sigmoid(v0 + xv @ v1 @ v2))
+                v = _lerp(
+                    v,
+                    v_first,
+                    _sigmoid(att.v0.reshape(-1) + xv @ v1 @ v2),
+                )
 
-            w = torch.exp(-_sigmoid(w0 + torch.tanh(xw @ w1) @ w2) / (torch.e**0.5))
-            a = _sigmoid(a0 + xa @ a1 @ a2)
-            kk = k * k_k
-            k = _lerp(k, k * a, k_a)
+            w = torch.exp(
+                -_sigmoid(
+                    att.w0.reshape(-1)
+                    + torch.tanh(xw @ w1) @ w2
+                )
+                / (torch.e**0.5)
+            )
+            a = _sigmoid(att.a0.reshape(-1) + xa @ a1 @ a2)
+            kk = k * att.k_k.reshape(-1)
+            k = _lerp(k, k * a, att.k_a.reshape(-1))
 
             r, w, k, v, kk, a = [z.view(T_len, H, N) for z in (r, w, k, v, kk, a)]
             kk = _l2_rwkv(kk)
@@ -341,8 +313,8 @@ class RWKV7Torch:
                 )
                 y[t] = y_t
 
-            y = F.group_norm(y.reshape(T_len, H * N), H, ln_xW, ln_xB, 64e-5)
-            rkrk = torch.sum(r * k * r_k, dim=-1, keepdim=True)
+            y = F.group_norm(y.reshape(T_len, H * N), H, att.ln_x.w, att.ln_x.b, 64e-5)
+            rkrk = torch.sum(r * k * att.r_k, dim=-1, keepdim=True)
             y = (y.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
             g = torch.sigmoid(xg @ g1) @ g2
             return x0 + (y * g) @ oWt, v_first, state
@@ -352,20 +324,14 @@ class RWKV7Torch:
     def make_CMIX_batch(self, i: int):
         # Batched CMIX for prefill: [T, C] GEMM path.
         b, ffn = self.w.blocks[i], self.w.blocks[i].ffn
-        lnW, lnB, x_k, kWt, vWt = (
-            b.ln2.w,
-            b.ln2.b,
-            ffn.x_k.reshape(-1),
-            ffn.key_weight.T.contiguous(),
-            ffn.value_weight.T.contiguous(),
-        )
+        kWt, vWt = ffn.key_weight.T.contiguous(), ffn.value_weight.T.contiguous()
 
         def layer(
             x0: Tensor, state: dict[str, Tensor]
         ) -> tuple[Tensor, dict[str, Tensor]]:
-            x_ln = _layer_norm(x0, lnW, lnB)
+            x_ln = _layer_norm(x0, b.ln_prec.w, b.ln_prec.b)
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
-            x = _lerp(x_ln, prev, x_k)
+            x = _lerp(x_ln, prev, ffn.x_k.reshape(-1))
             state["x"] = x_ln[-1]
             return x0 + _relusq(x @ kWt) @ vWt, state
 

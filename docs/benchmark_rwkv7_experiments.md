@@ -47,3 +47,22 @@
 - `prefill` 一旦被 `maybe_torch_compile` 包装，benchmark 每个不同 T 的 case 都会触发一次全新编译（0.4B 的 16×16 要 20+ 分钟），GPU 空闲、看起来像死锁。benchmark 现在通过 `_eager_dispatch` 走 eager 路径测实现本身；编译收益单独用脚本测。
 - 大规模 benchmark 在显存和内存受限的机器上容易触发 OOM，建议按 case 分开运行。
 - 对于长时间扫描，优先使用独立进程和日志文件方式执行，避免单次前台进程被中断。
+
+## decode 全融合单 kernel 的可行性评估（RTX 3060, 0.1B）
+
+背景：曾想用 tilelang 把 decode 的逐层 Python 循环（`for TM, CM in self.layers`）融合成一个动态层数的单 kernel，消除 ~130 次 kernel launch。
+
+测量结论：
+- eager decode 13.1 ms/token（wall），纯 GPU 11.1 ms；单次 decode 有 27 次 launch（~130 个小 kernel），主要为 GEMV（~1 ms）、`_fused_rkv_gemm`（12 次）、`_impl` reduce（95 次）、layernorm、elementwise。
+- **GraphDecoder（CUDA Graph）已到 1.63 ms/token**，且 profiler 显示 GPU kernel 总执行仅 1.55 ms、launch 间隙仅 ~0.08 ms。即 launch 开销已被 CUDA Graph 几乎完全消除。
+- 因此"全融合单 kernel"的理论上限 ≈ 1.55 ms，相对 GraphDecoder 只省 ~0.08 ms，收益极小。真正剩余成本是 ~1.5 ms 的 GEMV 计算本身，而非 launch。
+
+技术验证（tilelang）：
+- `T.gemm` 要求 M ≥ 16（MMA tile），decode 是 M=1 的 GEMV，不能直接用；手写 block-per-row + warp_reduce 的 GEMV 正确且比 cuBLAS `mv` 快（11.3 vs 17.4 μs @ C=768）。
+- `sync_grid` 需要 cooperative launch：grid=768 blocks × 32 threads 在 RTX 3060 上报 `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`，动态层数大网格不可行。
+- `@T.macro` 能复用 tilelang 代码片段（编译期内联，多 kernel 共享），但宏内**不能用 Python 条件分支切换张量索引**（`if batched:` 会被 tilelang 当运行时条件，生成错误代码）。因此 DPLR 的两个 kernel（T=1 输入 `[H,N]`、T>1 输入 `[T,H,N]`）索引布局不同，无法共用同一个宏；统一成 3D 布局需改 `fused_dplr` 公开契约，不值得。结论：DPLR 保持两处独立实现，不抽宏。
+
+方向决策：
+- **rwkv-tl 长期目标支持训练**。CUDA Graph 本质 inference-only：捕获前向启动序列、不重建 autograd 图（replay 不记录梯度，固定 buffer 与 autograd 动态建图冲突）。全融合单 kernel 并非本质 inference-only（任何自定义 kernel 都要显式 backward），但整层融合会让训练困难：需手写整层 backward（含串行 DPLR 递推的时间反向）并手工保存各算子的中间张量，远超 per-op custom op 路径的工作量。
+- 正确的训练路径是保留 `torch.library.custom_op`（`torch.ops.rwkv_tl.*`），通过 `register_autograd` 定义 backward。
+- 结论：decode 的优化应聚焦 GraphDecoder 那 1.5 ms GEMV 计算本身（如 output/FFN/低秩 gates 的 GEMV 优化），而不是全融合层数。不要为"融合"投入，除非能保持 autograd 能力。

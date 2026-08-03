@@ -2,12 +2,11 @@ import torch
 from torch import Tensor, nn
 
 
-class LNWeight(nn.Module):
+class LNWeight:
     w: Tensor
     b: Tensor
 
     def __init__(self, W, prefix: str):
-        super().__init__()
         self.w = W[f"{prefix}.weight"]
         self.b = W[f"{prefix}.bias"]
 
@@ -37,8 +36,7 @@ class RWKV7ATTWeight(nn.Module):
     key_weight: Tensor
     value_weight: Tensor
     output_weight: Tensor
-    ln_x_weight: Tensor
-    ln_x_bias: Tensor
+    ln_x: LNWeight
 
     def __init__(self, W, prefix: str):
         super().__init__()
@@ -66,32 +64,30 @@ class RWKV7ATTWeight(nn.Module):
         self.key_weight = W[f"{prefix}.key.weight"]
         self.value_weight = W[f"{prefix}.value.weight"]
         self.output_weight = W[f"{prefix}.output.weight"]
-        self.ln_x_weight = W[f"{prefix}.ln_x.weight"]
-        self.ln_x_bias = W[f"{prefix}.ln_x.bias"]
+        self.ln_x = LNWeight(W, f"{prefix}.ln_x")
 
 
-class RWKV7FFNWeight(nn.Module):
+class RWKV7FFNWeight:
     x_k: Tensor
     key_weight: Tensor
     value_weight: Tensor
 
     def __init__(self, W, prefix: str):
-        super().__init__()
         self.x_k = W[f"{prefix}.x_k"]
         self.key_weight = W[f"{prefix}.key.weight"]
         self.value_weight = W[f"{prefix}.value.weight"]
 
 
 class RWKV7Block(nn.Module):
-    ln1: LNWeight
-    ln2: LNWeight
+    ln_pret: LNWeight
+    ln_prec: LNWeight
     att: RWKV7ATTWeight
     ffn: RWKV7FFNWeight
 
     def __init__(self, W, prefix: str):
         super().__init__()
-        self.ln1 = LNWeight(W, f"{prefix}.ln1")
-        self.ln2 = LNWeight(W, f"{prefix}.ln2")
+        self.ln_pret = LNWeight(W, f"{prefix}.ln1")
+        self.ln_prec = LNWeight(W, f"{prefix}.ln2")
         self.att = RWKV7ATTWeight(W, f"{prefix}.att")
         self.ffn = RWKV7FFNWeight(W, f"{prefix}.ffn")
 
@@ -106,9 +102,9 @@ class RWKV7Weight(nn.Module):
     ln_out: LNWeight
     blocks: list[RWKV7Block]
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, device: str | torch.device | None = None):
         super().__init__()
-        W = torch.load(model_path)
+        W = torch.load(model_path, map_location=device)
 
         self.emb = W["emb.weight"]
         self.head = W["head.weight"]

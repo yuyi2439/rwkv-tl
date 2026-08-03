@@ -32,7 +32,6 @@ import importlib.util
 import inspect
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -45,11 +44,11 @@ for path in (SCRIPT_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pure_torch_rwkv7 import RWKV7Torch # noqa: E402
+from pure_torch_rwkv7 import RWKV7Torch  # noqa: E402
 
-from rwkv_tl import RWKV7 as ProjectRWKV7 # noqa: E402
-from rwkv_tl.model import RWKV7Weight # noqa: E402
-from rwkv_tl.state import State # noqa: E402
+from rwkv_tl import RWKV7 as ProjectRWKV7  # noqa: E402
+from rwkv_tl.model import RWKV7Weight  # noqa: E402
+from rwkv_tl.state import State  # noqa: E402
 
 
 def percentile(values, q):
@@ -211,17 +210,6 @@ def parse_targets(text: str) -> list[str]:
     return ordered
 
 
-def _build_materialized_checkpoint(checkpoint_path: Path, device: torch.device) -> Path:
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    moved = {
-        k: (v.to(device=device) if isinstance(v, torch.Tensor) else v)
-        for k, v in ckpt.items()
-    }
-    with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tmp:
-        torch.save(moved, tmp.name)
-        return Path(tmp.name)
-
-
 def _eager_dispatch(model, input_tokens, state):
     """Dispatch to the eager decode / prefill when available.
 
@@ -369,52 +357,59 @@ def bench_case_graph_decoder(
     return p10, p50, p90, tok_s
 
 
-def build_project_model(checkpoint_path: Path, vocab_path: Path, device: torch.device):
-    """加载权重并迁移到目标 device，构造 rwkv_tl.RWKV7 实例。
+def build_project_model(
+    checkpoint_path: Path,
+    device: torch.device,
+    is_torch_compile: bool = False,
+    w: RWKV7Weight | None = None,
+):
+    """构造 rwkv_tl.RWKV7 实例，权重位于目标 device。
 
-    RWKV7Weight.__init__ 内部会再次 torch.load，因此采用“迁移后另存临时
-    文件”的方式把 tensor 放到目标 device，再加载为 RWKV7Weight 传给 RWKV7。
+    ``RWKV7Weight`` 直接以目标 device 加载（``torch.load(map_location=device)``），
+    不再用临时文件搬移 checkpoint。
 
     Args:
         checkpoint_path (Path): 原始 .pth 权重路径。
-        vocab_path (Path): 词表文件路径。
         device (torch.device): 目标设备。
+        is_torch_compile (bool): True 时 decode 走 torch.compile（custom op
+            路径），False 时 eager raw kernels。注意每个不同 prompt 长度都会
+            重编译一张新图（分钟级），扫表场景请保持 False。
+        w: 可复用的 ``RWKV7Weight``（多个模型共享同一份权重时传入）。
 
     Returns:
-        ProjectRWKV7: 权重已位于 device 上的模型实例（is_torch_compile=False）。
+        ProjectRWKV7: 权重已位于 device 上的模型实例。
 
     Callers:
         - `benchmark_rwkv7.py:run_benchmark`: 构建 rwkv_tl 模型时调用。
     """
-    tmp_path = _build_materialized_checkpoint(checkpoint_path, device)
-
-    try:
-        model = ProjectRWKV7(RWKV7Weight(str(tmp_path)), is_torch_compile=False)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-    return model
+    if w is None:
+        w = RWKV7Weight(str(checkpoint_path), device=device)
+    return ProjectRWKV7(w, is_torch_compile=is_torch_compile)
 
 
 def build_pure_torch_model(
-    checkpoint_path: Path, vocab_path: Path, device: torch.device
+    checkpoint_path: Path,
+    device: torch.device,
+    is_torch_compile: bool = False,
+    w: RWKV7Weight | None = None,
 ):
     """Build the pure PyTorch RWKV7 baseline on the requested device."""
-    tmp_path = _build_materialized_checkpoint(checkpoint_path, device)
-
-    try:
-        model = RWKV7Torch(RWKV7Weight(str(tmp_path)), is_torch_compile=False)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-    return model
+    if w is None:
+        w = RWKV7Weight(str(checkpoint_path), device=device)
+    return RWKV7Torch(w, is_torch_compile=is_torch_compile)
 
 
-def build_graph_decoder(checkpoint_path: Path, vocab_path: Path):
+def build_graph_decoder(
+    checkpoint_path: Path,
+    vocab_path: Path,
+    w: RWKV7Weight | None = None,
+):
     """Build rwkv_tl GraphDecoder on CUDA."""
     from rwkv_tl.graph_decode import GraphDecoder
 
-    model = build_project_model(checkpoint_path, vocab_path, torch.device("cuda"))
+    model = build_project_model(
+        checkpoint_path, torch.device("cuda"), False, w
+    )
     return GraphDecoder(model)
 
 
@@ -497,6 +492,15 @@ def run_benchmark(args):
 
     correctness_tol = args.correctness_tol
     reference_model = None  # lazily built pure_torch reference for the gate
+    shared_w: RWKV7Weight | None = None  # lazily loaded, shared across targets
+
+    def _get_shared_w() -> RWKV7Weight:
+        nonlocal shared_w
+        if shared_w is None:
+            shared_w = RWKV7Weight(
+                str(args.project_checkpoint), device=rwkv_device
+            )
+        return shared_w
 
     for target in targets:
         if target == "faster3a_2607":
@@ -515,13 +519,19 @@ def run_benchmark(args):
             mode = "forward"
         elif target == "rwkv_tl":
             model = build_project_model(
-                Path(args.project_checkpoint), Path(args.vocab), rwkv_device
+                Path(args.project_checkpoint),
+                rwkv_device,
+                args.compile,
+                _get_shared_w(),
             )
             device = rwkv_device
             mode = "forward"
         elif target == "pure_torch":
             model = build_pure_torch_model(
-                Path(args.project_checkpoint), Path(args.vocab), rwkv_device
+                Path(args.project_checkpoint),
+                rwkv_device,
+                args.compile,
+                _get_shared_w(),
             )
             device = rwkv_device
             mode = "forward"
@@ -533,7 +543,9 @@ def run_benchmark(args):
                     flush=True,
                 )
                 continue
-            model = build_graph_decoder(Path(args.project_checkpoint), Path(args.vocab))
+            model = build_graph_decoder(
+                Path(args.project_checkpoint), Path(args.vocab), _get_shared_w()
+            )
             device = torch.device("cuda")
             mode = "decode"
         elif target in {"fla", "FlashRWKV"}:
@@ -551,7 +563,7 @@ def run_benchmark(args):
         if not args.no_correctness_check and target in ("rwkv_tl", "graph_decoder"):
             if reference_model is None:
                 reference_model = build_pure_torch_model(
-                    Path(args.project_checkpoint), Path(args.vocab), rwkv_device
+                    Path(args.project_checkpoint), rwkv_device, False, _get_shared_w()
                 )
             reference = reference_model
 
@@ -652,6 +664,14 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Build rwkv_tl / pure_torch with is_torch_compile=True (decode "
+        "goes through torch.compile + custom ops). Each distinct token count "
+        "recompiles a fresh graph (minutes), so prefer eager for sweeps; this "
+        "flag is for comparing compiled vs eager on a fixed case.",
+    )
     parser.add_argument(
         "--cases",
         default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16",
