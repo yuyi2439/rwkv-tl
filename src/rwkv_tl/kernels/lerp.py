@@ -11,8 +11,6 @@ compile time (compiled per-C, cached); only per-call sizes stay dynamic.
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
-import functools
-
 import tilelang
 import tilelang.language as T
 from torch import Tensor
@@ -21,7 +19,7 @@ from ._common import BLOCK
 from .gemm import fused_rkv_gemm
 
 
-@functools.cache
+@tilelang.jit(out_idx=[8, 9, 10, 11, 12, 13])
 def _lerp6_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -54,10 +52,10 @@ def _lerp6_kernel(C: int):
                     xa[i] = xi + x_a[i] * diff
                     xg[i] = xi + x_g[i] * diff
 
-    return tilelang.compile(_impl, out_idx=[8, 9, 10, 11, 12, 13])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[9, 10, 11, 12, 13, 14])
 def _lerp6_copy_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -92,10 +90,10 @@ def _lerp6_copy_kernel(C: int):
                     xa[i] = xi + x_a[i] * diff
                     xg[i] = xi + x_g[i] * diff
 
-    return tilelang.compile(_impl, out_idx=[9, 10, 11, 12, 13, 14])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[4])
 def _lerp1_copy_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -113,7 +111,7 @@ def _lerp1_copy_kernel(C: int):
                     x_copy[i] = x[i]
                     out[i] = x[i] + w[i] * (prev[i] - x[i])
 
-    return tilelang.compile(_impl, out_idx=[4])
+    return _impl
 
 
 # --------------------------------------------------------------------------- #

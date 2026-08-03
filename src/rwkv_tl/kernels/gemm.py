@@ -21,13 +21,10 @@ A single compilation serves any RWKV7 model via T.dynamic shapes (C and T_LEN).
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
-import functools
-
+import tilelang
+import tilelang.language as T
 import torch
 from torch import Tensor
-
-# tilelang import is deferred to first use so the module imports on CPU-only
-# machines without a CUDA toolchain.
 
 
 def _torch_bmm_rkv(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
@@ -57,34 +54,16 @@ def _gpu_supports_tl_bf16_gemm() -> bool:
     return (major, minor) >= (8, 0)
 
 
-@functools.cache
+@tilelang.jit(out_idx=[4])
 def _try_compile_tl_rkv(C: int):
     """Compile the tilelang T.gemm kernel for the current CUDA device and C.
 
-    C is a model constant baked at compile time; T_LEN stays dynamic. Returns
-    the compiled kernel on success, or None when:
-    - not on CUDA
-    - the GPU arch is below sm_80 (bf16 TransB MMA unsupported)
-    - tilelang is not installed/importable
-    - compilation fails for any other reason
-
-    On sm_80+ the compilation targets the device's native arch so WGMMA
-    (Hopper) or TCGEN5MMA (Blackwell) is used when available; otherwise Ampere
-    MMA.
+    C is a model constant baked at compile time; T_LEN stays dynamic. Compiled
+    lazily on first call (per-C, cached by tilelang's JIT). Only reached on
+    sm_80+ where the bf16 TransB MMA is available; target arch is auto-detected
+    from the current CUDA device (WGMMA on Hopper, TCGEN5MMA on Blackwell,
+    Ampere MMA otherwise).
     """
-    # Early-out: skip compilation on unsupported archs (sm_75, CPU).
-    if not _gpu_supports_tl_bf16_gemm():
-        return None
-
-    try:
-        import tilelang
-        import tilelang.language as T
-    except Exception:  # noqa: BLE001  (tilelang optional; fall back to bmm)
-        return None
-
-    major, minor = torch.cuda.get_device_capability()
-    target = {"kind": "cuda", "arch": f"sm_{major}{minor}"}
-
     T_LEN = T.dynamic("T_LEN")
     # Block tile sizes. block_M=16 matches the MMA M atom on sm_80+; block_N=64
     # and block_K=32 keep shared memory under the per-block limit and give the
@@ -92,7 +71,7 @@ def _try_compile_tl_rkv(C: int):
     BLOCK_M, BLOCK_N, BLOCK_K = 16, 64, 32
 
     @T.prim_func
-    def _fused_rkv_gemm(
+    def _impl(
         xr: T.Tensor((T_LEN, C), "bfloat16"),
         xk: T.Tensor((T_LEN, C), "bfloat16"),
         xv: T.Tensor((T_LEN, C), "bfloat16"),
@@ -126,10 +105,7 @@ def _try_compile_tl_rkv(C: int):
                 T.gemm(A_shared, B_shared, C_local)
             T.copy(C_local, rkv[bz, by * BLOCK_M, bx * BLOCK_N])
 
-    try:
-        return tilelang.compile(_fused_rkv_gemm, out_idx=[4], target=target)
-    except Exception:  # noqa: BLE001  (compilation failure -> bmm fallback)
-        return None
+    return _impl
 
 
 def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
@@ -155,7 +131,9 @@ def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
     """
     if xr.device.type != "cuda":
         return _torch_bmm_rkv(xr, xk, xv, Wb)
-    kernel = _try_compile_tl_rkv(xr.shape[1])
-    if kernel is not None:
-        return kernel(xr, xk, xv, Wb)
-    return _torch_bmm_rkv(xr, xk, xv, Wb)
+    if not _gpu_supports_tl_bf16_gemm():
+        return _torch_bmm_rkv(xr, xk, xv, Wb)
+    try:
+        return _try_compile_tl_rkv(xr.shape[1])(xr, xk, xv, Wb)
+    except Exception:  # noqa: BLE001  (compile failure -> bmm fallback)
+        return _torch_bmm_rkv(xr, xk, xv, Wb)

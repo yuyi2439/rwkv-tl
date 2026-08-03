@@ -10,7 +10,6 @@ model constant baked at compile time (compiled per-C, cached).
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
-import functools
 import math
 
 import tilelang
@@ -23,7 +22,7 @@ from ._common import BLOCK
 _SQRT_E = math.sqrt(math.e)  # exp decay gate constant
 
 
-@functools.cache
+@tilelang.jit(out_idx=[2])
 def _w_gate_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -41,10 +40,10 @@ def _w_gate_kernel(C: int):
                         T.exp(-T.sigmoid(s) / T.float32(_SQRT_E)), "bfloat16"
                     )
 
-    return tilelang.compile(_impl, out_idx=[2])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[4])
 def _v_gate_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -67,10 +66,10 @@ def _v_gate_kernel(C: int):
                         vf + sig * (T.cast(v_first[i], "float32") - vf), "bfloat16"
                     )
 
-    return tilelang.compile(_impl, out_idx=[4])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[5, 6, 7])
 def _a_kk_k_kernel(C: int):
     @T.prim_func
     def _impl(
@@ -101,7 +100,7 @@ def _a_kk_k_kernel(C: int):
                         kf + T.cast(k_a[i], "float32") * (kf * a_val - kf), "bfloat16"
                     )
 
-    return tilelang.compile(_impl, out_idx=[5, 6, 7])
+    return _impl
 
 
 # --------------------------------------------------------------------------- #

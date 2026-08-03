@@ -13,8 +13,6 @@ bit-exactness with PyTorch eager for fewer casts and better throughput.
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
-import functools
-
 import tilelang
 import tilelang.language as T
 import torch
@@ -26,20 +24,21 @@ from ._common import HEAD_DIM, SERIAL, WARP
 N = HEAD_DIM
 
 
-@functools.cache
+@tilelang.jit(out_idx=[2])
 def _l2norm_kernel(H: int):
     @T.prim_func
     def _impl(
         kk: T.Tensor((H, N), "bfloat16"),
         a: T.Tensor((H, N), "bfloat16"),
-        kk_norm_out: T.Tensor((H, N), "bfloat16"),
         b: T.Tensor((H, N), "bfloat16"),
     ):
-        """Fused L2-normalize(kk) + neg*multiply: B = -(kk/||kk||) * a.
+        """Fused L2-normalize(kk) in place + neg*multiply: B = -(kk/||kk||) * a.
 
-        Also writes the L2-normalized kk (kk/||kk||) so the caller can feed it to
-        the DPLR state update as the A ("kk-normalized key") term, matching the
-        reference DPLR formula S' = S*W + (S@kk_norm)@(-kk_norm*a) + V (x) K.
+        kk is overwritten with its L2-normalized value (kk/||kk||) so the caller
+        can feed it to the DPLR state update as the A ("kk-normalized key") term,
+        matching the reference DPLR formula S' = S*W + (S@kk_norm)@(-kk_norm*a)
+        + V (x) K. Only B is kernel-allocated; the write-back to kk is race-free
+        (each thread reads kk[h, idx] before writing the same indices).
         """
         with T.Kernel(H, threads=WARP) as h:
             n = T.get_thread_binding(0)
@@ -55,15 +54,15 @@ def _l2norm_kernel(H: int):
             for j in T.serial(SERIAL):
                 idx = n * SERIAL + j
                 kk_norm = T.cast(kk[h, idx], "float32") / den
-                kk_norm_out[h, idx] = T.cast(kk_norm, "bfloat16")
+                kk[h, idx] = T.cast(kk_norm, "bfloat16")
                 b[h, idx] = T.cast(
                     -(kk_norm * T.cast(a[h, idx], "float32")), "bfloat16"
                 )
 
-    return tilelang.compile(_impl, out_idx=[2, 3])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[7])
 def _gn_rkrk_kernel(H: int):
     @T.prim_func
     def _impl(
@@ -115,10 +114,10 @@ def _gn_rkrk_kernel(H: int):
                 residual = total_rkrk * T.cast(v[h, idx], "float32")
                 out[flat] = T.cast(y_aff + residual, "bfloat16")
 
-    return tilelang.compile(_impl, out_idx=[7])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[8])
 def _dplr_kernel(H: int):
     @T.prim_func
     def _impl(
@@ -170,10 +169,10 @@ def _dplr_kernel(H: int):
     # caller-supplied. Passing the SAME tensor as S (arg 0) and S_out (arg 7)
     # updates the state in-place. Race-free: each thread reads S[h, v_n, {2n, 2n+1}]
     # before writing the same indices.
-    return tilelang.compile(_impl, out_idx=[8])
+    return _impl
 
 
-@functools.cache
+@tilelang.jit(out_idx=[8])
 def _dplr_T_kernel(H: int):
     T_LEN = T.dynamic("T_LEN")
 
@@ -228,29 +227,34 @@ def _dplr_T_kernel(H: int):
                 if n == 0:
                     y_out[t, h, v_n] = T.cast(y_val, "bfloat16")
 
-    return tilelang.compile(_impl, out_idx=[8])
+    return _impl
 
 
 # --------------------------------------------------------------------------- #
 #  Python wrappers with CPU fallback
 # --------------------------------------------------------------------------- #
 def fused_l2norm_neg_kk_a(kk: Tensor, a: Tensor) -> tuple[Tensor, Tensor]:
-    """Fused L2-normalize(kk) + neg*multiply: B = -(kk/||kk||) * a.
+    """Fused L2-normalize(kk) in place + neg*multiply: B = -(kk/||kk||) * a.
+
+    kk is overwritten with its L2-normalized value; the returned first element
+    aliases kk.
 
     Args:
-        kk: Key-key tensor, [H, N].
+        kk: Key-key tensor, [H, N] (overwritten with the normalized value).
         a: Activation gate, [H, N].
 
     Returns:
-        (kk_norm, B): the L2-normalized key (kk/||kk||) and -kk_norm * a,
-        each [H, N], bf16. kk_norm feeds the DPLR A term; B is the decayed
-        key-key contribution.
+        (kk_norm, B): the L2-normalized key (kk/||kk||, same buffer as kk) and
+        -kk_norm * a, each [H, N], bf16. kk_norm feeds the DPLR A term; B is
+        the decayed key-key contribution.
     """
     if kk.device.type != "cuda":
         den = torch.sqrt(torch.sum(kk * kk, dim=1, keepdim=True))
         kk_norm = kk / torch.clamp(den, min=1e-12)
-        return kk_norm, -(kk_norm) * a
-    return _l2norm_kernel(kk.shape[0])(kk, a)
+        kk.copy_(kk_norm)
+        return kk, -(kk_norm) * a
+    b = _l2norm_kernel(kk.shape[0])(kk, a)
+    return kk, b
 
 
 def fused_gn_rkrk(

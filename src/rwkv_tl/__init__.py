@@ -343,7 +343,9 @@ class RWKV7:
             # recurrence inside), replacing the per-token Python loop.
             y, _ = fused_dplr_T(state["rnn"], r, w, k, v, kk_norm, B)
 
-            y_flat = F.group_norm(y.reshape(T_len, H * N), H, att.ln_x.w, att.ln_x.b, 64e-5)
+            y_flat = F.group_norm(
+                y.reshape(T_len, H * N), H, att.ln_x.w, att.ln_x.b, 64e-5
+            )
             rkrk = (r * k * r_k).sum(dim=2, keepdim=True)
             y_out = (y_flat.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
             g = torch.sigmoid(xg @ g1) @ g2
