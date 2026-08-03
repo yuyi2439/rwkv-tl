@@ -48,6 +48,8 @@ for path in (SCRIPT_ROOT, SRC_ROOT):
 from pure_torch_rwkv7 import RWKV7Torch
 
 from rwkv_tl import RWKV7 as ProjectRWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 
 def percentile(values, q):
@@ -125,9 +127,14 @@ class CorrectnessError(RuntimeError):
 def _fresh_logits(
     model, input_tokens, batch_size: int, device: torch.device
 ) -> torch.Tensor:
-    """Run ``model.forward`` on a fresh state; return flattened final logits."""
+    """Run ``model.forward`` on a fresh state; return flattened final logits.
+
+    Handles both ``forward -> (logits, state)`` (rwkv_tl / pure_torch) and
+    ``forward -> logits`` (faster3a_2607).
+    """
     state = make_state(model, batch_size, device)
-    logits, _ = model.forward(input_tokens, state)
+    out = model.forward(input_tokens, state)
+    logits = out[0] if isinstance(out, tuple) else out
     return logits.reshape(-1).float()
 
 
@@ -165,17 +172,19 @@ def make_state(model, batch_size: int, device: torch.device):
         - `benchmark_rwkv7.py:bench_case`: 每次计时前重置 state。
     """
     zero_state_fn = getattr(model, "zero_state", None)
-    if zero_state_fn is None:
-        raise AttributeError(f"{type(model).__name__} has no zero_state method")
-    try:
-        sig = inspect.signature(zero_state_fn)
-    except (TypeError, ValueError):
-        state = zero_state_fn()
-    else:
-        if len(sig.parameters) == 0:
+    if zero_state_fn is not None:
+        try:
+            sig = inspect.signature(zero_state_fn)
+        except (TypeError, ValueError):
             state = zero_state_fn()
         else:
-            state = zero_state_fn(batch_size)
+            if len(sig.parameters) == 0:
+                state = zero_state_fn()
+            else:
+                state = zero_state_fn(batch_size)
+    else:
+        w = model.w
+        state = State(w.N_LAYER, w.N_EMBD, 64, device=model.emb.device)
 
     return _move_tensors_to_device(state, device)
 
@@ -238,22 +247,19 @@ def _build_materialized_checkpoint(checkpoint_path: Path, device: torch.device) 
 
 
 def _eager_dispatch(model, input_tokens, state):
-    """Dispatch to the eager run_one / forward_prefill when available.
+    """Dispatch to the eager decode / prefill when available.
 
-    rwkv_tl and pure_torch wrap their prefill/decode methods with
-    @maybe_torch_compile, so `model.forward` would recompile a new graph for
-    every distinct token count (T) inside a benchmark sweep -- minutes per case
-    with the GPU idle. The benchmark measures the eager implementation, so route
-    through the raw methods. Other targets (faster3a, graph_decoder) keep
-    `model.forward`.
+    rwkv_tl / pure_torch instances are built with is_torch_compile=False, so
+    their decode/prefill are already eager and routing through them (rather
+    than `model.forward`) avoids recompiling a fresh graph for every distinct
+    token count (T) inside a benchmark sweep -- minutes per case with the GPU
+    idle. Other targets (faster3a, graph_decoder) keep `model.forward`.
     """
-    eager_run_one = getattr(model, "_eager_run_one", None)
-    eager_prefill = getattr(model, "_eager_forward_prefill", None)
-    if eager_run_one is None or eager_prefill is None:
-        return model.forward(input_tokens, state)
-    if input_tokens.numel() == 1:
-        return eager_run_one(int(input_tokens.item()), state)
-    return eager_prefill(input_tokens, state)
+    if isinstance(model, (ProjectRWKV7, RWKV7Torch)):
+        if input_tokens.numel() == 1:
+            return model.decode(int(input_tokens.item()), state)
+        return model.prefill(input_tokens, state)
+    return model.forward(input_tokens, state)
 
 
 def bench_case(
@@ -351,7 +357,8 @@ def bench_case_graph_decoder(
         for token in tokens:
             got = decoder.step(token)
         assert got is not None
-        ref_state = reference.zero_state()
+        w = reference.w
+        ref_state = State(w.N_LAYER, w.N_EMBD, 64, device=reference.emb.device)
         ref_logits, _ = reference.forward(tokens, ref_state)
         _check_correctness(
             got.reshape(-1).float(),
@@ -389,8 +396,8 @@ def bench_case_graph_decoder(
 def build_project_model(checkpoint_path: Path, vocab_path: Path, device: torch.device):
     """加载权重并迁移到目标 device，构造 rwkv_tl.RWKV7 实例。
 
-    RWKV7.__init__ 内部会再次 torch.load，因此采用“迁移后另存临时文件”
-    的方式把 tensor 放到目标 device，再传路径给 RWKV7。
+    RWKV7Weight.__init__ 内部会再次 torch.load，因此采用“迁移后另存临时
+    文件”的方式把 tensor 放到目标 device，再加载为 RWKV7Weight 传给 RWKV7。
 
     Args:
         checkpoint_path (Path): 原始 .pth 权重路径。
@@ -398,7 +405,7 @@ def build_project_model(checkpoint_path: Path, vocab_path: Path, device: torch.d
         device (torch.device): 目标设备。
 
     Returns:
-        ProjectRWKV7: 权重已位于 device 上的模型实例。
+        ProjectRWKV7: 权重已位于 device 上的模型实例（is_torch_compile=False）。
 
     Callers:
         - `benchmark_rwkv7.py:run_benchmark`: 构建 rwkv_tl 模型时调用。
@@ -406,7 +413,7 @@ def build_project_model(checkpoint_path: Path, vocab_path: Path, device: torch.d
     tmp_path = _build_materialized_checkpoint(checkpoint_path, device)
 
     try:
-        model = ProjectRWKV7(str(tmp_path), str(vocab_path))
+        model = ProjectRWKV7(RWKV7Weight(str(tmp_path)), is_torch_compile=False)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -420,7 +427,7 @@ def build_pure_torch_model(
     tmp_path = _build_materialized_checkpoint(checkpoint_path, device)
 
     try:
-        model = RWKV7Torch(str(tmp_path), str(vocab_path))
+        model = RWKV7Torch(RWKV7Weight(str(tmp_path)), is_torch_compile=False)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -561,18 +568,16 @@ def run_benchmark(args):
             raise ValueError(f"unknown target: {target}")
 
         # Correctness gate: compare each target's output against the pure-torch
-        # reference (built lazily, once). pure_torch is self-consistent.
+        # reference (built lazily, once). Applies to the project's own
+        # implementations (rwkv_tl, graph_decoder); pure_torch is
+        # self-consistent. Third-party faster3a_2607 is not gated.
         reference = None
-        if not args.no_correctness_check:
-            if target == "pure_torch":
-                reference = model
-            elif reference_model is None:
+        if not args.no_correctness_check and target in ("rwkv_tl", "graph_decoder"):
+            if reference_model is None:
                 reference_model = build_pure_torch_model(
                     Path(args.project_checkpoint), Path(args.vocab), rwkv_device
                 )
-                reference = reference_model
-            else:
-                reference = reference_model
+            reference = reference_model
 
         try:
             for B, T in parsed_cases:

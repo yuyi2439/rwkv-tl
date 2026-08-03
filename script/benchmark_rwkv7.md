@@ -28,7 +28,7 @@ uv run python script/benchmark_rwkv7.py \
 | 实现 | device | 路径 | 说明 |
 |---|---|---|---|
 | faster3a_2607 | cuda | forward | Albatross CUDA 扩展，wkv_seq kernel（T 维 kernel 内串行），编译目标 sm_75 |
-| rwkv_tl | cuda/cpu | forward | 本项目 fused kernel + GEMM 批处理；T=1 走 decode（run_one），T>1 走 prefill（forward_prefill, GEMM 批处理） |
+| rwkv_tl | cuda/cpu | forward | 本项目 fused kernel + 单 kernel prefill（fused_dplr_T：T 维串行递推在 kernel 内，一次 launch 交付整个序列）；T=1 走 decode（decode），T>1 走 prefill |
 | pure_torch | cuda/cpu | forward | 纯 PyTorch eager 基线，无自定义 kernel；同样 T=1 decode / T>1 prefill |
 | graph_decoder | cuda | decode | rwkv_tl + CUDA Graph 捕获单 token 解码，消除 launch 开销；T>1 时逐 token replay |
 
@@ -36,6 +36,7 @@ uv run python script/benchmark_rwkv7.py \
 - `--device cpu` 时，faster3a_2607 和 graph_decoder 自动跳过（CUDA-only）。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
 - 正确性门控默认开启：每个 case 计时前先把输出与 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。用 `--no-correctness-check` 关闭。
+- **MX450 2GB 显存注意**：0.4B 模型 + pure_torch 参考模型合计 ~2.4GB 超出显存，正确性门控会触发内存压力导致 0.4B rwkv_tl 延迟虚高 10x。0.4B MX450 数据使用 `--no-correctness-check` 采集。
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 
@@ -72,18 +73,18 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 9.18 | 108.95 |
-| faster3a_2607 | 1×32 | 44.03 | 726.81 |
-| faster3a_2607 | 1×64 | 47.69 | 1341.97 |
-| faster3a_2607 | 1×128 | 87.58 | 1461.47 |
-| rwkv_tl | 1×1 | 85.52 | 11.69 |
-| rwkv_tl | 1×32 | 214.79 | 148.98 |
-| rwkv_tl | 1×64 | 419.58 | 152.53 |
-| rwkv_tl | 1×128 | 659.60 | 194.06 |
-| pure_torch | 1×1 | 27.57 | 36.27 |
-| pure_torch | 1×32 | 267.67 | 119.55 |
-| pure_torch | 1×64 | 495.63 | 129.13 |
-| pure_torch | 1×128 | 820.61 | 155.98 |
+| faster3a_2607 | 1×1 | 9.80 | 102.02 |
+| faster3a_2607 | 1×32 | 43.93 | 728.39 |
+| faster3a_2607 | 1×64 | 46.93 | 1363.64 |
+| faster3a_2607 | 1×128 | 87.84 | 1457.13 |
+| rwkv_tl | 1×1 | 15.94 | 62.72 |
+| rwkv_tl | 1×32 | 24.71 | 1295.03 |
+| rwkv_tl | 1×64 | 27.74 | 2306.85 |
+| rwkv_tl | 1×128 | 37.56 | 3407.73 |
+| pure_torch | 1×1 | 23.01 | 43.46 |
+| pure_torch | 1×32 | 248.25 | 128.90 |
+| pure_torch | 1×64 | 410.57 | 155.88 |
+| pure_torch | 1×128 | 753.04 | 169.98 |
 | graph_decoder | 1×1 | 7.67 | 130.35 |
 | graph_decoder | 1×32 | 220.03 | 145.43 |
 | graph_decoder | 1×64 | 440.80 | 145.19 |
@@ -131,18 +132,17 @@ warmup=10, iters=20。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 16.21 | 61.70 |
-| faster3a_2607 | 1×32 | 168.23 | 190.21 |
-| faster3a_2607 | 1×64 | 153.49 | 416.97 |
-| faster3a_2607 | 1×128 | 222.78 | 574.55 |
-| rwkv_tl | 1×1 | 157.01 | 6.37 |
-| rwkv_tl | 1×32 | 289.71 | 110.46 |
-| rwkv_tl | 1×64 | 479.61 | 133.44 |
-| rwkv_tl | 1×128 | 791.40 | 161.74 |
-| pure_torch | 1×1 | 40.70 | 24.57 |
-| pure_torch | 1×32 | 372.20 | 85.98 |
-| pure_torch | 1×64 | 542.20 | 118.04 |
-| pure_torch | 1×128 | 1021.17 | 125.35 |
+| faster3a_2607 | 1×1 | 14.06 | 71.14 |
+| faster3a_2607 | 1×32 | 165.61 | 193.23 |
+| faster3a_2607 | 1×64 | 150.45 | 425.39 |
+| faster3a_2607 | 1×128 | 212.75 | 601.63 |
+| rwkv_tl | 1×1 | 21.35 | 46.84 |
+| rwkv_tl | 1×32 | 56.76 | 563.74 |
+| rwkv_tl | 1×64 | 67.54 | 947.56 |
+| rwkv_tl | 1×128 | 110.98 | 1153.36 |
+| pure_torch | 1×32 | 346.67 | 92.31 |
+| pure_torch | 1×64 | 638.33 | 100.26 |
+| pure_torch | 1×128 | 1328.24 | 96.37 |
 | graph_decoder | 1×1 | 21.94 | 45.57 |
 | graph_decoder | 1×32 | 652.04 | 49.08 |
 | graph_decoder | 1×64 | 1306.04 | 49.00 |
@@ -167,14 +167,18 @@ warmup=10, iters=20。
 - eager rwkv_tl 的 T=1 仍明显慢于 pure_torch（0.1B 40.5 vs 13.7ms；0.4B 85.1 vs 8.7ms），说明 fused kernel 的逐 token dispatch 开销在小模型上依旧占主导。
 - prefill（T≥32）rwkv_tl 与 pure_torch 接近（0.1B 1×32 118 vs 98ms；0.4B 1×32 179 vs 176ms），fused GEMM 批处理与纯 PyTorch 的 batched 路径基本打平，收益不如 MX450 上明显。
 - faster3a_2607 在所有 case 上大幅领先：prefill 已是 kernel 内串行的 T 维处理，B×T 增大几乎不影响单次延迟（0.4B 1×32 到 16×16 都约 16ms）。
-- 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `forward_prefill` 保持 eager。详见 docs/benchmark_rwkv7_experiments.md。
+- 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `prefill` 保持 eager。详见 docs/benchmark_rwkv7_experiments.md。
 
 ### CUDA (MX450, sm_75)
 
 - T=1 decode 时，graph_decoder 最快，说明 CUDA Graph 对单 token 解码的 launch 开销消除是有效的。
-- 纯 eager 的 rwkv_tl 在 T=1 上最慢（约为 pure_torch 的 ~3 倍），说明在这个硬件与路径下，逐 token dispatch 和 kernel launch 的额外开销很明显。
-- 在 prefill 场景（T≥32）中，rwkv_tl 的 fused GEMM 批处理已经快于 pure_torch（1×32: 215 vs 268ms），说明批处理收益在 MX450 上已经显现；但相比 Albatross 的单 kernel 长串行路径仍有差距。
-- 0.4B 相比 0.1B 的结果更慢，符合模型尺寸增大带来的额外计算成本。
+- **单 kernel prefill（fused_dplr_T）**：state 串行递推在 kernel 内、一次 launch 交付整个序列 + fp32io16 state。prefill 大幅提速并**反超 faster3a_2607**：
+  - 0.1B：1×32 24.7ms（1295 tok/s）vs faster3a 43.9ms（728 tok/s），快 **1.78x**；1×128 37.6ms（3408 tok/s）vs faster3a 87.8ms（1457 tok/s），快 **2.34x**。
+  - 0.4B：1×32 56.8ms（564 tok/s）vs faster3a 165.6ms（193 tok/s），快 **2.92x**；1×128 111.0ms（1153 tok/s）vs faster3a 212.8ms（602 tok/s），快 **1.92x**。
+- 对比 pure_torch：0.1B 1×128 快 20x（37.6 vs 753ms），0.4B 1×128 快 12x（111 vs 1328ms）。
+- T=1 decode 仍慢于 faster3a_2607（0.1B 15.9 vs 9.8ms，0.4B 21.4 vs 14.1ms），因 fused kernel 逐 token dispatch 开销；graph_decoder（CUDA Graph）可弥补此差距。
+- faster3a_2607 在 0.4B 上 T=64（150ms）反比 T=32（166ms）快，因其 chunk kernel 对不同序列长度有不同性能特征。
+- **MX450 2GB 显存限制**：0.4B 正确性门控会同时加载 pure_torch 参考模型（合计 ~2.4GB > 2GB），导致 rwkv_tl 延迟虚高 10x（540ms vs 实际 56ms）。0.4B 数据用 `--no-correctness-check` 采集。
 
 ### CPU
 

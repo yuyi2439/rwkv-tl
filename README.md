@@ -44,7 +44,7 @@ Key points:
 - rwkv_tl is the only path that supports both batched prefill and decode.
 - The Albatross reference (faster3a_2607) still leads all cases by a wide
   margin (4.32 ms on 1x1, ~7.5 ms on all prefill cases for 0.1B).
-- Compiling `forward_prefill` gives 1.11-1.43x on 0.1B, but recompiles a
+- Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmark_rwkv7_experiments.md`.
 

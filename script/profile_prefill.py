@@ -17,9 +17,10 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from rwkv_tl import RWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH")
-VOCAB = str(REPO / "asset" / "rwkv_vocab_v20230424.txt")
 T = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(T)]
 
@@ -27,20 +28,20 @@ if not CKPT:
     raise RuntimeError("RWKV_CHECKPOINT_PATH must be set")
 
 with torch.device("cuda"):
-    model = RWKV7(CKPT, VOCAB)
+    model = RWKV7(RWKV7Weight(CKPT))
 
 # warmup
 with torch.device("cuda"):
-    S = model.zero_state()
+    S = State(model.w.N_LAYER, model.w.N_EMBD, 64, device="cuda")
     for _ in range(3):
-        model.reset_state(S)
-        model.forward_prefill(TOKENS, S)
+        S.reset()
+        model.prefill(TOKENS, S)
 torch.cuda.synchronize()
 
 # profile
 with torch.device("cuda"):
-    S = model.zero_state()
-    model.reset_state(S)
+    S = State(model.w.N_LAYER, model.w.N_EMBD, 64, device="cuda")
+    S.reset()
 with (
     profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False
@@ -48,7 +49,7 @@ with (
     record_function("prefill_T32"),
     torch.device("cuda"),
 ):
-    model.forward_prefill(TOKENS, S)
+    model.prefill(TOKENS, S)
 
 # Group kernels by name keyword
 from collections import defaultdict

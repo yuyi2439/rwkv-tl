@@ -14,6 +14,8 @@ import torch
 
 from rwkv_tl import RWKV7
 from rwkv_tl.graph_decode import GraphDecoder
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
@@ -21,14 +23,19 @@ MAX_ABS_TOL = 4.0
 
 
 @pytest.fixture(scope="module")
-def model(ckpt_path: str, vocab_path: str) -> RWKV7:
+def model(ckpt_path: str) -> RWKV7:
     with torch.device("cuda"):
-        return RWKV7(ckpt_path, vocab_path)
+        return RWKV7(RWKV7Weight(ckpt_path))
 
 
 def _baseline_logits(model: RWKV7, tokens: list[int]) -> torch.Tensor:
     with torch.device("cuda"):
-        S = model.zero_state()
+        S = State(
+            model.w.N_LAYER,
+            model.w.N_EMBD,
+            64,
+            device=model.emb.device,
+        )
         logits, _ = model.forward(tokens, S)
     return logits.float().cpu()
 

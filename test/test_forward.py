@@ -20,6 +20,8 @@ import pytest
 import torch
 
 from rwkv_tl import RWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 # The pure-torch reference lives under script/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "script"))
@@ -30,26 +32,36 @@ TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
 MAX_ABS_TOL = 4.0  # bf16 rounding across 12 recurrent layers stays << this
 
 
+def _fresh_state(model) -> State:
+    return State(
+        model.w.N_LAYER,
+        model.w.N_EMBD,
+        64,
+        device=model.emb.device,
+    )
+
+
 def _run_decode(model, tokens) -> torch.Tensor:
     with torch.device("cuda"):
-        S = model.zero_state()
+        S = _fresh_state(model)
         logits = None
         for t in tokens:
-            logits, S = model._eager_run_one(t, S)
+            logits, S = model.decode(t, S)
     return logits.float().cpu()
 
 
 def _run_prefill(model, tokens) -> torch.Tensor:
     with torch.device("cuda"):
-        S = model.zero_state()
-        logits, _ = model.forward_prefill(tokens, S)
+        S = _fresh_state(model)
+        logits, _ = model.prefill(tokens, S)
     return logits.float().cpu()
 
 
 @pytest.fixture(scope="module")
-def models(ckpt_path: str, vocab_path: str) -> tuple[RWKV7, RWKV7Torch]:
+def models(ckpt_path: str) -> tuple[RWKV7, RWKV7Torch]:
     with torch.device("cuda"):
-        return RWKV7(ckpt_path, vocab_path), RWKV7Torch(ckpt_path, vocab_path)
+        w = RWKV7Weight(ckpt_path)
+        return RWKV7(w), RWKV7Torch(w)
 
 
 def _assert_consistent(got: torch.Tensor, ref: torch.Tensor, label: str) -> None:

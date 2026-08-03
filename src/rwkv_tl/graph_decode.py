@@ -1,11 +1,11 @@
 """CUDA Graph-accelerated single-token decoder for RWKV7.
 
-Captures one ``run_one`` step into a ``torch.cuda.CUDAGraph`` and replays it
+Captures one ``decode`` step into a ``torch.cuda.CUDAGraph`` and replays it
 per token, eliminating Python dispatch and kernel-launch overhead. On small
 models where launch overhead dominates GPU compute (profiler showed ~61% idle
 time on MX450), this gives the largest single speedup.
 
-Requires in-place state updates (see ``RWKV7.reset_state``) so that state
+Requires in-place state updates (see ``State.reset``) so that state
 tensor addresses stay fixed across replays.
 """
 
@@ -15,13 +15,15 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from rwkv_tl.state import State
+
 
 class GraphDecoder:
     """Single-token decoder backed by a captured CUDA Graph.
 
     Usage::
 
-        model = RWKV7(ckpt, vocab)  # weights on cuda
+        model = RWKV7(ckpt)  # weights on cuda
         dec = GraphDecoder(model)
         dec.reset()
         for tok in prompt:
@@ -54,7 +56,7 @@ class GraphDecoder:
 
     def reset(self) -> None:
         """Zero the RNN state in-place (keeps tensor addresses fixed)."""
-        self.model.reset_state(self.state)
+        self.state.reset()
 
     def step(self, token_id: int) -> Tensor:
         """Advance one token via graph replay.
@@ -75,10 +77,15 @@ class GraphDecoder:
     #  Internals
     # ------------------------------------------------------------------ #
 
-    def _cuda_state(self):
+    def _cuda_state(self) -> State:
         """Create a fresh zero state with all tensors on CUDA."""
         with torch.device("cuda"):
-            return self.model.zero_state()
+            return State(
+                self.model.N_LAYER,
+                self.model.N_EMBD,
+                self.model.HEAD_DIM,
+                device="cuda",
+            )
 
     def _run_step(self) -> Tensor:
         """Execute one forward step reading from ``token_buf``.
@@ -91,10 +98,12 @@ class GraphDecoder:
         """
         X = F.embedding(self.token_buf, self.model.emb).squeeze(0)
         v_first: Tensor | None = None
-        for (TM, CM), s in zip(self.model.layers, self.state):
-            X, v_first, s[0] = TM(X, v_first, s[0])
-            X, s[1] = CM(X, s[1])
-        return self.model.HEAD(self.model.NORM(X))
+        for (TM, CM), tmix_state, cmix_state in zip(
+            self.model.layers, self.state.tmix, self.state.cmix
+        ):
+            X, v_first, tmix_state = TM(X, v_first, tmix_state)
+            X, cmix_state = CM(X, cmix_state)
+        return self.model.HEAD(self.model.LN_OUT(X))
 
     def _capture(self, warmup: int) -> None:
         """Warmup on a side stream then capture the graph."""

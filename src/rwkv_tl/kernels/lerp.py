@@ -2,13 +2,16 @@
 
 Each kernel merges the x + w * (prev - x) LERP chain into one launch. The
 *_copy variants additionally write x into a caller-supplied buffer (state["x"])
-in-place, eliminating a separate copy_ call.
+in-place, eliminating a separate copy_ call. C is a model constant baked at
+compile time (compiled per-C, cached); only per-call sizes stay dynamic.
 """
 
 # tilelang's @T.prim_func DSL uses call expressions (T.Tensor(...)) in type
 # positions and tilelang-only intrinsics; pyright cannot type-check those.
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
+
+import functools
 
 import tilelang
 import tilelang.language as T
@@ -17,101 +20,100 @@ from torch import Tensor
 from ._common import BLOCK
 from .gemm import fused_rkv_gemm
 
-C = T.dynamic("C")
+
+@functools.cache
+def _lerp6_kernel(C: int):
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((C,), "bfloat16"),
+        prev: T.Tensor((C,), "bfloat16"),
+        x_r: T.Tensor((C,), "bfloat16"),
+        x_w: T.Tensor((C,), "bfloat16"),
+        x_k: T.Tensor((C,), "bfloat16"),
+        x_v: T.Tensor((C,), "bfloat16"),
+        x_a: T.Tensor((C,), "bfloat16"),
+        x_g: T.Tensor((C,), "bfloat16"),
+        xr: T.Tensor((C,), "bfloat16"),
+        xw: T.Tensor((C,), "bfloat16"),
+        xk: T.Tensor((C,), "bfloat16"),
+        xv: T.Tensor((C,), "bfloat16"),
+        xa: T.Tensor((C,), "bfloat16"),
+        xg: T.Tensor((C,), "bfloat16"),
+    ):
+        """Fused 6x LERP: out_i = x + w_i * (prev - x)."""
+        for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
+            for tx in T.thread_binding(BLOCK, "threadIdx.x"):
+                i = bx * BLOCK + tx
+                if i < C:
+                    xi = x[i]
+                    diff = prev[i] - xi
+                    xr[i] = xi + x_r[i] * diff
+                    xw[i] = xi + x_w[i] * diff
+                    xk[i] = xi + x_k[i] * diff
+                    xv[i] = xi + x_v[i] * diff
+                    xa[i] = xi + x_a[i] * diff
+                    xg[i] = xi + x_g[i] * diff
+
+    return tilelang.compile(_impl, out_idx=[8, 9, 10, 11, 12, 13])
 
 
-@T.prim_func
-def _fused_lerp6(
-    x: T.Tensor((C,), "bfloat16"),
-    prev: T.Tensor((C,), "bfloat16"),
-    x_r: T.Tensor((C,), "bfloat16"),
-    x_w: T.Tensor((C,), "bfloat16"),
-    x_k: T.Tensor((C,), "bfloat16"),
-    x_v: T.Tensor((C,), "bfloat16"),
-    x_a: T.Tensor((C,), "bfloat16"),
-    x_g: T.Tensor((C,), "bfloat16"),
-    xr: T.Tensor((C,), "bfloat16"),
-    xw: T.Tensor((C,), "bfloat16"),
-    xk: T.Tensor((C,), "bfloat16"),
-    xv: T.Tensor((C,), "bfloat16"),
-    xa: T.Tensor((C,), "bfloat16"),
-    xg: T.Tensor((C,), "bfloat16"),
-):
-    """Fused 6x LERP: out_i = x + w_i * (prev - x)."""
-    for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
-        for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-            i = bx * BLOCK + tx
-            if i < C:
-                xi = x[i]
-                diff = prev[i] - xi
-                xr[i] = xi + x_r[i] * diff
-                xw[i] = xi + x_w[i] * diff
-                xk[i] = xi + x_k[i] * diff
-                xv[i] = xi + x_v[i] * diff
-                xa[i] = xi + x_a[i] * diff
-                xg[i] = xi + x_g[i] * diff
+@functools.cache
+def _lerp6_copy_kernel(C: int):
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((C,), "bfloat16"),
+        prev: T.Tensor((C,), "bfloat16"),
+        x_r: T.Tensor((C,), "bfloat16"),
+        x_w: T.Tensor((C,), "bfloat16"),
+        x_k: T.Tensor((C,), "bfloat16"),
+        x_v: T.Tensor((C,), "bfloat16"),
+        x_a: T.Tensor((C,), "bfloat16"),
+        x_g: T.Tensor((C,), "bfloat16"),
+        x_copy: T.Tensor((C,), "bfloat16"),
+        xr: T.Tensor((C,), "bfloat16"),
+        xw: T.Tensor((C,), "bfloat16"),
+        xk: T.Tensor((C,), "bfloat16"),
+        xv: T.Tensor((C,), "bfloat16"),
+        xa: T.Tensor((C,), "bfloat16"),
+        xg: T.Tensor((C,), "bfloat16"),
+    ):
+        """Fused 6x LERP + copy x to x_copy buffer (in-place)."""
+        for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
+            for tx in T.thread_binding(BLOCK, "threadIdx.x"):
+                i = bx * BLOCK + tx
+                if i < C:
+                    xi = x[i]
+                    diff = prev[i] - xi
+                    x_copy[i] = xi
+                    xr[i] = xi + x_r[i] * diff
+                    xw[i] = xi + x_w[i] * diff
+                    xk[i] = xi + x_k[i] * diff
+                    xv[i] = xi + x_v[i] * diff
+                    xa[i] = xi + x_a[i] * diff
+                    xg[i] = xi + x_g[i] * diff
+
+    return tilelang.compile(_impl, out_idx=[9, 10, 11, 12, 13, 14])
 
 
-_fused_lerp6_kernel = tilelang.compile(_fused_lerp6, out_idx=[8, 9, 10, 11, 12, 13])
+@functools.cache
+def _lerp1_copy_kernel(C: int):
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((C,), "bfloat16"),
+        prev: T.Tensor((C,), "bfloat16"),
+        w: T.Tensor((C,), "bfloat16"),
+        x_copy: T.Tensor((C,), "bfloat16"),
+        out: T.Tensor((C,), "bfloat16"),
+    ):
+        """Fused single LERP + copy x to x_copy buffer (in-place)."""
+        for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
+            for tx in T.thread_binding(BLOCK, "threadIdx.x"):
+                i = bx * BLOCK + tx
+                if i < C:
+                    x_copy[i] = x[i]
+                    out[i] = x[i] + w[i] * (prev[i] - x[i])
 
-
-@T.prim_func
-def _fused_lerp6_copy(
-    x: T.Tensor((C,), "bfloat16"),
-    prev: T.Tensor((C,), "bfloat16"),
-    x_r: T.Tensor((C,), "bfloat16"),
-    x_w: T.Tensor((C,), "bfloat16"),
-    x_k: T.Tensor((C,), "bfloat16"),
-    x_v: T.Tensor((C,), "bfloat16"),
-    x_a: T.Tensor((C,), "bfloat16"),
-    x_g: T.Tensor((C,), "bfloat16"),
-    x_copy: T.Tensor((C,), "bfloat16"),
-    xr: T.Tensor((C,), "bfloat16"),
-    xw: T.Tensor((C,), "bfloat16"),
-    xk: T.Tensor((C,), "bfloat16"),
-    xv: T.Tensor((C,), "bfloat16"),
-    xa: T.Tensor((C,), "bfloat16"),
-    xg: T.Tensor((C,), "bfloat16"),
-):
-    """Fused 6x LERP + copy x to x_copy buffer (in-place)."""
-    for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
-        for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-            i = bx * BLOCK + tx
-            if i < C:
-                xi = x[i]
-                diff = prev[i] - xi
-                x_copy[i] = xi
-                xr[i] = xi + x_r[i] * diff
-                xw[i] = xi + x_w[i] * diff
-                xk[i] = xi + x_k[i] * diff
-                xv[i] = xi + x_v[i] * diff
-                xa[i] = xi + x_a[i] * diff
-                xg[i] = xi + x_g[i] * diff
-
-
-_fused_lerp6_copy_kernel = tilelang.compile(
-    _fused_lerp6_copy, out_idx=[9, 10, 11, 12, 13, 14]
-)
-
-
-@T.prim_func
-def _fused_lerp1_copy(
-    x: T.Tensor((C,), "bfloat16"),
-    prev: T.Tensor((C,), "bfloat16"),
-    w: T.Tensor((C,), "bfloat16"),
-    x_copy: T.Tensor((C,), "bfloat16"),
-    out: T.Tensor((C,), "bfloat16"),
-):
-    """Fused single LERP + copy x to x_copy buffer (in-place)."""
-    for bx in T.thread_binding((C + BLOCK - 1) // BLOCK, "blockIdx.x"):  # type: ignore[operator]
-        for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-            i = bx * BLOCK + tx
-            if i < C:
-                x_copy[i] = x[i]
-                out[i] = x[i] + w[i] * (prev[i] - x[i])
-
-
-_fused_lerp1_copy_kernel = tilelang.compile(_fused_lerp1_copy, out_idx=[4])
+    return tilelang.compile(_impl, out_idx=[4])
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +149,7 @@ def fused_lerp6(
             x + x_a * diff,
             x + x_g * diff,
         )
-    return _fused_lerp6_kernel(x, prev, x_r, x_w, x_k, x_v, x_a, x_g)
+    return _lerp6_kernel(x.shape[0])(x, prev, x_r, x_w, x_k, x_v, x_a, x_g)
 
 
 def fused_lerp6_copy(
@@ -186,7 +188,7 @@ def fused_lerp6_copy(
             x + x_a * diff,
             x + x_g * diff,
         )
-    return _fused_lerp6_copy_kernel(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
+    return _lerp6_copy_kernel(x.shape[0])(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
 
 
 def fused_lerp1_copy(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tensor:
@@ -207,7 +209,7 @@ def fused_lerp1_copy(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tens
         out = x + w * (prev - x)
         x_copy.copy_(x)
         return out
-    return _fused_lerp1_copy_kernel(x, prev, w, x_copy)
+    return _lerp1_copy_kernel(x.shape[0])(x, prev, w, x_copy)
 
 
 def fused_lerp6_rkv_copy(

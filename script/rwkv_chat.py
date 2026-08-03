@@ -5,6 +5,9 @@ import argparse
 import torch
 
 from rwkv_tl import RWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
+from rwkv_tl.tokenizer import Tokenizer
 
 
 def parse_args():
@@ -26,19 +29,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def greedy_generate(model, S, logits, max_tokens: int):
-    tokens = []
-    for _ in range(max_tokens):
-        token = int(torch.argmax(logits))
-        tokens.append(token)
-        logits, S = model.forward([token], S)
-    return tokens, S
-
-
 def main():
     args = parse_args()
-    model = RWKV7(args.checkpoint, args.vocab)
-    S = model.zero_state()
+    model = RWKV7(RWKV7Weight(args.checkpoint))
+    tokenizer = Tokenizer(args.vocab)
+    S = State(
+        model.w.N_LAYER,
+        model.w.N_EMBD,
+        64,
+        device=model.emb.device,
+    )
 
     print("Simple RWKV chat. Empty input exits.")
     while True:
@@ -47,10 +47,9 @@ def main():
             print("Exit.")
             break
 
-        user_tokens = model.encode(text + "\n")
-        logits, S = model.forward(user_tokens, S)
-        response_tokens, S = greedy_generate(model, S, logits, args.max_tokens)
-        response = model.decode(response_tokens)
+        user_tokens = tokenizer.encode(text + "\n")
+        response_tokens, S = model.generate(user_tokens, S, args.max_tokens)
+        response = tokenizer.decode(response_tokens)
 
         print("assistant:", response)
 

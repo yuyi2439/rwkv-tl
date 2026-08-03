@@ -25,8 +25,9 @@ sys.path.insert(0, str(REPO / "script"))
 from pure_torch_rwkv7 import RWKV7Torch
 
 from rwkv_tl import RWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
-VOCAB = str(REPO / "asset" / "rwkv_vocab_v20230424.txt")
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH", "")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,16 +35,13 @@ N_PREFILL = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_PREFILL)]
 
 
-def move_state(state, device):
-    for layer_state in state:
-        for slot in layer_state:
-            for k, v in slot.items():
-                slot[k] = v.to(device)
-    return state
-
-
-def fresh_state(model):
-    return move_state(model.zero_state(), DEVICE)
+def fresh_state(model) -> State:
+    return State(
+        model.w.N_LAYER,
+        model.w.N_EMBD,
+        64,
+        device=model.emb.device,
+    )
 
 
 def detect_breaks(fn, args, label):
@@ -62,7 +60,7 @@ def detect_breaks(fn, args, label):
         return -1
 
 
-def test_consistency(model, label):
+def test_consistency(eager_model, compiled_model, label):
     print(f"\n{'=' * 60}")
     print(f"CONSISTENCY: {label}")
     print(f"{'=' * 60}")
@@ -70,62 +68,62 @@ def test_consistency(model, label):
     # Decode: eager vs compiled (identical on non-bf16-native devices where
     # torch.compile is disabled; on sm_80+/AMD this compares the two paths).
     tok_int = TOKENS[0]
-    s1 = fresh_state(model)
-    s2 = fresh_state(model)
+    s1 = fresh_state(eager_model)
+    s2 = fresh_state(compiled_model)
     with torch.no_grad():
-        out_eager, _ = model._eager_run_one(tok_int, s1)
+        out_eager, _ = eager_model.decode(tok_int, s1)
     with torch.no_grad():
-        out_compiled, _ = model.run_one(tok_int, s2)
+        out_compiled, _ = compiled_model.decode(tok_int, s2)
     diff = (out_eager.float() - out_compiled.float()).abs()
     print(
         f"  decode:  max_diff={diff.max().item():.6e}  mean_diff={diff.mean().item():.6e}"
     )
 
 
-def quick_bench(model, label, iters=5):
+def quick_bench(eager_model, compiled_model, label, iters=5):
     print(f"\n{'=' * 60}")
     print(f"BENCH: {label}")
     print(f"{'=' * 60}")
 
     for path_name, n_tok, fn_name in [
-        ("decode", 1, "run_one"),
-        ("prefill", N_PREFILL, "forward_prefill"),
+        ("decode", 1, "decode"),
+        ("prefill", N_PREFILL, "prefill"),
     ]:
         tok = (
             TOKENS[0]
-            if fn_name == "run_one"
+            if fn_name == "decode"
             else torch.tensor(TOKENS, dtype=torch.long, device=DEVICE)
         )
 
         # eager
         for _ in range(2):
-            s = fresh_state(model)
-            model._eager_run_one(
+            s = fresh_state(eager_model)
+            eager_model.decode(tok, s) if fn_name == "decode" else eager_model.prefill(
                 tok, s
-            ) if fn_name == "run_one" else model.forward_prefill(tok, s)
+            )
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(iters):
-            s = fresh_state(model)
-            model._eager_run_one(
+            s = fresh_state(eager_model)
+            eager_model.decode(tok, s) if fn_name == "decode" else eager_model.prefill(
                 tok, s
-            ) if fn_name == "run_one" else model.forward_prefill(tok, s)
+            )
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         eager_ms = (time.perf_counter() - t0) / iters * 1000
 
         # compiled (decode only; prefill stays eager)
-        if fn_name == "run_one":
-            compiled = model.run_one
+        if fn_name == "decode":
+            compiled = compiled_model.decode
             for _ in range(3):
-                s = fresh_state(model)
+                s = fresh_state(compiled_model)
                 compiled(tok, s)
             if DEVICE.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(iters):
-                s = fresh_state(model)
+                s = fresh_state(compiled_model)
                 compiled(tok, s)
             if DEVICE.type == "cuda":
                 torch.cuda.synchronize()
@@ -148,36 +146,36 @@ def main():
     print(f"PyTorch: {torch.__version__}")
 
     with torch.device(DEVICE):
-        tl_model = RWKV7(CKPT, VOCAB)
-        pure_model = RWKV7Torch(CKPT, VOCAB)
+        w = RWKV7Weight(CKPT)
+        tl_model = RWKV7(w, is_torch_compile=True)
+        tl_eager = RWKV7(w, is_torch_compile=False)
+        pure_model = RWKV7Torch(w, is_torch_compile=True)
+        pure_eager = RWKV7Torch(w, is_torch_compile=False)
 
     models = [("rwkv_tl", tl_model), ("pure_torch", pure_model)]
+    eagers = {"rwkv_tl": tl_eager, "pure_torch": pure_eager}
 
     # 1. Graph break detection
     for label, model in models:
-        # decode: eager run_one closures (custom ops on native-bf16 devices,
+        # decode: eager decode closures (custom ops on native-bf16 devices,
         # raw kernels elsewhere); traces the path torch.compile would compile.
         s_d = fresh_state(model)
-        detect_breaks(
-            model._eager_run_one, (TOKENS[0], s_d), f"{label} decode (run_one)"
-        )
+        detect_breaks(model.decode, (TOKENS[0], s_d), f"{label} decode")
 
-        # prefill: forward_prefill with 32 tokens. Not torch.compile'd (each
+        # prefill: prefill with 32 tokens. Not torch.compile'd (each
         # prompt length would recompile a graph for <1.5x; kept eager), so this
         # traces the eager closures, which still graph-break on the raw kernels.
         tok_p = torch.tensor(TOKENS, dtype=torch.long, device=DEVICE)
         s_p = fresh_state(model)
-        detect_breaks(
-            model.forward_prefill, (tok_p, s_p), f"{label} prefill (forward_prefill)"
-        )
+        detect_breaks(model.prefill, (tok_p, s_p), f"{label} prefill")
 
     # 2. Numerical consistency
     for label, model in models:
-        test_consistency(model, label)
+        test_consistency(eagers[label], model, label)
 
     # 3. Quick benchmark
     for label, model in models:
-        quick_bench(model, label)
+        quick_bench(eagers[label], model, label)
 
     print("\nDone.")
 

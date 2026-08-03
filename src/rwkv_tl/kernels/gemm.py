@@ -21,13 +21,13 @@ A single compilation serves any RWKV7 model via T.dynamic shapes (C and T_LEN).
 # pyright: reportInvalidTypeForm=false, reportCallIssue=false, reportAttributeAccessIssue=false
 from __future__ import annotations
 
+import functools
+
 import torch
 from torch import Tensor
 
 # tilelang import is deferred to first use so the module imports on CPU-only
 # machines without a CUDA toolchain.
-_TL_AVAILABLE: bool | None = None
-_TL_RKV_KERNEL = None
 
 
 def _torch_bmm_rkv(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
@@ -57,42 +57,34 @@ def _gpu_supports_tl_bf16_gemm() -> bool:
     return (major, minor) >= (8, 0)
 
 
-def _try_compile_tl_rkv():
-    """Compile the tilelang T.gemm kernel for the current CUDA device.
+@functools.cache
+def _try_compile_tl_rkv(C: int):
+    """Compile the tilelang T.gemm kernel for the current CUDA device and C.
 
-    Returns the compiled kernel on success, or None when:
+    C is a model constant baked at compile time; T_LEN stays dynamic. Returns
+    the compiled kernel on success, or None when:
     - not on CUDA
     - the GPU arch is below sm_80 (bf16 TransB MMA unsupported)
     - tilelang is not installed/importable
     - compilation fails for any other reason
 
-    The kernel is compiled once and cached in _TL_RKV_KERNEL. On sm_80+ the
-    compilation targets the device's native arch so WGMMA (Hopper) or
-    TCGEN5MMA (Blackwell) is used when available; otherwise Ampere MMA.
+    On sm_80+ the compilation targets the device's native arch so WGMMA
+    (Hopper) or TCGEN5MMA (Blackwell) is used when available; otherwise Ampere
+    MMA.
     """
-    global _TL_RKV_KERNEL, _TL_AVAILABLE
-    if _TL_RKV_KERNEL is not None:
-        return _TL_RKV_KERNEL
-    if _TL_AVAILABLE is False:
-        return None
-
     # Early-out: skip compilation on unsupported archs (sm_75, CPU).
     if not _gpu_supports_tl_bf16_gemm():
-        _TL_AVAILABLE = False
         return None
 
     try:
         import tilelang
         import tilelang.language as T
     except Exception:  # noqa: BLE001  (tilelang optional; fall back to bmm)
-        _TL_AVAILABLE = False
         return None
-    _TL_AVAILABLE = True
 
     major, minor = torch.cuda.get_device_capability()
     target = {"kind": "cuda", "arch": f"sm_{major}{minor}"}
 
-    C_dyn = T.dynamic("C")
     T_LEN = T.dynamic("T_LEN")
     # Block tile sizes. block_M=16 matches the MMA M atom on sm_80+; block_N=64
     # and block_K=32 keep shared memory under the per-block limit and give the
@@ -101,11 +93,11 @@ def _try_compile_tl_rkv():
 
     @T.prim_func
     def _fused_rkv_gemm(
-        xr: T.Tensor((T_LEN, C_dyn), "bfloat16"),
-        xk: T.Tensor((T_LEN, C_dyn), "bfloat16"),
-        xv: T.Tensor((T_LEN, C_dyn), "bfloat16"),
-        Wb: T.Tensor((3, C_dyn, C_dyn), "bfloat16"),
-        rkv: T.Tensor((3, T_LEN, C_dyn), "bfloat16"),
+        xr: T.Tensor((T_LEN, C), "bfloat16"),
+        xk: T.Tensor((T_LEN, C), "bfloat16"),
+        xv: T.Tensor((T_LEN, C), "bfloat16"),
+        Wb: T.Tensor((3, C, C), "bfloat16"),
+        rkv: T.Tensor((3, T_LEN, C), "bfloat16"),
     ):
         """Fused r/k/v GEMM: rkv[b] = X[b] @ Wb[b] for b in {0,1,2}.
 
@@ -114,7 +106,7 @@ def _try_compile_tl_rkv():
         weight slice is chosen via a runtime branch inside the k-loop.
         """
         with T.Kernel(
-            T.ceildiv(C_dyn, BLOCK_N),
+            T.ceildiv(C, BLOCK_N),
             T.ceildiv(T_LEN, BLOCK_M),
             3,
             threads=128,
@@ -123,7 +115,7 @@ def _try_compile_tl_rkv():
             B_shared = T.alloc_shared((BLOCK_K, BLOCK_N), "bfloat16")
             C_local = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
             T.clear(C_local)
-            for k in T.Pipelined(T.ceildiv(C_dyn, BLOCK_K), num_stages=3):
+            for k in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=3):
                 if bz == 0:
                     T.copy(xr[by * BLOCK_M, k * BLOCK_K], A_shared)
                 elif bz == 1:
@@ -135,10 +127,9 @@ def _try_compile_tl_rkv():
             T.copy(C_local, rkv[bz, by * BLOCK_M, bx * BLOCK_N])
 
     try:
-        _TL_RKV_KERNEL = tilelang.compile(_fused_rkv_gemm, out_idx=[4], target=target)
+        return tilelang.compile(_fused_rkv_gemm, out_idx=[4], target=target)
     except Exception:  # noqa: BLE001  (compilation failure -> bmm fallback)
-        _TL_RKV_KERNEL = None
-    return _TL_RKV_KERNEL
+        return None
 
 
 def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
@@ -164,7 +155,7 @@ def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
     """
     if xr.device.type != "cuda":
         return _torch_bmm_rkv(xr, xk, xv, Wb)
-    kernel = _try_compile_tl_rkv()
+    kernel = _try_compile_tl_rkv(xr.shape[1])
     if kernel is not None:
         return kernel(xr, xk, xv, Wb)
     return _torch_bmm_rkv(xr, xk, xv, Wb)

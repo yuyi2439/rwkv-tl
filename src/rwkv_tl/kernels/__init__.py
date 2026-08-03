@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .dplr import (
     fused_dplr,
+    fused_dplr_T,
     fused_gn_rkrk,
     fused_l2norm_neg_kk_a,
 )
@@ -29,6 +30,7 @@ from .lerp import (
 __all__ = [
     "fused_a_kk_k",
     "fused_dplr",
+    "fused_dplr_T",
     "fused_gn_rkrk",
     "fused_l2norm_neg_kk_a",
     "fused_lerp1_copy",

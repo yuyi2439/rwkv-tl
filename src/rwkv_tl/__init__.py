@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +11,7 @@ from ._compat import maybe_torch_compile, supports_native_bf16
 from .kernels import (
     fused_a_kk_k,
     fused_dplr,
+    fused_dplr_T,
     fused_gn_rkrk,
     fused_l2norm_neg_kk_a,
     fused_lerp1_copy,
@@ -20,74 +20,13 @@ from .kernels import (
     fused_v_gate,
     fused_w_gate,
 )
-from .tokenizer import Tokenizer
-
-
-class _TmixCache(TypedDict):
-    lnW: Tensor
-    lnB: Tensor
-    x_x: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
-    oW: Tensor
-    rWt_stack: Tensor
-    oWt: Tensor
-    w0: Tensor
-    w1: Tensor
-    w2: Tensor
-    a0: Tensor
-    a1: Tensor
-    a2: Tensor
-    v0: Tensor
-    v1: Tensor
-    v2: Tensor
-    g1: Tensor
-    g2: Tensor
-    k_k: Tensor
-    k_a: Tensor
-    r_k: Tensor
-    ln_xW: Tensor
-    ln_xB: Tensor
-
-
-class _CMixCache(TypedDict):
-    lnW: Tensor
-    lnB: Tensor
-    x_k: Tensor
-    kW: Tensor
-    vW: Tensor
-    kWt: Tensor
-    vWt: Tensor
-
-
-def SIGMOID(x: Tensor) -> Tensor:
-    """Numerically stable sigmoid via the fused torch primitive."""
-    return torch.sigmoid(x)
+from .model import RWKV7Weight
+from .state import State
 
 
 def RELUSQ(x: Tensor) -> Tensor:
     """Squared ReLU; `F.relu(x) ** 2` fuses to a single kernel."""
     return F.relu(x) ** 2
-
-
-def LERP(x: Tensor, y: Tensor, w: Tensor) -> Tensor:
-    """Linear interpolation `x + w*(y-x)`.
-
-    `torch.lerp` is NOT used: on bf16 it falls back to separate sub/mul/add
-    kernels (verified via profiler), offering no fusion benefit over the
-    explicit form.
-    """
-    return x + w * (y - x)
-
-
-def L2_RWKV(x: Tensor) -> Tensor:
-    """L2-normalize rows along dim=1.
-
-    `F.normalize` is NOT used: it dispatches to the same reduce+elementwise
-    kernels as the explicit form (verified via profiler), so the explicit
-    form is kept for clarity and to avoid the extra `max(||x||, eps)` vs
-    `clamp(..., min=eps)` semantic divergence.
-    """
-    den = torch.sqrt(torch.sum(x * x, dim=1, keepdim=True))
-    return x / torch.clamp(den, min=1e-12)
 
 
 def LAYER_NORM(x: Tensor, w: Tensor, b: Tensor) -> Tensor:
@@ -104,154 +43,51 @@ def LAYER_NORM(x: Tensor, w: Tensor, b: Tensor) -> Tensor:
     return F.layer_norm(x, (x.shape[-1],), w, b)
 
 
-def GROUP_NORM(x: Tensor, w: Tensor, b: Tensor, eps: float) -> Tensor:
-    """Apply grouped normalization over an `[H, N]` tensor.
-
-    The handwritten implementation normalizes along axis 1 for each head and
-    then applies affine parameters over the flattened `H * N` dimension. This
-    is equivalent to `group_norm` with `num_groups=H`, treating `[H, N]` as
-    `[1, H * N]` with `H` groups.
-
-    Args:
-        x: Input tensor of shape `[H, N]`.
-        w: Affine weight tensor of shape `[H * N]`.
-        b: Affine bias tensor of shape `[H * N]`.
-        eps: Normalization epsilon.
-
-    Returns:
-        The normalized tensor of shape `[H * N]`.
-    """
-    h, n = x.shape
-    return F.group_norm(x.reshape(1, h * n), h, w, b, eps).reshape(-1)
-
-
-def DPLR_RWKV(
-    S: Tensor,
-    R: Tensor,
-    W: Tensor,
-    K: Tensor,
-    V: Tensor,
-    A: Tensor,
-    B: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """DPLR state update for RWKV7 time-mixing.
-
-    S = S*W + S@A@Bᵀ + V⊗K;  y = S @ R.
-
-    The einsum form is kept as-is: rewriting the first/third terms to
-    broadcast mul (S*W[:,None,:], V[:,:,None]*K[:,None,:]) was numerically
-    identical but increased gemv kernel dispatch count (profiler showed
-    gemv2T calls 3104 -> 4656), slowing CUDA forward. einsum routes these
-    through a fused bmm path instead.
-
-    Args:
-        S: State tensor of shape `[H, N, N]`.
-        R: Receptance, `[H, N]`.
-        W: Decay gate, `[H, N]`.
-        K: Key, `[H, N]`.
-        V: Value, `[H, N]`.
-        A: kk-normalized key, `[H, N]`.
-        B: `-kk * a`, `[H, N]`.
-
-    Returns:
-        (y, S): output `[H, N]` and updated state `[H, N, N]`.
-    """
-    S = (
-        torch.einsum("hvk,hk->hvk", S, W)
-        + torch.einsum("hva,ha,hb->hvb", S, A, B)
-        + torch.einsum("hv,hk->hvk", V, K)
-    )
-    return torch.einsum("hvk,hk->hv", S, R), S
-
-
 class RWKV7:
-    def __init__(self, checkpoint_path: str, vocab_path: str) -> None:
-        W: dict[str, Tensor] = torch.load(checkpoint_path)
+    def __init__(
+        self,
+        w: RWKV7Weight,
+        *,
+        is_torch_compile: bool = True,
+    ) -> None:
+        self.w = w
+        self._is_torch_compile = is_torch_compile
+        self.N_LAYER = self.w.N_LAYER
+        self.N_EMBD = self.w.N_EMBD
+        self.HEAD_DIM = 64
+        self.HEAD_CNT = self.N_EMBD // self.HEAD_DIM
 
-        self.tokenizer = Tokenizer(vocab_path)
-        self.n_layer = 1 + max(
-            int(k.split(".")[1]) for k in W if k.startswith("blocks.")
-        )
-        self.C, self.N = W["emb.weight"].shape[1], 64
-        self.H = self.C // self.N
-        self.emb = LAYER_NORM(
-            W["emb.weight"], W["blocks.0.ln0.weight"], W["blocks.0.ln0.bias"]
-        )
-        self.ln_outW, self.ln_outB, self.head = (
-            W["ln_out.weight"],
-            W["ln_out.bias"],
-            W["head.weight"],  # [V, C] contiguous; HEAD does head @ x
-        )
-        self._tmix_cache: dict[int, _TmixCache] = {}
-        self._cmix_cache: dict[int, _CMixCache] = {}
-        self._init_layer_caches(W)
+        self.emb = LAYER_NORM(self.w.emb, self.w.ln_in.w, self.w.ln_in.b)
         # The decode closures dispatch through the registered custom ops
         # (rwkv_tl::*) only when torch.compile is enabled for this device, so
         # dynamo can trace a single graph. On devices where we stay eager
         # (no native bf16), the closures call the raw tilelang kernels to avoid
         # the per-call custom-op dispatch overhead.
-        use_custom_ops = supports_native_bf16(self.emb.device.type)
+        use_custom_ops = self._is_torch_compile and supports_native_bf16(
+            self.emb.device.type
+        )
         self._use_custom_ops = use_custom_ops
         self.layers = [
             (self.make_TMIX(i, use_custom_ops), self.make_CMIX(i, use_custom_ops))
-            for i in range(self.n_layer)
+            for i in range(self.N_LAYER)
         ]
         # Prefill path is built eagerly, but both paths reuse shared caches.
-        # forward_prefill is NOT torch.compile'd: each distinct prompt length
-        # would recompile a fresh graph (minutes on 0.4B, GPU idle meanwhile)
-        # for a <1.5x win, which is not worth it. Keep it eager.
+        # prefill is NOT torch.compile'd: each distinct prompt length would
+        # recompile a fresh graph (minutes on 0.4B, GPU idle meanwhile) for a
+        # <1.5x win, which is not worth it. Keep it eager.
         self.layers_batch = [
             (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
-            for i in range(self.n_layer)
+            for i in range(self.N_LAYER)
         ]
-        # torch.compile is applied lazily by the @maybe_torch_compile decorator
-        # on run_one (native-bf16 devices only, e.g. sm_80+ / AMD MI). The
-        # eager method is kept for testing and comparison.
-        self._eager_run_one = self.run_one.__wrapped__.__get__(self, type(self))  # type: ignore[attr-defined]
-
-    def encode(self, text: str) -> list[int]:
-        return self.tokenizer.encode(text)
-
-    def decode(self, tokens: list[int]) -> str:
-        return self.tokenizer.decode(tokens)
-
-    def zero_state(self) -> list[list[dict[str, Tensor]]]:
-        S: list[list[dict[str, Tensor]]] = []
-        for _ in range(self.n_layer):
-            S.append(
-                [
-                    {
-                        "x": torch.zeros(self.C, dtype=torch.bfloat16),
-                        "rnn": torch.zeros(
-                            (self.H, self.N, self.N), dtype=torch.bfloat16
-                        ),
-                    },
-                    {"x": torch.zeros(self.C, dtype=torch.bfloat16)},
-                ]
-            )
-        return S
-
-    def reset_state(
-        self, S: list[list[dict[str, Tensor]]]
-    ) -> list[list[dict[str, Tensor]]]:
-        """Zero all state tensors in-place.
-
-        Unlike ``zero_state``, this reuses existing buffers so tensor
-        addresses stay fixed -- a requirement for CUDA Graph replay.
-        """
-        for layer_state in S:
-            for slot in layer_state:
-                for v in slot.values():
-                    v.zero_()
-        return S
 
     def HEAD(self, x: Tensor) -> Tensor:
-        return self.head @ x
+        return self.w.head @ x
+
+    def LN_OUT(self, X: Tensor) -> Tensor:
+        return LAYER_NORM(X, self.w.ln_out.w, self.w.ln_out.b)
 
     @maybe_torch_compile
-    def run_one(
-        self, token: int, S: list[list[dict[str, Tensor]]]
-    ) -> tuple[Tensor, list[list[dict[str, Tensor]]]]:
+    def decode(self, token: int, S: State) -> tuple[Tensor, State]:
         """Advance one token and return `(logits, state)`.
 
         Args:
@@ -264,24 +100,23 @@ class RWKV7:
         x = self.EMB(token)
         v_first: Tensor | None = None
 
-        for (TM, CM), s in zip(self.layers, S):
-            x, v_first, s[0] = TM(x, v_first, s[0])
-            x, s[1] = CM(x, s[1])
+        for (TM, CM), tmix_state, cmix_state in zip(self.layers, S.tmix, S.cmix):
+            x, v_first, tmix_state = TM(x, v_first, tmix_state)
+            x, cmix_state = CM(x, cmix_state)
 
-        x = LAYER_NORM(x, self.ln_outW, self.ln_outB)
+        x = LAYER_NORM(x, self.w.ln_out.w, self.w.ln_out.b)
         return self.HEAD(x), S
 
     def forward(
         self,
         tokens: list[int] | Tensor,
-        S: list[list[dict[str, Tensor]]] | None = None,
-    ) -> tuple[Tensor, list[list[dict[str, Tensor]]]]:
+        S: State,
+    ) -> tuple[Tensor, State]:
         """Run inference over a token sequence.
 
-        Single-token inputs use the `run_one` decode path. Multi-token inputs
-        are routed to `forward_prefill` for batched GEMM-heavy prefill.
+        Single-token inputs use the `decode` path. Multi-token inputs are
+        routed to `prefill` for batched GEMM-heavy processing.
         """
-        S = self.zero_state() if S is None else S
         if isinstance(tokens, Tensor):
             tok = tokens.reshape(-1)
         else:
@@ -292,80 +127,83 @@ class RWKV7:
         if tok.numel() == 0:
             raise RuntimeError("forward received an empty token sequence")
         if tok.numel() == 1:
-            return self.run_one(int(tok.item()), S)
-        return self.forward_prefill(tok, S)
+            return self.decode(int(tok.item()), S)
+        return self.prefill(tok, S)
+
+    def prefill(
+        self,
+        tokens: list[int] | Tensor,
+        S: State,
+    ) -> tuple[Tensor, State]:
+        # Batched prefill: [T, C] matmuls instead of per-token GEMV loops.
+        # DPLR stays per-token (serial state). Returns last-token logits.
+        if isinstance(tokens, Tensor):
+            tok = tokens.reshape(-1)
+        else:
+            tok = torch.as_tensor(
+                list(tokens), dtype=torch.long, device=self.emb.device
+            )
+        if tok.numel() == 0:
+            raise RuntimeError("prefill received an empty token sequence")
+        # GPU tensor indexing keeps the whole prefill path CUDA-side (graph-safe).
+        x = self.emb[tok]
+        v_first: Tensor | None = None
+        for (TM, CM), tmix_state, cmix_state in zip(self.layers_batch, S.tmix, S.cmix):
+            x, v_first, tmix_state = TM(x, v_first, tmix_state)
+            x, cmix_state = CM(x, cmix_state)
+        return self.HEAD(LAYER_NORM(x[-1], self.w.ln_out.w, self.w.ln_out.b)), S
+
+    def generate(
+        self,
+        tokens: list[int] | Tensor,
+        S: State,
+        max_tokens: int,
+    ) -> tuple[list[int], State]:
+        """Generate autoregressively from a prompt.
+
+        Args:
+            tokens: Prompt tokens, then greedily continued.
+            S: Model state.
+            max_tokens: Number of tokens to generate after the prompt.
+
+        Returns:
+            (generated tokens, final state).
+        """
+        logits, S = self.forward(tokens, S)
+        out: list[int] = []
+        for _ in range(max_tokens):
+            token = int(torch.argmax(logits))
+            out.append(token)
+            logits, S = self.decode(token, S)
+        return out, S
 
     def EMB(self, token: int) -> Tensor:
         return self.emb[token]
 
-    def NORM(self, X: Tensor) -> Tensor:
-        return LAYER_NORM(X, self.ln_outW, self.ln_outB)
-
-    def _init_layer_caches(self, W) -> None:
-        for i in range(self.n_layer):
-            p_att = f"blocks.{i}.att."
-            rWt, kWt, vWt, oWt = (
-                W[p_att + n + ".weight"].T
-                for n in ("receptance", "key", "value", "output")
-            )
-            self._tmix_cache[i] = {
-                "lnW": W[f"blocks.{i}.ln1.weight"],
-                "lnB": W[f"blocks.{i}.ln1.bias"],
-                "x_x": tuple(
-                    W[p_att + n].reshape(-1)
-                    for n in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g")
-                ),
-                "oW": W[p_att + "output.weight"],
-                "rWt_stack": torch.stack([rWt, kWt, vWt], dim=0).contiguous(),
-                "oWt": oWt,
-                "w0": W[p_att + "w0"].reshape(-1),
-                "w1": W[p_att + "w1"],
-                "w2": W[p_att + "w2"],
-                "a0": W[p_att + "a0"].reshape(-1),
-                "a1": W[p_att + "a1"],
-                "a2": W[p_att + "a2"],
-                "v0": W[p_att + "v0"].reshape(-1),
-                "v1": W[p_att + "v1"],
-                "v2": W[p_att + "v2"],
-                "g1": W[p_att + "g1"],
-                "g2": W[p_att + "g2"],
-                "k_k": W[p_att + "k_k"].reshape(-1),
-                "k_a": W[p_att + "k_a"].reshape(-1),
-                "r_k": W[p_att + "r_k"],
-                "ln_xW": W[p_att + "ln_x.weight"],
-                "ln_xB": W[p_att + "ln_x.bias"],
-            }
-
-            p_ffn = f"blocks.{i}.ffn."
-            self._cmix_cache[i] = {
-                "lnW": W[f"blocks.{i}.ln2.weight"],
-                "lnB": W[f"blocks.{i}.ln2.bias"],
-                "x_k": W[p_ffn + "x_k"].reshape(-1),
-                "kW": W[p_ffn + "key.weight"],
-                "vW": W[p_ffn + "value.weight"],
-                "kWt": W[p_ffn + "key.weight"].T,
-                "vWt": W[p_ffn + "value.weight"].T,
-            }
-
-    def _get_tmix_cache(self, i: int) -> _TmixCache:
-        return self._tmix_cache[i]
-
-    def _get_cmix_cache(self, i: int) -> _CMixCache:
-        return self._cmix_cache[i]
-
     def make_TMIX(self, i: int, use_custom_ops: bool):
-        H, N = self.H, self.N
-        c = self._get_tmix_cache(i)
-        lnW, lnB = c["lnW"], c["lnB"]
-        x_x = c["x_x"]
-        oW = c["oW"]
-        rWt_stack = c["rWt_stack"]
-        w0, w1, w2 = c["w0"], c["w1"], c["w2"]
-        a0, a1, a2 = c["a0"], c["a1"], c["a2"]
-        v0, v1, v2 = c["v0"], c["v1"], c["v2"]
-        g1, g2 = c["g1"], c["g2"]
-        k_k, k_a, r_k = c["k_k"], c["k_a"], c["r_k"]
-        ln_xW, ln_xB = c["ln_xW"], c["ln_xB"]
+        H, N = self.HEAD_CNT, self.HEAD_DIM
+        b = self.w.blocks[i]
+        att = b.att
+        rWt = att.receptance_weight.T
+        kWt = att.key_weight.T
+        vWt = att.value_weight.T
+        lnW, lnB = b.ln1.w, b.ln1.b
+        x_x = (
+            att.x_r.reshape(-1),
+            att.x_w.reshape(-1),
+            att.x_k.reshape(-1),
+            att.x_v.reshape(-1),
+            att.x_a.reshape(-1),
+            att.x_g.reshape(-1),
+        )
+        oW = att.output_weight
+        rWt_stack = torch.stack([rWt, kWt, vWt], dim=0).contiguous()
+        w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
+        a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
+        v0, v1, v2 = att.v0.reshape(-1), att.v1, att.v2
+        g1, g2 = att.g1, att.g2
+        k_k, k_a, r_k = att.k_k.reshape(-1), att.k_a.reshape(-1), att.r_k
+        ln_xW, ln_xB = att.ln_x_weight, att.ln_x_bias
 
         # Dispatch through the registered custom ops only when torch.compile is
         # active (dynamo traces them as single-graph nodes). Eager calls go
@@ -441,17 +279,29 @@ class RWKV7:
         # Batched TMIX for prefill: [T, C] GEMM path.
         # GEMV -> GEMM, token-shift via cat-shift, gates via broadcast.
         # DPLR stays per-token (1.3% of time, serially dependent on state).
-        H, N = self.H, self.N
-        c = self._get_tmix_cache(i)
-        lnW, lnB = c["lnW"], c["lnB"]
-        x_x = c["x_x"]
-        rWt_stack, oWt = c["rWt_stack"], c["oWt"]
-        w0, w1, w2 = c["w0"], c["w1"], c["w2"]
-        a0, a1, a2 = c["a0"], c["a1"], c["a2"]
-        v0, v1, v2 = c["v0"], c["v1"], c["v2"]
-        g1, g2 = c["g1"], c["g2"]
-        k_k, k_a, r_k = c["k_k"], c["k_a"], c["r_k"]
-        ln_xW, ln_xB = c["ln_xW"], c["ln_xB"]
+        H, N = self.HEAD_CNT, self.HEAD_DIM
+        b = self.w.blocks[i]
+        att = b.att
+        rWt = att.receptance_weight.T
+        kWt = att.key_weight.T
+        vWt = att.value_weight.T
+        lnW, lnB = b.ln1.w, b.ln1.b
+        x_x = (
+            att.x_r.reshape(-1),
+            att.x_w.reshape(-1),
+            att.x_k.reshape(-1),
+            att.x_v.reshape(-1),
+            att.x_a.reshape(-1),
+            att.x_g.reshape(-1),
+        )
+        rWt_stack = torch.stack([rWt, kWt, vWt], dim=0).contiguous()
+        oWt = att.output_weight.T
+        w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
+        a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
+        v0, v1, v2 = att.v0.reshape(-1), att.v1, att.v2
+        g1, g2 = att.g1, att.g2
+        k_k, k_a, r_k = att.k_k.reshape(-1), att.k_a.reshape(-1), att.r_k
+        ln_xW, ln_xB = att.ln_x_weight, att.ln_x_bias
 
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
@@ -492,13 +342,9 @@ class RWKV7:
             kk_norm = kk / torch.clamp(den, min=1e-12)
             B = -kk_norm * a
 
-            # DPLR: serial over T (state-dependent), reuses fused_dplr kernel.
-            y = torch.empty(T_len, H, N, dtype=x0.dtype, device=x0.device)
-            for t in range(T_len):
-                y_t, _ = fused_dplr(
-                    state["rnn"], r[t], w[t], k[t], v[t], kk_norm[t], B[t]
-                )
-                y[t] = y_t
+            # DPLR: single-shot over the whole sequence (one launch, serial state
+            # recurrence inside), replacing the per-token Python loop.
+            y, _ = fused_dplr_T(state["rnn"], r, w, k, v, kk_norm, B)
 
             y_flat = F.group_norm(y.reshape(T_len, H * N), H, ln_xW, ln_xB, 64e-5)
             rkrk = (r * k * r_k).sum(dim=2, keepdim=True)
@@ -509,9 +355,10 @@ class RWKV7:
         return layer
 
     def make_CMIX(self, i: int, use_custom_ops: bool):
-        c = self._get_cmix_cache(i)
-        lnW, lnB = c["lnW"], c["lnB"]
-        x_k, kW, vW = c["x_k"], c["kW"], c["vW"]
+        b = self.w.blocks[i]
+        ffn = b.ffn
+        lnW, lnB = b.ln2.w, b.ln2.b
+        x_k, kW, vW = ffn.x_k.reshape(-1), ffn.key_weight, ffn.value_weight
         _lerp1 = (
             torch.ops.rwkv_tl.fused_lerp1_copy if use_custom_ops else fused_lerp1_copy
         )
@@ -529,10 +376,11 @@ class RWKV7:
 
     def make_CMIX_batch(self, i: int):
         # Batched CMIX for prefill: [T, C] GEMM path.
-        c = self._get_cmix_cache(i)
-        lnW, lnB = c["lnW"], c["lnB"]
-        x_k = c["x_k"]
-        kWt, vWt = c["kWt"], c["vWt"]
+        b = self.w.blocks[i]
+        ffn = b.ffn
+        lnW, lnB = b.ln2.w, b.ln2.b
+        x_k = ffn.x_k.reshape(-1)
+        kWt, vWt = ffn.key_weight.T, ffn.value_weight.T
 
         def layer(
             x0: Tensor, state: dict[str, Tensor]
@@ -544,27 +392,3 @@ class RWKV7:
             return x0 + RELUSQ(x @ kWt) @ vWt, state
 
         return layer
-
-    def forward_prefill(
-        self,
-        tokens: list[int] | Tensor,
-        S: list[list[dict[str, Tensor]]] | None = None,
-    ) -> tuple[Tensor, list[list[dict[str, Tensor]]]]:
-        # Batched prefill: [T, C] matmuls instead of per-token GEMV loops.
-        # DPLR stays per-token (serial state). Returns last-token logits.
-        S = self.zero_state() if S is None else S
-        if isinstance(tokens, Tensor):
-            tok = tokens.reshape(-1)
-        else:
-            tok = torch.as_tensor(
-                list(tokens), dtype=torch.long, device=self.emb.device
-            )
-        if tok.numel() == 0:
-            raise RuntimeError("forward_prefill received an empty token sequence")
-        # GPU tensor indexing keeps the whole prefill path CUDA-side (graph-safe).
-        x = self.emb[tok]
-        v_first: Tensor | None = None
-        for (TM, CM), s in zip(self.layers_batch, S):
-            x, v_first, s[0] = TM(x, v_first, s[0])
-            x, s[1] = CM(x, s[1])
-        return self.HEAD(self.NORM(x[-1])), S

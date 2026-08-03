@@ -3,7 +3,7 @@
 
 Focuses on the eager (uncompiled) path, which is what runs on devices without
 native bf16 (sm_75) or before torch.compile kicks in. State is zeroed in-place
-via ``reset_state`` so the measurement excludes allocation overhead.
+via ``State.reset`` so the measurement excludes allocation overhead.
 
 Usage:
     .venv/bin/python script/bench_decode.py --checkpoint <path> [--vocab <path>]
@@ -25,27 +25,37 @@ sys.path.insert(0, str(REPO / "script"))
 from pure_torch_rwkv7 import RWKV7Torch
 
 from rwkv_tl import RWKV7
+from rwkv_tl.model import RWKV7Weight
+from rwkv_tl.state import State
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
 
 
+def _fresh_state(model) -> State:
+    return State(
+        model.w.N_LAYER,
+        model.w.N_EMBD,
+        64,
+        device=model.emb.device,
+    )
+
+
 def bench_decode(model, iters: int = 10) -> float:
     """ms per 32-token decode sequence (eager, in-place state reset)."""
-    with torch.device(model.emb.device):
-        S = model.zero_state()
+    S = _fresh_state(model)
     for _ in range(3):
-        model.reset_state(S)
+        S.reset()
         for t in TOKENS:
-            model._eager_run_one(t, S)
+            model.decode(t, S)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        model.reset_state(S)
+        S.reset()
         for t in TOKENS:
-            model._eager_run_one(t, S)
+            model.decode(t, S)
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
@@ -54,18 +64,17 @@ def bench_decode(model, iters: int = 10) -> float:
 def bench_prefill(model, iters: int = 10) -> float:
     """ms per 32-token prefill (eager, in-place state reset)."""
     tok = torch.tensor(TOKENS, dtype=torch.long, device=model.emb.device)
-    with torch.device(model.emb.device):
-        S = model.zero_state()
+    S = _fresh_state(model)
     for _ in range(3):
-        model.reset_state(S)
-        model.forward_prefill(tok, S)
+        S.reset()
+        model.prefill(tok, S)
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        model.reset_state(S)
-        model.forward_prefill(tok, S)
+        S.reset()
+        model.prefill(tok, S)
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
@@ -73,11 +82,10 @@ def bench_prefill(model, iters: int = 10) -> float:
 
 def _decode_logits(model) -> torch.Tensor:
     """Last-token logits from per-token eager decode over TOKENS."""
-    with torch.device(model.emb.device):
-        S = model.zero_state()
+    S = _fresh_state(model)
     logits = None
     for t in TOKENS:
-        logits, S = model._eager_run_one(t, S)
+        logits, S = model.decode(t, S)
     assert logits is not None
     return logits.reshape(-1).float().cpu()
 
@@ -85,9 +93,8 @@ def _decode_logits(model) -> torch.Tensor:
 def _prefill_logits(model) -> torch.Tensor:
     """Last-token logits from batched prefill over TOKENS."""
     tok = torch.tensor(TOKENS, dtype=torch.long, device=model.emb.device)
-    with torch.device(model.emb.device):
-        S = model.zero_state()
-    logits, _ = model.forward_prefill(tok, S)
+    S = _fresh_state(model)
+    logits, _ = model.prefill(tok, S)
     return logits.reshape(-1).float().cpu()
 
 
@@ -136,8 +143,9 @@ def main():
         parser.error("--checkpoint is required or set RWKV_CHECKPOINT_PATH")
 
     with torch.device("cuda"):
-        tl = RWKV7(args.checkpoint, args.vocab)
-        pt = RWKV7Torch(args.checkpoint, args.vocab)
+        w = RWKV7Weight(args.checkpoint)
+        tl = RWKV7(w, is_torch_compile=False)
+        pt = RWKV7Torch(w, is_torch_compile=False)
 
     print(f"device: {tl.emb.device}")
     print(f"rwkv_tl use_custom_ops (decode dispatch): {tl._use_custom_ops}")
