@@ -71,6 +71,43 @@ def bench_prefill(model, iters: int = 10) -> float:
     return start.elapsed_time(end) / iters
 
 
+def _decode_logits(model) -> torch.Tensor:
+    """Last-token logits from per-token eager decode over TOKENS."""
+    with torch.device(model.emb.device):
+        S = model.zero_state()
+    logits = None
+    for t in TOKENS:
+        logits, S = model._eager_run_one(t, S)
+    assert logits is not None
+    return logits.reshape(-1).float().cpu()
+
+
+def _prefill_logits(model) -> torch.Tensor:
+    """Last-token logits from batched prefill over TOKENS."""
+    tok = torch.tensor(TOKENS, dtype=torch.long, device=model.emb.device)
+    with torch.device(model.emb.device):
+        S = model.zero_state()
+    logits, _ = model.forward_prefill(tok, S)
+    return logits.reshape(-1).float().cpu()
+
+
+def _check_correctness(
+    got: torch.Tensor, ref: torch.Tensor, label: str, tol: float
+) -> None:
+    """Verify ``got`` matches the reference; raise SystemExit on mismatch."""
+    if got.shape != ref.shape:
+        raise SystemExit(
+            f"SKIP {label}: shape mismatch {tuple(got.shape)} vs {tuple(ref.shape)}"
+        )
+    diff = (got - ref).abs().max().item()
+    argmax_ok = int(got.argmax()) == int(ref.argmax())
+    if not (argmax_ok and diff <= tol):
+        raise SystemExit(
+            f"SKIP {label}: incorrect (argmax {'ok' if argmax_ok else 'MISMATCH'} "
+            f"max_abs={diff:.4f}, tol={tol}); not reporting latency"
+        )
+
+
 def main():
     default_vocab = str(REPO / "asset" / "rwkv_vocab_v20230424.txt")
     parser = argparse.ArgumentParser(
@@ -83,6 +120,17 @@ def main():
     )
     parser.add_argument("--vocab", default=default_vocab)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--no-correctness-check",
+        action="store_true",
+        help="Disable the rwkv_tl-vs-pure_torch correctness gate.",
+    )
+    parser.add_argument(
+        "--correctness-tol",
+        type=float,
+        default=16.0,
+        help="Max-abs logit tolerance for the correctness gate (default 16.0).",
+    )
     args = parser.parse_args()
     if not args.checkpoint:
         parser.error("--checkpoint is required or set RWKV_CHECKPOINT_PATH")
@@ -93,6 +141,17 @@ def main():
 
     print(f"device: {tl.emb.device}")
     print(f"rwkv_tl use_custom_ops (decode dispatch): {tl._use_custom_ops}")
+
+    # Correctness gate: refuse to report latency for broken output.
+    if not args.no_correctness_check:
+        _check_correctness(
+            _decode_logits(tl), _decode_logits(pt), "decode", args.correctness_tol
+        )
+        _check_correctness(
+            _prefill_logits(tl), _prefill_logits(pt), "prefill", args.correctness_tol
+        )
+        print("correctness: decode/prefill match pure_torch reference")
+
     for label, model in (("rwkv_tl", tl), ("pure_torch", pt)):
         print(
             f"{label}: decode {bench_decode(model, args.iters):8.2f} ms/32tok  "

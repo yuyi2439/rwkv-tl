@@ -57,7 +57,7 @@ def _ensure_ops_registered() -> None:
         x_g: Tensor,
         x_copy: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        return tuple(torch.empty_like(x) for _ in range(6)) # pyright: ignore[reportReturnType]
+        return tuple(torch.empty_like(x) for _ in range(6))  # pyright: ignore[reportReturnType]
 
     @torch.library.custom_op("rwkv_tl::fused_lerp1_copy", mutates_args=("x_copy",))
     def fused_lerp1_copy_op(
@@ -218,7 +218,7 @@ def _ensure_ops_registered() -> None:
         rWt_stack: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         # r, k, v have shape [C]; xv, xw, xa, xg have shape [C]
-        return tuple(torch.empty_like(x) for _ in range(7)) # pyright: ignore[reportReturnType]
+        return tuple(torch.empty_like(x) for _ in range(7))  # pyright: ignore[reportReturnType]
 
     # ---- gemm.py ----
 

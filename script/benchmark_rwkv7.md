@@ -34,6 +34,7 @@ uv run python script/benchmark_rwkv7.py \
 注：
 - `--device cpu` 时，faster3a_2607 和 graph_decoder 自动跳过（CUDA-only）。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
+- 正确性门控默认开启：每个 case 计时前先把输出与 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。用 `--no-correctness-check` 关闭。
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 

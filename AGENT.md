@@ -74,6 +74,29 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`supports_native_bf16`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
 - Eager perf on MX450 / 0.1B: rwkv_tl decode ~66 ms/token and prefill ~503 ms/32tok are SLOWER than pure_torch (~52 ms/token, ~285 ms/32tok). The fused kernels do not pay off on this tiny model / sm_75 GPU; expect gains only on larger models or sm_80+ (native bf16, tensor cores). Use `script/bench_decode.py` to re-measure.
 - `supports_native_bf16` takes only `device_type` (no device index): `torch.cuda.is_bf16_supported()` is per-process and does not accept a device argument, and bf16 support is uniform across same-arch GPUs.
+- The repo checkpoints are saved on cuda: `torch.load` loads them to cuda regardless of the device context, so a CPU model run needs a CPU-materialized checkpoint (`torch.load(ckpt, map_location="cpu")` then re-save).
+
+## Planned architecture direction
+
+These are user-approved future directions (inspired by FlashRWKV). They are NOT
+done yet. When working on the related area, remind the user whether to proceed.
+
+- **Move `src/rwkv_tl/__init__.py` model code out of the library.** The current
+  `RWKV7` class there is a temporary usage example, not the library core. It
+  should be relocated to a `demo/` (or similar) directory outside `src/rwkv_tl`,
+  so the library ships only kernels + operators. Do not keep growing model logic
+  in `__init__.py`; treat it as example code already slated for extraction.
+- **Adopt a stateless operator API.** Future kernel/operator APIs should take
+  `initial_state` and return `final_state` explicitly instead of mutating an
+  in-place `state` dict. This is clearer, autograd-friendly, and matches the
+  FlashRWKV `rwkv7(..., initial_state=, output_final_state=)` contract. Apply
+  this pattern to new ops; migrate existing ones when refactoring.
+- **Make benchmarks correctness-gated.** A benchmark run must verify numerical
+  correctness before reporting latency. If outputs do not match the reference,
+  skip the case (or fail) and do NOT emit a latency number. This prevents
+  silently reporting speed for broken code. **DONE 2026-08**: added to
+  `script/benchmark_rwkv7.py` (per-case, `--no-correctness-check` /
+  `--correctness-tol`) and `script/bench_decode.py`; the reference is pure_torch.
 
 ## Open verification (TODO.md)
 

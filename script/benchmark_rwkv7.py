@@ -114,6 +114,40 @@ def _move_tensors_to_device(obj, device: torch.device):
     return obj
 
 
+class CorrectnessError(RuntimeError):
+    """Raised when a target's output does not match the pure-torch reference.
+
+    The benchmark catches this to SKIP the case instead of reporting a latency
+    for broken code.
+    """
+
+
+def _fresh_logits(
+    model, input_tokens, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    """Run ``model.forward`` on a fresh state; return flattened final logits."""
+    state = make_state(model, batch_size, device)
+    logits, _ = model.forward(input_tokens, state)
+    return logits.reshape(-1).float()
+
+
+def _check_correctness(
+    got: torch.Tensor, ref: torch.Tensor, label: str, tol: float
+) -> None:
+    """Verify ``got`` matches the reference; raise CorrectnessError otherwise."""
+    if got.shape != ref.shape:
+        raise CorrectnessError(
+            f"{label}: shape mismatch {tuple(got.shape)} vs {tuple(ref.shape)}"
+        )
+    diff = (got - ref).abs().max().item()
+    argmax_ok = int(got.argmax()) == int(ref.argmax())
+    if not (argmax_ok and diff <= tol):
+        raise CorrectnessError(
+            f"{label}: argmax {'ok' if argmax_ok else 'MISMATCH'} "
+            f"max_abs={diff:.4f} (tol={tol})"
+        )
+
+
 def make_state(model, batch_size: int, device: torch.device):
     """调用模型的 zero_state 并把 state 迁移到目标 device。
 
@@ -210,6 +244,8 @@ def bench_case(
     warmup: int,
     iters: int,
     device: torch.device,
+    reference=None,
+    correctness_tol: float | None = None,
 ):
     """对单个 (B, T) 用例做 warmup + iters 次前向计时。
 
@@ -220,9 +256,14 @@ def bench_case(
         warmup (int): 预热轮数。
         iters (int): 计时轮数。
         device (torch.device): 运行设备。
+        reference: 正确性门控的参考模型（pure_torch）；None 表示跳过门控。
+        correctness_tol: 门控的 max_abs 容差；None 表示跳过门控。
 
     Returns:
         tuple[float, float, float, float]: (p10_ms, p50_ms, p90_ms, tok_s_p50)。
+
+    Raises:
+        CorrectnessError: 输出与参考不一致时（由上层捕获并 SKIP 该 case）。
 
     Callers:
         - `benchmark_rwkv7.py:run_benchmark`: 遍历 cases 时调用。
@@ -236,6 +277,12 @@ def bench_case(
     )
     tokens = (tokens * 1103515245 + 12345) % 65536
     input_tokens = _prepare_tokens(model, tokens)
+
+    if reference is not None and correctness_tol is not None:
+        got = _fresh_logits(model, input_tokens, batch_size, device)
+        ref_input = _prepare_tokens(reference, tokens)
+        ref = _fresh_logits(reference, ref_input, batch_size, device)
+        _check_correctness(got, ref, type(model).__name__, correctness_tol)
 
     for _ in range(warmup):
         _ = model.forward(input_tokens, state)
@@ -265,12 +312,34 @@ def bench_case(
     return p10, p50, p90, tok_s
 
 
-def bench_case_graph_decoder(decoder, seq_len: int, warmup: int, iters: int):
+def bench_case_graph_decoder(
+    decoder,
+    seq_len: int,
+    warmup: int,
+    iters: int,
+    reference=None,
+    correctness_tol: float | None = None,
+):
     """Benchmark GraphDecoder over a length-T token sequence.
 
     GraphDecoder is single-token decode only, so one timed run replays T steps.
     """
     tokens = [int((i * 1103515245 + 12345) % 65536) for i in range(seq_len)]
+
+    if reference is not None and correctness_tol is not None:
+        decoder.reset()
+        got = None
+        for token in tokens:
+            got = decoder.step(token)
+        assert got is not None
+        ref_state = reference.zero_state()
+        ref_logits, _ = reference.forward(tokens, ref_state)
+        _check_correctness(
+            got.reshape(-1).float(),
+            ref_logits.reshape(-1).float(),
+            "graph_decoder",
+            correctness_tol,
+        )
 
     torch.cuda.synchronize()
     for _ in range(warmup):
@@ -424,6 +493,9 @@ def run_benchmark(args):
         batch_size_str, seq_len_str = case.lower().split("x", 1)
         parsed_cases.append((int(batch_size_str), int(seq_len_str)))
 
+    correctness_tol = args.correctness_tol
+    reference_model = None  # lazily built pure_torch reference for the gate
+
     for target in targets:
         if target == "faster3a_2607":
             # Albatross is CUDA-only: skip (not error) when unavailable or when
@@ -469,6 +541,20 @@ def run_benchmark(args):
         else:
             raise ValueError(f"unknown target: {target}")
 
+        # Correctness gate: compare each target's output against the pure-torch
+        # reference (built lazily, once). pure_torch is self-consistent.
+        reference = None
+        if not args.no_correctness_check:
+            if target == "pure_torch":
+                reference = model
+            elif reference_model is None:
+                reference_model = build_pure_torch_model(
+                    Path(args.project_checkpoint), Path(args.vocab), rwkv_device
+                )
+                reference = reference_model
+            else:
+                reference = reference_model
+
         try:
             for B, T in parsed_cases:
                 if mode == "decode" and B != 1:
@@ -480,12 +566,31 @@ def run_benchmark(args):
                 try:
                     if mode == "decode":
                         p10, p50, p90, tok_s = bench_case_graph_decoder(
-                            model, T, args.warmup, args.iters
+                            model,
+                            T,
+                            args.warmup,
+                            args.iters,
+                            reference,
+                            correctness_tol,
                         )
                     else:
                         p10, p50, p90, tok_s = bench_case(
-                            model, B, T, args.warmup, args.iters, device
+                            model,
+                            B,
+                            T,
+                            args.warmup,
+                            args.iters,
+                            device,
+                            reference,
+                            correctness_tol,
                         )
+                except CorrectnessError as exc:
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} "
+                        f"reason=incorrect ({exc})",
+                        flush=True,
+                    )
+                    continue
                 except RuntimeError as exc:
                     # A single case OOM-ing must not abort the whole benchmark
                     # run; skip it and keep going so later (smaller) cases and
@@ -550,6 +655,18 @@ def main():
     parser.add_argument(
         "--cases",
         default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16",
+    )
+    parser.add_argument(
+        "--no-correctness-check",
+        action="store_true",
+        help="Disable the pure-torch correctness gate (SKIPs cases whose output "
+        "does not match the reference).",
+    )
+    parser.add_argument(
+        "--correctness-tol",
+        type=float,
+        default=16.0,
+        help="Max-abs logit tolerance for the correctness gate (default 16.0).",
     )
     args = parser.parse_args()
 

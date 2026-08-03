@@ -202,8 +202,11 @@ def fused_lerp1_copy(x: Tensor, prev: Tensor, w: Tensor, x_copy: Tensor) -> Tens
         Interpolated value, [C], bf16.
     """
     if x.device.type != "cuda":
+        # Compute the lerp first: prev aliases x_copy (both state["x"]), so an
+        # earlier copy_ would corrupt prev before it is read.
+        out = x + w * (prev - x)
         x_copy.copy_(x)
-        return x + w * (prev - x)
+        return out
     return _fused_lerp1_copy_kernel(x, prev, w, x_copy)
 
 
