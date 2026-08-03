@@ -25,7 +25,22 @@ This file is the canonical benchmark report for this repository. Follow these ru
 - Put runtime warnings, environment constraints, and maintenance guidance in this file.
 - When a new benchmark run is added, update this report with the new numbers and keep the narrative short.
 
+## Management rules for test validation records
+
+- Test results (which model versions passed the test suite, environment, commit) go in [docs/validation_rtx3060.md](docs/validation_rtx3060.md) (or a sibling per-GPU file). Keep it in Chinese and report-like.
+
 This is a practical compromise: the benchmark report should stay easy to skim, while the deeper notes can live in the docs and agent guide.
+
+## User preferences and project standards (remember these)
+
+- Docs and reports under `docs/` and the benchmark report must be written in Chinese. Source code comments/docstrings stay in English.
+- Test results must be saved to a file under `docs/` (see `docs/validation_rtx3060.md` for the current RTX 3060 13/13 record). Do not leave test outcomes only in chat history.
+- When a new benchmark/test run is completed, record the results in the docs before moving on.
+- Models live in `~/rwkv/model/` (rwkv7-g1d-0.1b, rwkv7-g1d-0.4b, rwkv7-g1i-7.2b). Test the originally-used model first, then the others; the 7.2B may OOM on 12GB.
+- `forward_prefill` stays eager: torch.compile of prefill recompiles a fresh graph per distinct prompt length (minutes, GPU idle) for only 1.11-1.43x steady-state. This was validated on RTX 3060 and is a firm decision -- do not re-enable without new evidence.
+- Long benchmarks must run as background processes writing to a log file, then be monitored -- never as a blocking foreground command that looks frozen.
+- If a script appears to hang with idle CPU/GPU, investigate before assuming it failed: torch.compile or first-call kernel compilation can idle the GPU for minutes.
+- When the user says "check it yourself" or "you can do more tests", investigate and run any additional worthwhile tests autonomously.
 
 ## Goal
 
