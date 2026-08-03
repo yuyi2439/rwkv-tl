@@ -45,11 +45,11 @@ for path in (SCRIPT_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pure_torch_rwkv7 import RWKV7Torch
+from pure_torch_rwkv7 import RWKV7Torch # noqa: E402
 
-from rwkv_tl import RWKV7 as ProjectRWKV7
-from rwkv_tl.model import RWKV7Weight
-from rwkv_tl.state import State
+from rwkv_tl import RWKV7 as ProjectRWKV7 # noqa: E402
+from rwkv_tl.model import RWKV7Weight # noqa: E402
+from rwkv_tl.state import State # noqa: E402
 
 
 def percentile(values, q):
@@ -90,30 +90,6 @@ def load_fast_module(module_path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _move_tensors_to_device(obj, device: torch.device):
-    """递归把嵌套结构中的 tensor 迁移到目标 device。
-
-    Args:
-        obj: tensor / dict / list / tuple / 其它。
-        device (torch.device): 目标设备。
-
-    Returns:
-        与 obj 同结构的对象，tensor 已迁移。
-
-    Callers:
-        - `benchmark_rwkv7.py:make_state`: zero_state 后迁移到 device。
-    """
-    if isinstance(obj, torch.Tensor):
-        return obj.to(device=device)
-    if isinstance(obj, dict):
-        return {k: _move_tensors_to_device(v, device) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_move_tensors_to_device(v, device) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_move_tensors_to_device(v, device) for v in obj)
-    return obj
 
 
 class CorrectnessError(RuntimeError):
@@ -184,9 +160,9 @@ def make_state(model, batch_size: int, device: torch.device):
                 state = zero_state_fn(batch_size)
     else:
         w = model.w
-        state = State(w.N_LAYER, w.N_EMBD, 64, device=model.emb.device)
+        state = State(w.N_LAYER, w.N_EMBD, 64, device=device)
 
-    return _move_tensors_to_device(state, device)
+    return state
 
 
 def _prepare_tokens(model, tokens: torch.Tensor):

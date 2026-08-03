@@ -46,24 +46,32 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 4.32 | 231.50 |
-| faster3a_2607 | 1×8 | 6.23 | 1284.88 |
-| faster3a_2607 | 1×32 | 7.49 | 4274.21 |
-| faster3a_2607 | 8×8 | 7.64 | 8380.39 |
-| faster3a_2607 | 16×16 | 7.64 | 33526.74 |
-| rwkv_tl | 1×1 | 40.48 | 24.70 |
-| rwkv_tl | 1×8 | 40.48 | 197.63 |
-| rwkv_tl | 1×32 | 118.12 | 270.92 |
-| rwkv_tl | 8×8 | 206.94 | 309.26 |
-| rwkv_tl | 16×16 | 758.45 | 337.53 |
-| pure_torch | 1×1 | 13.74 | 72.77 |
-| pure_torch | 1×8 | 29.59 | 270.37 |
-| pure_torch | 1×32 | 98.20 | 325.87 |
-| pure_torch | 8×8 | 171.77 | 372.58 |
-| pure_torch | 16×16 | 609.80 | 419.81 |
-| graph_decoder | 1×1 | 2.11 | 473.14 |
-| graph_decoder | 1×8 | 14.76 | 541.88 |
-| graph_decoder | 1×32 | 58.78 | 544.42 |
+| faster3a_2607 | 1×1 | 5.00 | 199.95 |
+| faster3a_2607 | 1×8 | 6.06 | 1319.81 |
+| faster3a_2607 | 1×32 | 7.88 | 4062.20 |
+| faster3a_2607 | 1×64 | 7.89 | 8112.67 |
+| faster3a_2607 | 1×128 | 7.27 | 17618.43 |
+| faster3a_2607 | 8×8 | 7.14 | 8963.16 |
+| faster3a_2607 | 16×16 | 6.37 | 40218.79 |
+| rwkv_tl | 1×1 | 9.58 | 104.41 |
+| rwkv_tl | 1×8 | 15.38 | 520.20 |
+| rwkv_tl | 1×32 | 17.90 | 1787.72 |
+| rwkv_tl | 1×64 | 14.65 | 4368.65 |
+| rwkv_tl | 1×128 | 15.80 | 8103.51 |
+| rwkv_tl | 8×8 | 16.09 | 3978.86 |
+| rwkv_tl | 16×16 | 15.87 | 16135.64 |
+| pure_torch | 1×1 | 14.50 | 68.98 |
+| pure_torch | 1×8 | 40.15 | 199.26 |
+| pure_torch | 1×32 | 121.82 | 262.68 |
+| pure_torch | 1×64 | 236.38 | 270.75 |
+| pure_torch | 1×128 | 447.04 | 286.33 |
+| pure_torch | 8×8 | 214.81 | 297.94 |
+| pure_torch | 16×16 | 969.97 | 263.93 |
+| graph_decoder | 1×1 | 1.66 | 602.63 |
+| graph_decoder | 1×8 | 12.87 | 621.57 |
+| graph_decoder | 1×32 | 51.57 | 620.50 |
+| graph_decoder | 1×64 | 103.60 | 617.78 |
+| graph_decoder | 1×128 | 207.01 | 618.34 |
 
 ### MX450 (CUDA, sm_75, 旧参考)
 
@@ -109,24 +117,32 @@ warmup=10, iters=20。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 6.50 | 153.94 |
-| faster3a_2607 | 1×8 | 13.78 | 580.62 |
-| faster3a_2607 | 1×32 | 16.25 | 1969.52 |
-| faster3a_2607 | 8×8 | 16.28 | 3931.92 |
-| faster3a_2607 | 16×16 | 16.84 | 15198.95 |
-| rwkv_tl | 1×1 | 85.09 | 11.75 |
-| rwkv_tl | 1×8 | 69.66 | 114.84 |
-| rwkv_tl | 1×32 | 179.03 | 178.74 |
-| rwkv_tl | 8×8 | 307.36 | 208.23 |
-| rwkv_tl | 16×16 | 1128.89 | 226.77 |
-| pure_torch | 1×1 | 8.69 | 115.01 |
-| pure_torch | 1×8 | 72.56 | 110.25 |
-| pure_torch | 1×32 | 175.51 | 182.33 |
-| pure_torch | 8×8 | 347.61 | 184.11 |
-| pure_torch | 16×16 | 1294.50 | 197.76 |
-| graph_decoder | 1×1 | 4.60 | 217.18 |
-| graph_decoder | 1×8 | 36.24 | 220.72 |
-| graph_decoder | 1×32 | 144.16 | 221.97 |
+| faster3a_2607 | 1×1 | 5.70 | 175.54 |
+| faster3a_2607 | 1×8 | 13.00 | 615.16 |
+| faster3a_2607 | 1×32 | 14.90 | 2147.99 |
+| faster3a_2607 | 1×64 | 15.62 | 4097.05 |
+| faster3a_2607 | 1×128 | 14.05 | 9109.13 |
+| faster3a_2607 | 8×8 | 15.44 | 4144.85 |
+| faster3a_2607 | 16×16 | 15.79 | 16216.97 |
+| rwkv_tl | 1×1 | 20.38 | 49.07 |
+| rwkv_tl | 1×8 | 36.51 | 219.12 |
+| rwkv_tl | 1×32 | 33.93 | 943.24 |
+| rwkv_tl | 1×64 | 31.38 | 2039.69 |
+| rwkv_tl | 1×128 | 33.67 | 3801.59 |
+| rwkv_tl | 8×8 | 32.74 | 1954.93 |
+| rwkv_tl | 16×16 | 33.79 | 7577.32 |
+| pure_torch | 1×1 | 32.59 | 30.68 |
+| pure_torch | 1×8 | 87.14 | 91.81 |
+| pure_torch | 1×32 | 289.14 | 110.67 |
+| pure_torch | 1×64 | 503.39 | 127.14 |
+| pure_torch | 1×128 | 1001.30 | 127.83 |
+| pure_torch | 8×8 | 552.79 | 115.78 |
+| pure_torch | 16×16 | 2000.69 | 127.96 |
+| graph_decoder | 1×1 | 4.11 | 243.23 |
+| graph_decoder | 1×8 | 31.69 | 252.41 |
+| graph_decoder | 1×32 | 127.47 | 251.05 |
+| graph_decoder | 1×64 | 254.74 | 251.23 |
+| graph_decoder | 1×128 | 509.36 | 251.29 |
 
 ### MX450 (CUDA, sm_75, 旧参考)
 
@@ -163,10 +179,12 @@ warmup=10, iters=20。
 
 ### CUDA (RTX 3060, sm_86, 目标卡)
 
-- T=1 decode 时 graph_decoder 最快（0.1B 2.11ms、0.4B 4.60ms），CUDA Graph 消除 launch 开销的效果在 sm_86 上依旧成立。
-- eager rwkv_tl 的 T=1 仍明显慢于 pure_torch（0.1B 40.5 vs 13.7ms；0.4B 85.1 vs 8.7ms），说明 fused kernel 的逐 token dispatch 开销在小模型上依旧占主导。
-- prefill（T≥32）rwkv_tl 与 pure_torch 接近（0.1B 1×32 118 vs 98ms；0.4B 1×32 179 vs 176ms），fused GEMM 批处理与纯 PyTorch 的 batched 路径基本打平，收益不如 MX450 上明显。
-- faster3a_2607 在所有 case 上大幅领先：prefill 已是 kernel 内串行的 T 维处理，B×T 增大几乎不影响单次延迟（0.4B 1×32 到 16×16 都约 16ms）。
+- T=1 decode 时 graph_decoder 最快（0.1B 1.66ms、0.4B 4.11ms），CUDA Graph 消除 launch 开销的效果在 sm_86 上依旧成立。
+- **单 kernel prefill（fused_dplr_T）**：state 串行递推在 kernel 内、一次 launch 交付整个序列 + fp32 state。prefill 较重构前大幅提速（0.1B 1×128 从 479ms 降到 15.8ms，~30x），并已接近/反超 faster3a_2607：
+  - 0.1B：1×32 17.9ms（1788 tok/s）vs faster3a 7.9ms（4062 tok/s）；1×128 15.8ms（8104 tok/s）vs faster3a 7.3ms（17618 tok/s）。仍落后 faster3a ~2.2x。
+  - 0.4B：1×32 33.9ms（943 tok/s）vs faster3a 14.9ms（2148 tok/s）；1×128 33.7ms（3802 tok/s）vs faster3a 14.1ms（9109 tok/s）。仍落后 faster3a ~2.4x。
+- 对比 pure_torch：0.1B 1×128 快 28x（15.8 vs 447ms），0.4B 1×128 快 30x（33.7 vs 1001ms）。
+- eager rwkv_tl 的 T=1 已快于 pure_torch（0.1B 9.6 vs 14.5ms；0.4B 20.4 vs 32.6ms），得益于重构后更紧凑的 decode 路径。
 - 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `prefill` 保持 eager。详见 docs/benchmark_rwkv7_experiments.md。
 
 ### CUDA (MX450, sm_75)

@@ -7,7 +7,7 @@
 
 | 项目 | 值 |
 |---|---|
-| 代码版本 | commit `8753509` (perf: keep forward_prefill eager; verify on RTX 3060) |
+| 代码版本 | commit `2f8c8f6`（stateless 重构后，`chore: bump version to 0.1.1`） |
 | GPU | NVIDIA RTX 3060 (sm_86, 12GB GDDR6) |
 | CUDA / PyTorch | CUDA 13.3 / PyTorch 2.13.0+cu130 |
 | TileLang | 0.1.12 |
@@ -15,7 +15,8 @@
 
 ## 测试结果：13/13 通过
 
-两个模型在 RTX 3060 上均通过完整测试套件（`pytest test/ -v`，13 项）：
+两个模型在 RTX 3060 上均通过完整测试套件（`pytest test/ -v`，13 项）。
+该结果在 stateless 重构（`694962f`，含单 kernel `fused_dplr_T`、fp32 state、`is_torch_compile` 参数）后重新验证通过：
 
 | 模型 | 参数 | 结构 | 结果 |
 |---|---|---|---|

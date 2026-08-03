@@ -28,22 +28,26 @@ uv sync
 ## Benchmark status
 
 The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
-target validation GPU. `rwkv_tl` and `pure_torch` run the eager path; the
-benchmark harness routes through the raw methods so a sweep does not recompile
-a fresh graph per token count.
+target validation GPU, after the stateless refactor with the single-shot
+`fused_dplr_T` prefill kernel. `rwkv_tl` and `pure_torch` run the eager path;
+the benchmark harness routes through the raw methods so a sweep does not
+recompile a fresh graph per token count.
 
 | Case | rwkv_tl | pure_torch | graph_decoder |
 |---|---:|---:|---:|
-| 1x1 | 40.48 ms / 24.70 tok/s | 13.74 ms / 72.77 tok/s | 2.11 ms / 473.14 tok/s |
-| 1x32 | 118.12 ms / 270.92 tok/s | 98.20 ms / 325.87 tok/s | 58.78 ms / 544.42 tok/s |
-| 8x8 | 206.94 ms / 309.26 tok/s | 171.77 ms / 372.58 tok/s | not supported |
-| 16x16 | 758.45 ms / 337.53 tok/s | 609.80 ms / 419.81 tok/s | not supported |
+| 1x1 | 9.58 ms / 104.41 tok/s | 14.50 ms / 68.98 tok/s | 1.66 ms / 602.63 tok/s |
+| 1x32 | 17.90 ms / 1787.72 tok/s | 121.82 ms / 262.68 tok/s | 51.57 ms / 620.50 tok/s |
+| 8x8 | 16.09 ms / 3978.86 tok/s | 214.81 ms / 297.94 tok/s | not supported |
+| 16x16 | 15.87 ms / 16135.64 tok/s | 969.97 ms / 263.93 tok/s | not supported |
 
 Key points:
 - GraphDecoder is best for single-token decode latency.
 - rwkv_tl is the only path that supports both batched prefill and decode.
-- The Albatross reference (faster3a_2607) still leads all cases by a wide
-  margin (4.32 ms on 1x1, ~7.5 ms on all prefill cases for 0.1B).
+- The single-shot `fused_dplr_T` prefill kernel made prefill latency
+  flat across T (0.1B ~15-18 ms for all prefill cases); it now beats
+  `pure_torch` by ~28x at 1x128.
+- The Albatross reference (faster3a_2607) still leads prefill by ~2.2x
+  (7.3 ms on 0.1B 1x128 vs 15.8 ms for rwkv_tl).
 - Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmark_rwkv7_experiments.md`.
