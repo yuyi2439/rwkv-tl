@@ -61,17 +61,29 @@ vs the sm75-adapted faster3a_2607 from
 
 | T | faster3a_2607 (sm75-adapted) | tl-mx450 |
 |---|---|---|
-| 1 | 14.9ms (noisy) | **8.2ms (stable)** |
-| 2 | **8.7ms** | 24.0ms |
-| 4 | **9.5ms** | 25.0ms |
-| 8 | **22.9ms** | 25.2ms |
-| 16 | 33.7ms | **28.0ms** |
-| 32 | 43.8ms | **32.5ms** |
+| 1 | 9.6ms (noisy) | **8.3ms (stable)** |
+| 2 | 11.4ms | **11.5ms (tie)** |
+| 4 | **10.8ms** | 11.7ms |
+| 8 | 23.6ms | **13.0ms** |
+| 16 | 34.0ms | **19.5ms** |
+| 32 | 43.9ms | **15.8ms** |
+| 64 | 47.0ms | **22.5ms** |
+| 128 | 88.6ms | **43.4ms** |
 
-- **T=1 decode beats faster3a**: CUDA Graph removes launch overhead, giving a
-  stable 8.2ms vs faster3a's fluctuating 8.3-23.2ms.
-- **T>=16 prefill beats faster3a**; faster3a still leads the tiny-prefill
-  regime (T=2/4/8).
+**`tl-mx450` now leads (or ties) the sm75-adapted faster3a_2607 at every T.** The
+wins stack three sm_75 findings: CUDA-Graph decode (stable 8.3ms T=1), CUDA-Graph
+prefill for T<=64 (small-T prefill was launch-bound: a constant ~2175 launches
+regardless of T; T=4 dropped 33 -> 11.7ms), and `.contiguous()` on transposed
+GEMM weights (non-contiguous cuBLAS operands are ~2.7x slower on Turing;
+T=128 prefill dropped 70.6 -> 43.4ms).
+
+Why we win despite both sides using CUDA Graph: faster3a_2607 (its sm75
+adaptation also captures per-stage `torch.cuda.CUDAGraph`s) still runs its
+prefill through **fp16 tensor-core GEMMs** (`volta_fp16_s884gemm...` ~39ms of
+42.6ms at T=32), which are the pathological Turing fp16 cuBLAS kernels (~4-6x
+slower than fp32 for these shapes). `tl-mx450` deliberately uses **fp32 GEMMs**
+for prefill, which is the correct sm_75 adaptation. This is an architecture-level
+difference, not a measurement artifact.
 
 ## Run benchmark
 

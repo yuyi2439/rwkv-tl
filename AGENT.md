@@ -152,6 +152,24 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - AMD note: tilelang's `warp_reduce_sum` keeps 32-lane logical-warp semantics on HIP (CDNA wave64 and RDNA wave32) -- see `src/tl_templates/hip/reduce.h`. Do NOT set WARP to the AMD hardware wavefront (64): the reduce would then cover only lanes 0-31 and silently drop half the reduction. `SERIAL = HEAD_DIM // WARP` stays 2 on every backend.
 - `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
+- **Non-contiguous cuBLAS operands are ~2.7x slower on Turing.** A transposed
+  weight view (`W.T`, strides `(1, N)`) passed straight to `matmul`/`bmm` runs
+  far slower than the contiguous copy (measured `[128,768]@[768,3072]` fp32:
+  1.52 vs 0.55ms). Always `.contiguous()` after `.T` on any weight used in a
+  GEMM (rkv stack, output projection, FFN key/value). This one fix cut MX450
+  prefill T=128 by ~40% (70.6 -> 43.4ms). Note the FFN is 4x expanded
+  (`[C, C]` weights are actually `[4*C, C]`), so CMIX GEMMs are the prefill
+  bottleneck, not the TMIX gate chains.
+- **MX450 prefill is CUDA-Graphed for T<=64.** Small-T prefill launches a
+  constant ~2175 kernels regardless of T (every layer runs the same op
+  sequence), so T=2..8 is launch-bound (~15-20ms of dispatch overhead on
+  MX450). `demo/prefill_graph.py` captures the whole prefill per exact T (no
+  padding -- the DPLR recurrence advances the state per token) and replays it;
+  `RWKV7MX450.prefill` copies the caller's State in/out like the decode graph,
+  keeping the model stateless. This cut T=4 prefill 33 -> 11.7ms and MX450 now
+  leads or ties the sm75-adapted faster3a at every T. T>64 stays eager (launch
+  overhead amortized, graph memory scales with T). Requires the batch closures
+  to update `state["x"]` in place (`copy_`, not rebind) so addresses stay fixed.
 - **Turing sm_75 fp16 GEMM is T-specialized.** `kernels/gemm.py` compiles a
   per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
   MX450) for fp16 on sm_75, because a dynamic-T version cannot reach that

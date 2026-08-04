@@ -272,7 +272,8 @@ class RWKV7Base(RWKV7Model):
         ln_pre = b.ln_pret
 
         rWt_stack = torch.stack([rWt, kWt, vWt], dim=0).contiguous()
-        oWt = att.output_weight.T
+        # .contiguous(): a transposed cuBLAS operand is ~2.7x slower (Turing).
+        oWt = att.output_weight.T.contiguous()
         w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
         a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
         v0, v1, v2 = att.v0.reshape(-1), att.v1, att.v2
@@ -358,7 +359,7 @@ class RWKV7Base(RWKV7Model):
         ffn = b.ffn
         ln_pre = b.ln_prec
         x_k = ffn.x_k.reshape(-1)
-        kWt, vWt = ffn.key_weight.T, ffn.value_weight.T
+        kWt, vWt = ffn.key_weight.T.contiguous(), ffn.value_weight.T.contiguous()
 
         def layer(x0: Tensor, state: dict[str, Tensor]) -> Tensor:
             x_ln = LAYER_NORM(x0, ln_pre)

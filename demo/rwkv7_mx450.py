@@ -26,6 +26,7 @@ from torch import Tensor
 
 from demo._rwkv7_base import LAYER_NORM, RELUSQ
 from demo.graph_decode import GraphDecoder
+from demo.prefill_graph import PrefillGraph
 from demo.rwkv7_fp16 import RWKV7FP16
 from rwkv_tl.kernels import fused_dplr_T, fused_rkv_gemm
 from rwkv_tl.state import State
@@ -45,6 +46,11 @@ def _copy_state(dst: State, src: State) -> None:
 
 
 class RWKV7MX450(RWKV7FP16):
+    # Small-T prefill is launch-bound (constant ~2175 launches regardless of T),
+    # so it is CUDA-graphed per exact T up to this cap; larger T runs eager
+    # (launch overhead is amortized there and graph memory scales with T).
+    PREFILL_GRAPH_MAX_T = 64
+
     def __init__(
         self,
         w: RWKV7Weight,
@@ -58,6 +64,7 @@ class RWKV7MX450(RWKV7FP16):
         # in/out around the replay, so the model stays stateless and any State
         # works (MX450 is a CUDA-only sm_75 variant, so the graph is default-on).
         self._graph = GraphDecoder(self) if use_graph else None
+        self._prefill_graphs: dict[int, PrefillGraph] = {}
 
     def decode(self, token: int | Tensor, S: State) -> tuple[Tensor, State]:
         """Advance one token; CUDA-graph replays when enabled, eager otherwise."""
@@ -68,8 +75,21 @@ class RWKV7MX450(RWKV7FP16):
         _copy_state(g.state, S)
         logits = g.step(int(token.item()) if isinstance(token, Tensor) else int(token))
         _copy_state(S, g.state)
-
         return logits.clone(), S
+
+    def prefill(self, tokens: Tensor, S: State) -> State:
+        """Batched prefill; CUDA-graph replays per exact T when enabled."""
+        if self._graph is None:
+            return super().prefill(tokens, S)
+        tok = tokens.reshape(-1)
+        T = tok.numel()
+        if T < 2 or T > self.PREFILL_GRAPH_MAX_T:
+            return super().prefill(tok, S)
+        g = self._prefill_graphs.get(T)
+        if g is None:
+            g = PrefillGraph(self, T)
+            self._prefill_graphs[T] = g
+        return g.step(tok, S)
 
     def make_TMIX_batch(self, i: int):
         # Batched TMIX for prefill, GEMMs in fp32 (see module docstring).
@@ -86,7 +106,9 @@ class RWKV7MX450(RWKV7FP16):
         # beats the fp32 cuBLAS bmm for T<=16 (measured 0.12 vs 0.21ms @ T=8);
         # fp32 cuBLAS stays faster at T>=32 (0.42 vs 0.83ms @ T=128).
         rWt_stack16 = rWt_stack.half()
-        oWt = att.output_weight.T.float()
+        # .contiguous() matters: a transposed fp32 view is ~2.7x slower in cuBLAS
+        # (measured [128,768]@[768,3072]: 1.52 vs 0.55ms non-contiguous vs contiguous).
+        oWt = att.output_weight.T.contiguous().float()
         w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
         a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
         v0, v1, v2 = att.v0.reshape(-1), att.v1, att.v2
@@ -120,8 +142,9 @@ class RWKV7MX450(RWKV7FP16):
             xv = x + x_v * diff
             xa = x + x_a * diff
             xg = x + x_g * diff
-            # state["x"] stays fp16 (decode's fused_lerp6_rkv_copy requires it).
-            state["x"] = x[-1].half()
+            # state["x"] stays fp16 (decode's fused_lerp6_rkv_copy requires it);
+            # in-place so CUDA-Graph prefill keeps fixed buffers.
+            state["x"].copy_(x[-1])
 
             if T_len <= 16:
                 rkv = fused_rkv_gemm(xr.half(), xk.half(), xv.half(), rWt_stack16)
@@ -169,14 +192,14 @@ class RWKV7MX450(RWKV7FP16):
         ffn = b.ffn
         ln_pre = b.ln_prec
         x_k = ffn.x_k.reshape(-1)
-        kWt = ffn.key_weight.T.float()
-        vWt = ffn.value_weight.T.float()
+        kWt = ffn.key_weight.T.contiguous().float()
+        vWt = ffn.value_weight.T.contiguous().float()
 
         def layer(x0: Tensor, state: dict[str, Tensor]) -> Tensor:
             x_ln = LAYER_NORM(x0, ln_pre)
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
             x = x_ln + x_k * (prev - x_ln)
-            state["x"] = x_ln[-1]
+            state["x"].copy_(x_ln[-1])
             out = x0 + RELUSQ(x.float() @ kWt) @ vWt
             return out.half()
 

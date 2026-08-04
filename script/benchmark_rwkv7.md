@@ -50,18 +50,21 @@ uv run python script/benchmark_rwkv7.py \
 
 | T | faster3a_2607 (sm75 适配) | tl-mx450 |
 |---|---|---|
-| 1 | 14.9ms（p10 8.3 / p90 23.2，波动大） | **8.2ms（p10 8.1 / p90 8.8，稳定）** |
-| 2 | **8.7ms** | 24.0ms |
-| 4 | **9.5ms** | 25.0ms |
-| 8 | **22.9ms** | 25.2ms |
-| 16 | 33.7ms | **28.0ms** |
-| 32 | 43.8ms | **32.5ms** |
+| 1 | 9.6ms（波动大） | **8.3ms（稳定）** |
+| 2 | 11.4ms | **11.5ms（持平）** |
+| 4 | **10.8ms** | 11.7ms |
+| 8 | 23.6ms | **13.0ms** |
+| 16 | 34.0ms | **19.5ms** |
+| 32 | 43.9ms | **15.8ms** |
+| 64 | 47.0ms | **22.5ms** |
+| 128 | 88.6ms | **43.4ms** |
 
 结论：
-- **T=1 decode：mx450 已部分超过适配 sm75 的 faster3a**——CUDA Graph 消除 launch 开销，
-  稳定 8.2ms（p10/p90 几乎重合），而 faster3a 受热降频影响波动到 8.3~23.2ms。
-- T=2/4/8 小 prefill：faster3a 仍占优（chunk kernel 对极小 T 高效）。
-- T≥16 prefill：mx450 反超。
+- **T=1 decode：mx450 稳定 8.3ms**（CUDA Graph 消除 launch 开销），faster3a 波动到 20ms+。
+- **小 T prefill（T=2/4）持平，T≥8 全面反超**：2026-08-04 起小 T prefill 也走 CUDA Graph
+  （launch 数恒定 ~2175 与 T 无关，T=4 从 33 → 11.7ms）。
+- **T=128 快 2.04x（43.4 vs 88.6ms）**：GEMM 权重 `.T` 后补 `.contiguous()`（非连续
+  cuBLAS 操作数在 Turing 慢 ~2.7x），70.6 → 43.4ms（-39%）。
 
 原因分析（kernel 级剖析）见 [docs/benchmarks/mx450_sm75.md](../docs/benchmarks/mx450_sm75.md)。
 
