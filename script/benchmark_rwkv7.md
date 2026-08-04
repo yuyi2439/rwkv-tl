@@ -9,7 +9,7 @@ uv run python script/benchmark_rwkv7.py \
   --project-checkpoint ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth \
   --fast-script ~/rwkv/Albatross/faster3a_2607 \
   --device cuda \
-  --targets faster3a_2607,tl-fp16,pure-torch,graph_decoder \
+  --targets faster3a_2607,tl-fp16,pure-torch \
   --cases 1x1,8x8,16x16
 ```
 
@@ -21,26 +21,47 @@ uv run python script/benchmark_rwkv7.py \
 | GPU (旧参考) | NVIDIA MX450 (sm_75, 2GB GDDR6) |
 | 模型 | rwkv7-g1d-0.1b (C=768, H=12, L=12), rwkv7-g1d-0.4b (C=1024, H=16, L=24) |
 | 精度 | float16 (CUDA), float32 (CPU) |
-| 实现 | faster3a_2607 (Albatross), tl-fp16 (本项目 fp16), tl-bf16 (本项目 bf16), tl-mx450 (sm_75 变体), pure-torch (纯 PyTorch 基线), graph_decoder (CUDA Graph 解码) |
+| 实现 | faster3a_2607 (Albatross), tl-fp16 (本项目 fp16), tl-bf16 (本项目 bf16), tl-mx450 (sm_75 变体, CUDA Graph decode), pure-torch (纯 PyTorch 基线) |
 
 ## 实现说明
 
 | 实现 | device | 路径 | 说明 |
 |---|---|---|---|
-| faster3a_2607 | cuda | forward | Albatross CUDA 扩展，wkv_seq kernel（T 维 kernel 内串行），编译目标 sm_75 |
+| faster3a_2607 | cuda | forward | Albatross CUDA 扩展，wkv_seq kernel（T 维 kernel 内串行），sm_75 适配版来自 [yuyi2439/Albatross `support/sm75`](https://github.com/yuyi2439/Albatross/tree/support/sm75) |
 | tl-fp16 | cuda/cpu | forward | 本项目 fused kernel + 单 kernel prefill（fused_dplr_T：T 维串行递推在 kernel 内，一次 launch 交付整个序列）；fp16 权重；T=1 走 decode（decode），T>1 走 prefill |
 | tl-bf16 | cuda/cpu | forward | 同 tl-fp16，但用 checkpoint 原始 bf16 权重（bf16 kernel 绑定），参考/实验用 |
-| tl-mx450 | cuda | forward | fp16 变体，sm_75 下 batch prefill GEMM 走 fp32 快路径（Turing fp16 cuBLAS 小 shape 病态慢） |
+| tl-mx450 | cuda | forward | fp16 变体，sm_75 下 batch prefill GEMM 走 fp32 快路径（Turing fp16 cuBLAS 小 shape 病态慢）+ T≤16 rkv 走 tilelang fp16；decode 走 CUDA Graph |
 | pure-torch | cuda/cpu | forward | 纯 PyTorch eager 基线，无自定义 kernel；同样 T=1 decode / T>1 prefill |
-| graph_decoder | cuda | decode | tl-fp16 + CUDA Graph 捕获单 token 解码，消除 launch 开销；T>1 时逐 token replay |
 
 注：
-- `--device cpu` 时，faster3a_2607 和 graph_decoder 自动跳过（CUDA-only）。
+- `--device cpu` 时，faster3a_2607 自动跳过（CUDA-only）。
+- graph_decoder benchmark target 已暂时移除（等测试其他设备后加回）；CUDA Graph decode 现在集成在 tl-mx450 的 decode 路径里。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
 - 正确性门控**默认关闭**（`--correctness-check` 开启）：每个 case 计时前先把输出与同 dtype 的 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。默认关是为了省显存（参考模型共享 target 权重对象，但多 target 混跑仍可能压 2GB 卡）。
 - **权重按 target 加载/释放**：每个 target 独立 `RWKV7Weight`，跑完即删（`del` + `gc.collect()` + `empty_cache()`），同进程同时只有一份权重在显存。
 - **MX450 2GB 显存注意**：0.4B 模型 + pure_torch 参考模型合计 ~2.4GB 超出显存，正确性门控会触发内存压力导致 0.4B rwkv_tl 延迟虚高 10x。0.4B MX450 数据不要开 `--correctness-check` 采集。
 - **同一进程跑多个 target 也会压显存**：fp16 + bf16 权重与参考模型同驻（0.1B 也会 ~1.6GB+），MX450 的 fp32 权重副本叠加后接近 2GB，延迟虚高数倍。MX450 数据建议单独跑该 target（实测 T=128 73ms，混跑 1029ms）。
+
+## MX450 特调 vs 适配 sm75 的 faster3a_2607
+
+> 对比对象：本项目 `tl-mx450`（fp32 prefill GEMM + T≤16 tilelang fp16 rkv + CUDA Graph decode）
+> 与 [yuyi2439/Albatross](https://github.com/yuyi2439/Albatross) `support/sm75` 分支适配的
+> faster3a_2607。0.1B / MX450，warmup=10, iters=20，单会话（仅两 target）。
+
+| T | faster3a_2607 (sm75 适配) | tl-mx450 |
+|---|---|---|
+| 1 | 14.9ms（p10 8.3 / p90 23.2，波动大） | **8.2ms（p10 8.1 / p90 8.8，稳定）** |
+| 2 | **8.7ms** | 24.0ms |
+| 4 | **9.5ms** | 25.0ms |
+| 8 | **22.9ms** | 25.2ms |
+| 16 | 33.7ms | **28.0ms** |
+| 32 | 43.8ms | **32.5ms** |
+
+结论：
+- **T=1 decode：mx450 已部分超过适配 sm75 的 faster3a**——CUDA Graph 消除 launch 开销，
+  稳定 8.2ms（p10/p90 几乎重合），而 faster3a 受热降频影响波动到 8.3~23.2ms。
+- T=2/4/8 小 prefill：faster3a 仍占优（chunk kernel 对极小 T 高效）。
+- T≥16 prefill：mx450 反超。
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 

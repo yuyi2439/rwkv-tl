@@ -43,7 +43,12 @@ class GraphDecoder:
 
         self.model = model
         self.token_buf = torch.zeros(1, dtype=torch.long, device="cuda")
-        self.state = self._cuda_state()
+        self.state = State(
+            self.model.N_LAYER,
+            self.model.N_EMBD,
+            self.model.HEAD_DIM,
+            device="cuda",
+        )
 
         # Output logits buffer — populated by the captured forward.
         self.logits: Tensor | None = None
@@ -70,22 +75,13 @@ class GraphDecoder:
         """
         self.token_buf[0] = token_id
         self.graph.replay()
+
         assert self.logits is not None
         return self.logits
 
     # ------------------------------------------------------------------ #
     #  Internals
     # ------------------------------------------------------------------ #
-
-    def _cuda_state(self) -> State:
-        """Create a fresh zero state with all tensors on CUDA."""
-        with torch.device("cuda"):
-            return State(
-                self.model.N_LAYER,
-                self.model.N_EMBD,
-                self.model.HEAD_DIM,
-                device="cuda",
-            )
 
     def _run_step(self) -> Tensor:
         """Execute one forward step reading from ``token_buf``.

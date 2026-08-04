@@ -52,13 +52,34 @@ Key points:
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmark_rwkv7_experiments.md`.
 
+## MX450 tuning (sm_75) now partially beats the sm75-adapted faster3a_2607
+
+`tl-mx450` (sm_75 tuning: fp32 prefill GEMMs + T<=16 tilelang fp16 rkv + CUDA-Graph decode)
+vs the sm75-adapted faster3a_2607 from
+[yuyi2439/Albatross `support/sm75`](https://github.com/yuyi2439/Albatross/tree/support/sm75)
+(0.1B / MX450, warmup=10, iters=20, single session):
+
+| T | faster3a_2607 (sm75-adapted) | tl-mx450 |
+|---|---|---|
+| 1 | 14.9ms (noisy) | **8.2ms (stable)** |
+| 2 | **8.7ms** | 24.0ms |
+| 4 | **9.5ms** | 25.0ms |
+| 8 | **22.9ms** | 25.2ms |
+| 16 | 33.7ms | **28.0ms** |
+| 32 | 43.8ms | **32.5ms** |
+
+- **T=1 decode beats faster3a**: CUDA Graph removes launch overhead, giving a
+  stable 8.2ms vs faster3a's fluctuating 8.3-23.2ms.
+- **T>=16 prefill beats faster3a**; faster3a still leads the tiny-prefill
+  regime (T=2/4/8).
+
 ## Run benchmark
 
 ```bash
 .venv/bin/python script/benchmark_rwkv7.py \
   --project-checkpoint <checkpoint.pth> \
   --vocab asset/rwkv_vocab_v20230424.txt \
-  --targets rwkv_tl,pure_torch,graph_decoder \
+  --targets tl-fp16,pure-torch \
   --device cuda \
   --cases 1x1,1x8,1x32,2x1,8x1,8x8,16x16 \
   --warmup 10 --iters 20

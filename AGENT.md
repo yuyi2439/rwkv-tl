@@ -82,7 +82,16 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
   the model dtype. DPLR RNN state is always fp32 in both variants.
 - **`demo.make_rwkv7` backends**: `"auto"` (MX450 variant on CUDA sm_75,
-  fp16 elsewhere), `"fp16"`, `"bf16"`, `"mx450"`, `"torch"`.
+  fp16 elsewhere), `"fp16"`, `"bf16"`, `"mx450"`, `"torch"`. `use_graph=True`
+  (default) makes `RWKV7MX450` decode via a captured CUDA Graph.
+- **Models are stateless; `State` is passed explicitly.** `State` and model are
+  decoupled: models never own runtime state, and `decode`/`prefill`/`forward`/
+  `generate` take a `State` argument and return it. State creation is a
+  standalone helper (the benchmark's `make_state`), not a model method. The
+  CUDA-Graph decode in `RWKV7MX450` preserves this: the graph replays against
+  its own fixed-address shadow state and `decode` copies the caller's `State`
+  in/out around each replay, so any `State` works and the model stays
+  stateless. Do not add an owned-state API or a `zero_state` model method.
 
 ## Goal
 
@@ -90,7 +99,7 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 
 **Long-term direction: rwkv-tl must support TRAINING.** All new operators/optimizations must keep autograd compatibility in mind:
 - The registered custom ops (`torch.ops.rwkv_tl.*`) exist precisely to enable future `register_autograd` backward definitions (the standard PyTorch op dispatch path).
-- CUDA Graph (`GraphDecoder`) is INFERENCE-ONLY by design: it captures the forward launch sequence and does not rebuild an autograd graph (replay does not record gradients, fixed buffers conflict with autograd's dynamic graph). Do not route anything training-relevant through it.
+- CUDA Graph (`GraphDecoder`, now in `demo/`) is INFERENCE-ONLY by design: it captures the forward launch sequence and does not rebuild an autograd graph (replay does not record gradients, fixed buffers conflict with autograd's dynamic graph). Do not route anything training-relevant through it. `RWKV7MX450` integrates it as the default `decode` path (`use_graph=True`) via a stateless copy-in/out around a fixed shadow state.
 - A fully-fused single kernel is NOT inherently inference-only (unlike CUDA Graph) -- any custom CUDA kernel, fused or not, needs an explicit backward to support training. But fusing a whole layer makes training hard: you must hand-write the layer's backward (including the serial DPLR recurrence, which reverses in time and needs every intermediate state saved) and manually stage/save the per-op intermediates that autograd would otherwise keep. That is far more work and error-prone than the per-op custom-op path, where each op registers its own backward and intermediates stay in the autograd graph automatically. So: prefer per-op custom ops for training; do not build a whole-layer fused kernel for the training path.
 - Measured on RTX 3060 / 0.1B: GraphDecoder is already 1.63 ms/token with launch gaps squeezed to ~0.08 ms (GPU kernel time ~1.55 ms). Fusing all decode layers into one kernel would gain <0.1 ms over that and (as above) hurt training. The remaining real cost is the ~1.5 ms of GEMV compute itself.
 
@@ -105,15 +114,21 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 
 ## Hardware note
 
-Validation completed on an RTX 3060 (sm_86, 12GB). MX450 results are historical references only (that GPU also thermal-throttles under sustained load, inflating latencies up to ~50%).
+Validation completed on an RTX 3060 (sm_86, 12GB). MX450 (sm_75, 2GB) is now an
+ACTIVE optimization target (`tl-mx450`), not just historical: it is a Turing
+card with pathological fp16 cuBLAS GEMMs and severe thermal throttling under
+sustained load (latencies inflate up to ~50%, p90 >> p10) -- treat single-session
+relative comparisons as reliable, absolute numbers as noisy.
 
 ## Performance work
 
-- Decode path: fused TMIX/CMIX kernels plus GraphDecoder.
+- Decode path: fused TMIX/CMIX kernels; `RWKV7MX450` decode is CUDA-Graph
+  accelerated by default (see the stateless `use_graph` design above).
 - Prefill path: batched GEMM instead of per-token GEMV where possible.
 - Keep correctness first: forward and prefill must use independent state objects in tests.
 - `prefill` is deliberately NOT torch.compile'd: each distinct prompt length recompiles a fresh graph (T=256 took ~12 min on 0.1B with the GPU idle) for a steady-state gain of only 1.11-1.43x. Keep it eager.
-- The benchmark harness (`benchmark_rwkv7.py`) builds rwkv_tl/pure_torch with `is_torch_compile=False` and routes them through `decode`/`prefill` (via `_eager_dispatch`) so a sweep measures the eager implementation and never triggers per-case torch.compile recompiles (which previously made it look frozen for minutes).
+- The benchmark harness (`benchmark_rwkv7.py`) builds rwkv_tl/pure_torch with `is_torch_compile=False` and routes them through `decode`/`prefill` (via `_eager_dispatch`) so a sweep measures the eager implementation and never triggers per-case torch.compile recompiles (which previously made it look frozen for minutes). The correctness gate is OFF by default (`--correctness-check` opt-in) to keep VRAM low on 2GB GPUs. The `graph_decoder` benchmark target is removed for now (CUDA-Graph decode now lives inside `tl-mx450`); re-add after testing on other devices.
+- MX450 tuning (0.1B) now partially beats the sm75-adapted faster3a_2607: a stable 8.2ms T=1 decode (CUDA Graph) and T>=16 prefill wins; faster3a still leads T=2/4/8. See `README.md` and `script/benchmark_rwkv7.md`.
 
 ## Benchmarks
 
@@ -155,7 +170,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   (`RWKV7BF16` + `RWKV7Weight(..., dtype=torch.bfloat16)`) keeps the raw
   checkpoint dtype and is a reference/experimental variant. The compile
   decision is purely `is_torch_compile`.
-- `RWKV7Weight(model_path, device=None)` loads directly to the target device via `torch.load(..., map_location=device)` -- the repo checkpoints are saved on cuda, so without `device` the tensors land on cuda regardless of context. The benchmark shares ONE `RWKV7Weight` across rwkv_tl/pure_torch/graph_decoder instead of re-materializing a temp checkpoint per model (old `_build_materialized_checkpoint` is removed).
+- `RWKV7Weight(model_path, device=None)` loads directly to the target device via `torch.load(..., map_location=device)` -- the repo checkpoints are saved on cuda, so without `device` the tensors land on cuda regardless of context. The benchmark loads ONE fresh `RWKV7Weight` per target and frees it (`del` + `gc.collect()` + `empty_cache()`) before the next target, so only one weight copy is resident at a time (MX450 has 2GB VRAM); the correctness reference shares the target's weight object.
 - Kernels are compiled PER-MODEL with static H/C (model constants baked at compile time; only T_LEN stays dynamic): each kernel file exposes `@functools.cache` factories (`_dplr_kernel(H)`, `_lerp6_kernel(C)`, ...) and the wrappers dispatch by input shape. Only compile-time model constants go static; per-call sizes (token count) stay dynamic. Caveat: a factory param used ONLY in a type annotation (not the kernel body) is not captured by tilelang's `get_func_nonlocals` and causes `NameError` -- reference it in the body too (e.g. `H * N` in annotations is fine since H is used in the body).
 - Compute is **fp16 IO + fp32 accumulation**, DPLR state is **fp32** (matching Albatross): RNN state `[H,N,N]` is fp32 (not fp16-rounded each step), IO (r/w/k/v) stays fp16. Weights are converted bf16->fp16 once at `RWKV7Weight` load. `_dplr_kernel`/`_dplr_T_kernel` read/write fp32 S; pure_torch reference matches.
 - Prefill DPLR is a **single-shot kernel** (`fused_dplr_T` / `_dplr_T_kernel`): one launch processes the whole [T,H,N] sequence, serial state recurrence inside each (h,v_n) block. Verified: y outputs bit-match the reference through long T. Known tilelang quirk: the STORED S_out comes out fp16-rounded despite being declared fp32 (y, computed from the fp32 local, is exact); treat state precision as fp16-level across calls for now.
@@ -170,13 +185,25 @@ done yet. When working on the related area, remind the user whether to proceed.
   live in `demo/` (one class per device/kernel strategy):
   `demo.rwkv7_fp16.RWKV7FP16` (tilelang fp16, sm_80+), `demo.rwkv7_bf16.RWKV7BF16`
   (tilelang bf16), `demo.rwkv7_mx450.RWKV7MX450`
-  (sm_75: batch GEMMs in fp32), `demo.rwkv7_torch.RWKV7Torch` (pure torch
-  reference). `demo.make_rwkv7(w, backend=...)` picks by CUDA arch.
+  (sm_75: fp32 batch GEMMs + T<=16 tilelang fp16 rkv + CUDA-Graph decode),
+  `demo.rwkv7_torch.RWKV7Torch` (pure torch reference).
+  `demo.graph_decode.GraphDecoder` (moved here from `src/rwkv_tl/`) provides the
+  CUDA-Graph single-token decode used by `RWKV7MX450`.
+  `demo.make_rwkv7(w, backend=...)` picks by CUDA arch.
 - **Adopt a stateless operator API.** Future kernel/operator APIs should take
   `initial_state` and return `final_state` explicitly instead of mutating an
   in-place `state` dict. This is clearer, autograd-friendly, and matches the
   FlashRWKV `rwkv7(..., initial_state=, output_final_state=)` contract. Apply
   this pattern to new ops; migrate existing ones when refactoring.
+- **Future: real batch (B>1) support.** Currently there is NO real batching:
+  `State` has no batch dim (one `State` = one sequence), `forward` silently
+  flattens `[B,T]` to a single `[B*T]` sequence (the benchmark's `BxT` cases
+  are just longer single-sequence lengths, B is not real), `decode` handles
+  one token, and `GraphDecoder` is inherently B=1. Real batch needs a
+  dedicated adaptation: `State` gains a batch dim (`rnn [B,H,N,N]`, `x [B,C]`),
+  prefill/decode run the batch in parallel, and the DPLR recurrence iterates
+  B independent per-sequence states. User-approved direction -- DO NOT start
+  this now; revisit when the user asks.
 
 ## Verified on RTX 3060 (sm_86)
 

@@ -11,6 +11,11 @@ Small-T exception: for T<=16 the fused r/k/v projection goes through the
 T-specialized tilelang fp16 m16n8k8 kernel instead (it beats the fp32 cuBLAS
 bmm there -- measured 0.12 vs 0.21ms @ T=8); fp32 cuBLAS stays faster at
 T>=32 (0.42 vs 0.83ms @ T=128).
+
+Decode is CUDA-Graph accelerated by default (``use_graph=True``): a single
+token step is captured once and replayed. The model stays stateless -- the
+graph replays against its own fixed-address shadow state and ``decode`` copies
+the caller's ``State`` in/out around each replay, so any ``State`` works.
 """
 
 from __future__ import annotations
@@ -20,13 +25,52 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from demo._rwkv7_base import LAYER_NORM, RELUSQ
+from demo.graph_decode import GraphDecoder
 from demo.rwkv7_fp16 import RWKV7FP16
 from rwkv_tl.kernels import fused_dplr_T, fused_rkv_gemm
+from rwkv_tl.state import State
+from rwkv_tl.weight import RWKV7Weight
 
 __all__ = ["RWKV7MX450"]
 
 
+def _copy_state(dst: State, src: State) -> None:
+    """Copy all state tensors from ``src`` into ``dst`` in place."""
+    for ds, ss in zip(dst.tmix, src.tmix):
+        for k in ds:
+            ds[k].copy_(ss[k])
+    for ds, ss in zip(dst.cmix, src.cmix):
+        for k in ds:
+            ds[k].copy_(ss[k])
+
+
 class RWKV7MX450(RWKV7FP16):
+    def __init__(
+        self,
+        w: RWKV7Weight,
+        *,
+        is_torch_compile: bool = True,
+        use_graph: bool = True,
+    ) -> None:
+        super().__init__(w, is_torch_compile=is_torch_compile)
+        # CUDA Graph single-token decode: the captured graph replays against its
+        # own fixed-address shadow state; decode copies the caller's State
+        # in/out around the replay, so the model stays stateless and any State
+        # works (MX450 is a CUDA-only sm_75 variant, so the graph is default-on).
+        self._graph = GraphDecoder(self) if use_graph else None
+
+    def decode(self, token: int | Tensor, S: State) -> tuple[Tensor, State]:
+        """Advance one token; CUDA-graph replays when enabled, eager otherwise."""
+        if self._graph is None:
+            return super().decode(token, S)
+
+        g = self._graph
+        _copy_state(g.state, S)
+        logits = g.step(int(token.item()) if isinstance(token, Tensor) else int(token))
+        _copy_state(S, g.state)
+
+        return logits.clone(), S
+
     def make_TMIX_batch(self, i: int):
         # Batched TMIX for prefill, GEMMs in fp32 (see module docstring).
         H, N = self.HEAD_CNT, self.HEAD_DIM

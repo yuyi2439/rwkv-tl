@@ -7,11 +7,11 @@ functions) so every target goes through the same entry point:
 - faster3a_2607: Albatross CUDA implementation (external module).
 - tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
 - tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
-- tl-mx450: sm_75 variant (``backend="mx450"``).
+- tl-mx450: sm_75 variant (``backend="mx450"``, CUDA-Graph decode).
 - pure-torch: pure PyTorch baseline (``backend="torch"``).
-- graph_decoder: CUDA Graph single-token decode path for tl-fp16.
 
 Reserved but not yet implemented targets:
+- graph_decoder (re-add after testing on other devices)
 - fla
 - FlashRWKV
 
@@ -62,7 +62,7 @@ DTYPE_FOR_TARGET = {
 }
 
 # Project targets gated against a matching-dtype pure-torch reference.
-GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450", "graph_decoder"}
+GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450"}
 
 
 def percentile(values, q):
@@ -199,7 +199,6 @@ def parse_targets(text: str) -> list[str]:
         "tl-bf16",
         "tl-mx450",
         "pure-torch",
-        "graph_decoder",
         "fla",
         "FlashRWKV",
     }
@@ -306,64 +305,6 @@ def bench_case(
     return p10, p50, p90, tok_s
 
 
-def bench_case_graph_decoder(
-    decoder,
-    seq_len: int,
-    warmup: int,
-    iters: int,
-    reference=None,
-    correctness_tol: float | None = None,
-):
-    """Benchmark GraphDecoder over a length-T token sequence.
-
-    GraphDecoder is single-token decode only, so one timed run replays T steps.
-    """
-    tokens = [int((i * 1103515245 + 12345) % 65536) for i in range(seq_len)]
-
-    if reference is not None and correctness_tol is not None:
-        decoder.reset()
-        got = None
-        for token in tokens:
-            got = decoder.step(token)
-        assert got is not None
-        ref_state = make_state(reference)
-        ref_logits = None
-        for token in tokens:
-            ref_logits, _ = reference.decode(token, ref_state)
-        assert ref_logits is not None
-        _check_correctness(
-            got.reshape(-1).float(),
-            ref_logits.reshape(-1).float(),
-            "graph_decoder",
-            correctness_tol,
-        )
-
-    torch.cuda.synchronize()
-    for _ in range(warmup):
-        decoder.reset()
-        for token in tokens:
-            _ = decoder.step(token)
-    torch.cuda.synchronize()
-
-    times = []
-    for _ in range(iters):
-        decoder.reset()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for token in tokens:
-            _ = decoder.step(token)
-        end.record()
-        torch.cuda.synchronize()
-        times.append(float(start.elapsed_time(end)))
-
-    p10 = percentile(times, 10)
-    p50 = percentile(times, 50)
-    p90 = percentile(times, 90)
-    tok_s = seq_len * 1000.0 / p50
-    return p10, p50, p90, tok_s
-
-
 def _print_row(label: str, B: int, T: int, iters: int, p10, p50, p90, tok_s) -> None:
     """打印一行 RESULT 与一行 csv。
 
@@ -405,7 +346,7 @@ def build_fast_model(module_path: Path, model_path: str):
 def run_benchmark(args):
     """根据 --targets 与 --device 运行选定实现的计时。
 
-    faster3a_2607 / graph_decoder 始终 CUDA；项目 target 运行在 --device。
+    faster3a_2607 始终 CUDA；项目 target 运行在 --device。
     fla / FlashRWKV 先保留为占位 target，后续再接入。
 
     Args:
@@ -453,7 +394,6 @@ def run_benchmark(args):
                     args.project_checkpoint,
                 )
                 device = torch.device("cuda")
-                mode = "forward"
                 gate_dtype: torch.dtype | None = None
             elif target in BACKEND_FOR_TARGET:
                 # One fresh weight per target, freed after the target's cases:
@@ -469,29 +409,7 @@ def run_benchmark(args):
                     is_torch_compile=args.compile,
                 )
                 device = rwkv_device
-                mode = "forward"
                 gate_dtype = dtype
-            elif target == "graph_decoder":
-                # GraphDecoder is CUDA-only: skip when unavailable or --device cpu.
-                if rwkv_device.type != "cuda" or not torch.cuda.is_available():
-                    print(
-                        f"SKIP label=graph_decoder reason=cuda_only_device={rwkv_device.type}",
-                        flush=True,
-                    )
-                    continue
-                from rwkv_tl.graph_decode import GraphDecoder
-
-                w = RWKV7Weight(
-                    str(args.project_checkpoint),
-                    device=rwkv_device,
-                    dtype=torch.float16,
-                )
-                model = GraphDecoder(
-                    make_rwkv7(w, backend="fp16", is_torch_compile=False)
-                )
-                device = torch.device("cuda")
-                mode = "decode"
-                gate_dtype = torch.float16
             elif target in {"fla", "FlashRWKV"}:
                 raise NotImplementedError(
                     f"target '{target}' is reserved but not implemented yet"
@@ -508,33 +426,17 @@ def run_benchmark(args):
                 reference = make_rwkv7(w, backend="torch", is_torch_compile=False)
 
             for B, T in parsed_cases:
-                if mode == "decode" and B != 1:
-                    print(
-                        f"SKIP label={target}({device.type}) B={B} T={T} reason=graph_decoder_requires_B1",
-                        flush=True,
-                    )
-                    continue
                 try:
-                    if mode == "decode":
-                        p10, p50, p90, tok_s = bench_case_graph_decoder(
-                            model,
-                            T,
-                            args.warmup,
-                            args.iters,
-                            reference,
-                            correctness_tol,
-                        )
-                    else:
-                        p10, p50, p90, tok_s = bench_case(
-                            model,
-                            B,
-                            T,
-                            args.warmup,
-                            args.iters,
-                            device,
-                            reference,
-                            correctness_tol,
-                        )
+                    p10, p50, p90, tok_s = bench_case(
+                        model,
+                        B,
+                        T,
+                        args.warmup,
+                        args.iters,
+                        device,
+                        reference,
+                        correctness_tol,
+                    )
                 except CorrectnessError as exc:
                     print(
                         f"SKIP label={target}({device.type}) B={B} T={T} "
@@ -589,17 +491,17 @@ def main():
     )
     parser.add_argument(
         "--targets",
-        default="faster3a_2607,tl-fp16,pure-torch,graph_decoder",
+        default="faster3a_2607,tl-fp16,pure-torch",
         help=(
             "Comma/space separated targets: faster3a_2607, tl-fp16, tl-bf16, "
-            "tl-mx450, pure-torch, graph_decoder, fla, FlashRWKV. Defaults to "
-            "the implemented targets."
+            "tl-mx450, pure-torch, fla, FlashRWKV. Defaults to the implemented "
+            "targets."
         ),
     )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Controls the project-target device: cpu | cuda. CUDA-only targets (faster3a_2607, graph_decoder) auto-skip on cpu.",
+        help="Controls the project-target device: cpu | cuda. faster3a_2607 (CUDA-only) auto-skips on cpu.",
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)

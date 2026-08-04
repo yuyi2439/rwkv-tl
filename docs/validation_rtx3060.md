@@ -25,7 +25,6 @@
 
 测试项覆盖：
 - `test_forward.py`：decode / prefill 与 pure_torch 参考的数值一致性（argmax、top-5、logit 差上限），decode 与 prefill 路径互相对齐。
-- `test_graph.py`：GraphDecoder 与基线 forward 的一致性。
 - `test_kernels.py`：fused_lerp6 与 6 次独立 LERP 的 bit-exact 对比。
 
 运行命令：

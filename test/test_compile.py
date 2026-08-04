@@ -7,7 +7,7 @@ recompile; with ``fullgraph=True`` it hard-fails after ``recompile_limit``
 CUDA 0-dim tensor instead so the runtime token value stays out of the
 specialization keys.
 
-The old eager-only correctness tests (test_forward/test_graph) can't catch
+The old eager-only correctness tests can't catch
 this, so this test drives a compiled model through >8 distinct greedy
 tokens. Slow (~1 min first compile on small GPUs): run with ``-m compile``.
 """

@@ -66,5 +66,5 @@ bf16 是 8 位指数 + 7 位尾数，fp16 是 5 位指数 + 10 位尾数。fp16 
 
 ```python
 rt = t.half().to(torch.bfloat16)
-lossy = (rt != t).sum().item()   # t 为 checkpoint 的 bf16 张量
+lossy = (rt != t).sum().item()  # t 为 checkpoint 的 bf16 张量
 ```
