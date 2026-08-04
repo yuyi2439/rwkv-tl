@@ -24,6 +24,7 @@ class State(tuple[list[dict[str, Tensor]], list[dict[str, Tensor]]]):
         head_dim: int,
         *,
         device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float16,
     ) -> Self:
         head_count = n_embd // head_dim
 
@@ -32,7 +33,7 @@ class State(tuple[list[dict[str, Tensor]], list[dict[str, Tensor]]]):
         for _ in range(n_layer):
             tmix_layers.append(
                 {
-                    "x": torch.zeros(n_embd, dtype=torch.float16, device=device),
+                    "x": torch.zeros(n_embd, dtype=dtype, device=device),
                     "rnn": torch.zeros(
                         (head_count, head_dim, head_dim),
                         dtype=torch.float32,
@@ -40,9 +41,7 @@ class State(tuple[list[dict[str, Tensor]], list[dict[str, Tensor]]]):
                     ),
                 }
             )
-            cmix_layers.append(
-                {"x": torch.zeros(n_embd, dtype=torch.float16, device=device)}
-            )
+            cmix_layers.append({"x": torch.zeros(n_embd, dtype=dtype, device=device)})
 
         obj = super().__new__(cls, (tmix_layers, cmix_layers))
         return obj

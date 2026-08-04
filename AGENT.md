@@ -10,6 +10,11 @@ This file is the operating guide for future agents. Follow these rules strictly:
 - Keep the content in English unless a specific repository report is intentionally written in Chinese.
 - Update it when a new constraint, bug, environment limitation, or workflow rule is discovered.
 - Do not leave important findings only in chat history; record them here when they affect future work.
+- **Documenting project standards is itself a project standard.** Whenever a
+  decision establishes a lasting constraint or convention (package layout,
+  interface contracts, device/dtype strategy, workflow rules), write it down
+  here in the same session, before moving on -- future agents follow this
+  file, not chat history. "I'll remember" is not an acceptable substitute.
 - Keep this file focused on actionable guidance. Avoid personal notes, speculation, or long retrospective writing.
 - When a new benchmark or experiment note is added, make sure the relevant link and summary are also reflected here.
 - Update this file when a new constraint, bug, or performance path is discovered. Keep it concise and actionable.
@@ -42,6 +47,42 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - If a script appears to hang with idle CPU/GPU, investigate before assuming it failed: torch.compile or first-call kernel compilation can idle the GPU for minutes.
 - When the user says "check it yourself" or "you can do more tests", investigate and run any additional worthwhile tests autonomously.
 - Permission to run git write operations (commit/push/amend) is ALWAYS temporary and scoped to that single action. Each commit/push needs its own explicit approval; do not treat one approval as a standing green light. When in doubt, ask.
+
+## Project structure and standards
+
+These are firm, user-approved conventions. Follow them when adding or moving code.
+
+- **`src/rwkv_tl/` is the published library; `demo/` is not part of it.**
+  The package must be self-contained: no docstring or comment inside
+  `src/rwkv_tl/` may reference `demo/`, `script/`, or `docs/` (files that do
+  not ship with the package). Model implementations are helper/example code
+  and live OUTSIDE the package in `demo/`; do not move them into `src/rwkv_tl/`.
+- **Model interface.** `demo/_rwkv7_abc.py` defines the `RWKV7Model` ABC
+  (`decode` / `prefill` / `forward` / `generate`). Every model implements it.
+  Application scripts (`script/rwkv_chat.py`, `script/profile_prefill.py`, ...)
+  build models via `demo.make_rwkv7(w, backend="auto")` and operate on the
+  ABC; do not hard-code a specific model class into an application script.
+- **Kernels are split by function AND bound by IO dtype.** The kernel
+  definitions live in `kernels/{gemm,lerp,gates,dplr}.py`, each exposing
+  `build(DTYPE)`; `kernels/_base.py` is just the assembler
+  (`build_kernels(DTYPE) -> Kernels`); `kernels/fp16.py` / `kernels/bf16.py`
+  bind the two dtypes with identical public interfaces; `kernels/__init__.py`
+  re-exports the fp16 bindings by default. Add a new kernel in its function
+  file and expose it through BOTH bindings, never one dtype file only.
+  Custom ops (`operators`) route by input tensor dtype via `_kernels_for`.
+- **Tilelang closure-dtype gotcha.** `kernels/{gemm,lerp,gates,dplr}.py`
+  deliberately have NO `from __future__ import annotations`: tilelang's eager
+  builder evaluates the annotation expressions, and a stringified annotation
+  only has module globals + direct nonlocals available, so a closure `DTYPE`
+  param fails with `NameError`. The pre-dtype-split files used literal
+  `"float16"`/`"bfloat16"` strings and could keep the import; the `build(DTYPE)`
+  files cannot.
+- **Dtype plumbing.** `RWKV7Weight(path, dtype=...)` controls weight precision
+  (default `torch.float16`, converts the bf16 checkpoint once at load; pass
+  `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
+  the model dtype. DPLR RNN state is always fp32 in both variants.
+- **`demo.make_rwkv7` backends**: `"auto"` (MX450 variant on CUDA sm_75,
+  fp16 elsewhere), `"fp16"`, `"bf16"`, `"mx450"`, `"torch"`.
 
 ## Goal
 
@@ -96,7 +137,12 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - AMD note: tilelang's `warp_reduce_sum` keeps 32-lane logical-warp semantics on HIP (CDNA wave64 and RDNA wave32) -- see `src/tl_templates/hip/reduce.h`. Do NOT set WARP to the AMD hardware wavefront (64): the reduce would then cover only lanes 0-31 and silently drop half the reduction. `SERIAL = HEAD_DIM // WARP` stays 2 on every backend.
 - `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmark_rwkv7_experiments.md for the RTX 3060 measurement that led to this decision).
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
-- Inference is **fp16 everywhere** (checkpoints are bf16, converted once at `RWKV7Weight` load), so there is no bf16-capability detection; the compile decision is purely `is_torch_compile`.
+- **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
+- Default inference is **fp16** (checkpoints are bf16, converted once at
+  `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path
+  (`RWKV7BF16` + `RWKV7Weight(..., dtype=torch.bfloat16)`) keeps the raw
+  checkpoint dtype and is a reference/experimental variant. The compile
+  decision is purely `is_torch_compile`.
 - `RWKV7Weight(model_path, device=None)` loads directly to the target device via `torch.load(..., map_location=device)` -- the repo checkpoints are saved on cuda, so without `device` the tensors land on cuda regardless of context. The benchmark shares ONE `RWKV7Weight` across rwkv_tl/pure_torch/graph_decoder instead of re-materializing a temp checkpoint per model (old `_build_materialized_checkpoint` is removed).
 - Kernels are compiled PER-MODEL with static H/C (model constants baked at compile time; only T_LEN stays dynamic): each kernel file exposes `@functools.cache` factories (`_dplr_kernel(H)`, `_lerp6_kernel(C)`, ...) and the wrappers dispatch by input shape. Only compile-time model constants go static; per-call sizes (token count) stay dynamic. Caveat: a factory param used ONLY in a type annotation (not the kernel body) is not captured by tilelang's `get_func_nonlocals` and causes `NameError` -- reference it in the body too (e.g. `H * N` in annotations is fine since H is used in the body).
 - Compute is **fp16 IO + fp32 accumulation**, DPLR state is **fp32** (matching Albatross): RNN state `[H,N,N]` is fp32 (not fp16-rounded each step), IO (r/w/k/v) stays fp16. Weights are converted bf16->fp16 once at `RWKV7Weight` load. `_dplr_kernel`/`_dplr_T_kernel` read/write fp32 S; pure_torch reference matches.
@@ -107,11 +153,13 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 These are user-approved future directions (inspired by FlashRWKV). They are NOT
 done yet. When working on the related area, remind the user whether to proceed.
 
-- **Move `src/rwkv_tl/__init__.py` model code out of the library.** The current
-  `RWKV7` class there is a temporary usage example, not the library core. It
-  should be relocated to a `demo/` (or similar) directory outside `src/rwkv_tl`,
-  so the library ships only kernels + operators. Do not keep growing model logic
-  in `__init__.py`; treat it as example code already slated for extraction.
+- **DONE — model code moved out of `src/rwkv_tl/`.** The library ships only
+  kernels + operators + state/sampling/weight/tokenizer; model implementations
+  live in `demo/` (one class per device/kernel strategy):
+  `demo.rwkv7_fp16.RWKV7FP16` (tilelang fp16, sm_80+), `demo.rwkv7_bf16.RWKV7BF16`
+  (tilelang bf16), `demo.rwkv7_mx450.RWKV7MX450`
+  (sm_75: batch GEMMs in fp32), `demo.rwkv7_torch.RWKV7Torch` (pure torch
+  reference). `demo.make_rwkv7(w, backend=...)` picks by CUDA arch.
 - **Adopt a stateless operator API.** Future kernel/operator APIs should take
   `initial_state` and return `final_state` explicitly instead of mutating an
   in-place `state` dict. This is clearer, autograd-friendly, and matches the

@@ -21,8 +21,9 @@ updates state in place, matching the old `custom_op` behavior.
 
 Differentiable ops can later get autograd support either by adding a
 `CompositeImplicitAutograd` impl (must be composed of plain torch ops) or by
-registering an explicit backward; see docs/benchmark_rwkv7_experiments.md for
-the training-direction notes.
+registering an explicit backward. Note that the serial DPLR recurrence needs
+an explicit time-reversed backward pass, so full training support is a
+per-op undertaking rather than a blanket autograd registration.
 """
 
 from __future__ import annotations
@@ -67,6 +68,13 @@ def _register(
         return meta(*args, **kwargs)
 
 
+def _kernels_for(x: Tensor):
+    """Pick the fp16/bf16 kernel namespace matching an input tensor's dtype."""
+    from ..kernels import bf16, fp16
+
+    return bf16 if x.dtype == torch.bfloat16 else fp16
+
+
 def _ensure_ops_registered() -> None:
     """Register all custom ops (idempotent via module-level flag)."""
     global _OPS_REGISTERED
@@ -79,9 +87,10 @@ def _ensure_ops_registered() -> None:
     def _lerp6_copy_cuda(
         x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
     ) -> tuple[Tensor, ...]:
-        from ..kernels.lerp import fused_lerp6_copy
+        from ..kernels import bf16, fp16
 
-        return fused_lerp6_copy(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
+        k = bf16 if x.dtype == torch.bfloat16 else fp16
+        return k.fused_lerp6_copy(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)
 
     def _lerp6_copy_cpu(
         x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
@@ -111,9 +120,7 @@ def _ensure_ops_registered() -> None:
     )
 
     def _lerp1_copy_cuda(x, prev, w, x_copy) -> Tensor:
-        from ..kernels.lerp import fused_lerp1_copy
-
-        return fused_lerp1_copy(x, prev, w, x_copy)
+        return _kernels_for(x).fused_lerp1_copy(x, prev, w, x_copy)
 
     def _lerp1_copy_cpu(x, prev, w, x_copy) -> Tensor:
         x_copy.copy_(x)
@@ -133,9 +140,7 @@ def _ensure_ops_registered() -> None:
     # ---- gates.py ----
 
     def _w_gate_cuda(x, w0) -> Tensor:
-        from ..kernels.gates import fused_w_gate
-
-        return fused_w_gate(x, w0)
+        return _kernels_for(x).fused_w_gate(x, w0)
 
     def _w_gate_cpu(x, w0) -> Tensor:
         import math
@@ -154,9 +159,7 @@ def _ensure_ops_registered() -> None:
     )
 
     def _v_gate_cuda(v, v_first, v0, v12) -> Tensor:
-        from ..kernels.gates import fused_v_gate
-
-        return fused_v_gate(v, v_first, v0, v12)
+        return _kernels_for(v).fused_v_gate(v, v_first, v0, v12)
 
     def _v_gate_cpu(v, v_first, v0, v12) -> Tensor:
         return v + torch.sigmoid(v0 + v12) * (v_first - v)
@@ -173,9 +176,7 @@ def _ensure_ops_registered() -> None:
     )
 
     def _a_kk_k_cuda(a0, a_x, k, k_k, k_a) -> tuple[Tensor, Tensor, Tensor]:
-        from ..kernels.gates import fused_a_kk_k
-
-        return fused_a_kk_k(a0, a_x, k, k_k, k_a)
+        return _kernels_for(k).fused_a_kk_k(a0, a_x, k, k_k, k_a)
 
     def _a_kk_k_cpu(a0, a_x, k, k_k, k_a) -> tuple[Tensor, Tensor, Tensor]:
         a = torch.sigmoid(a0 + a_x)
@@ -196,9 +197,7 @@ def _ensure_ops_registered() -> None:
     # ---- dplr.py ----
 
     def _l2norm_cuda(kk, a) -> tuple[Tensor, Tensor]:
-        from ..kernels.dplr import fused_l2norm_neg_kk_a
-
-        return fused_l2norm_neg_kk_a(kk, a)
+        return _kernels_for(kk).fused_l2norm_neg_kk_a(kk, a)
 
     def _l2norm_cpu(kk, a) -> tuple[Tensor, Tensor]:
         den = torch.sqrt(torch.sum(kk * kk, dim=1, keepdim=True))
@@ -217,9 +216,7 @@ def _ensure_ops_registered() -> None:
     )
 
     def _gn_cuda(y, r, k, v, r_k, ln_xW, ln_xB) -> Tensor:
-        from ..kernels.dplr import fused_gn_rkrk
-
-        return fused_gn_rkrk(y, r, k, v, r_k, ln_xW, ln_xB)
+        return _kernels_for(y).fused_gn_rkrk(y, r, k, v, r_k, ln_xW, ln_xB)
 
     def _gn_cpu(y, r, k, v, r_k, ln_xW, ln_xB) -> Tensor:
         import torch.nn.functional as F
@@ -245,15 +242,11 @@ def _ensure_ops_registered() -> None:
     )
 
     def _dplr_cuda(S, R, W, K, V, A, B) -> Tensor:
-        from ..kernels.dplr import fused_dplr
-
-        y, _ = fused_dplr(S, R, W, K, V, A, B)
+        y, _ = _kernels_for(R).fused_dplr(S, R, W, K, V, A, B)
         return y
 
     def _dplr_cpu(S, R, W, K, V, A, B) -> Tensor:
-        from ..kernels.dplr import fused_dplr
-
-        y, _ = fused_dplr(S, R, W, K, V, A, B)
+        y, _ = _kernels_for(R).fused_dplr(S, R, W, K, V, A, B)
         return y
 
     def _dplr_meta(S, R, *_args) -> Tensor:
@@ -271,9 +264,7 @@ def _ensure_ops_registered() -> None:
     def _lerp6_rkv_cuda(
         x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy, rWt_stack
     ) -> tuple[Tensor, ...]:
-        from ..kernels.lerp import fused_lerp6_rkv_copy
-
-        r, k, v, xv, xw, xa, xg = fused_lerp6_rkv_copy(
+        r, k, v, xv, xw, xa, xg = _kernels_for(x).fused_lerp6_rkv_copy(
             x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy, rWt_stack
         )
         # r/k/v are views of the same stacked tensor; clone to avoid aliasing.
@@ -304,9 +295,7 @@ def _ensure_ops_registered() -> None:
     # ---- gemm.py ----
 
     def _rkv_gemm_cuda(xr, xk, xv, Wb) -> Tensor:
-        from ..kernels.gemm import fused_rkv_gemm
-
-        return fused_rkv_gemm(xr, xk, xv, Wb)
+        return _kernels_for(xr).fused_rkv_gemm(xr, xk, xv, Wb)
 
     def _rkv_gemm_cpu(xr, xk, xv, Wb) -> Tensor:
         return torch.stack([xr, xk, xv], dim=0) @ Wb

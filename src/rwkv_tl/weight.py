@@ -108,15 +108,21 @@ class RWKV7Weight(nn.Module):
     ln_out: LNWeight
     blocks: list[RWKV7Block]
 
-    def __init__(self, model_path: str, device: str | torch.device | None = None):
+    def __init__(
+        self,
+        model_path: str,
+        device: str | torch.device | None = None,
+        dtype: torch.dtype = torch.float16,
+    ):
         super().__init__()
-        # Checkpoints are bf16; convert to fp16 once at load (Albatross
-        # approach): fp16 tensor cores work on sm_75+, and fp16's 10-bit mantissa
-        # beats bf16's 7-bit. Accumulation stays fp32 inside every kernel.
+        # Checkpoints are bf16. Default converts to fp16 once at load
+        # (Albatross approach): fp16 tensor cores work on sm_75+, and fp16's
+        # 10-bit mantissa beats bf16's 7-bit. Pass dtype=torch.bfloat16 to
+        # keep the raw checkpoint dtype (no conversion) for the bf16 model.
+        # Accumulation stays fp32 inside every kernel.
         W = torch.load(model_path, map_location=device)
         W = {
-            k: v.to(torch.float16) if isinstance(v, torch.Tensor) else v
-            for k, v in W.items()
+            k: (v.to(dtype) if isinstance(v, torch.Tensor) else v) for k, v in W.items()
         }
 
         self.emb = W["emb.weight"]

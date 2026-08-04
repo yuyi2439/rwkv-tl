@@ -9,9 +9,12 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure src/ is importable when running `pytest` from repo root without install.
+# Ensure src/ and demo/ are importable when running `pytest` from repo root
+# without install.
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
+for _path in (REPO / "src", REPO):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 import pytest
 import torch

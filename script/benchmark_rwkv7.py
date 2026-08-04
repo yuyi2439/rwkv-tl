@@ -39,14 +39,12 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_ROOT = REPO_ROOT / "script"
-SRC_ROOT = REPO_ROOT / "src"
-for path in (SCRIPT_ROOT, SRC_ROOT):
+for path in (SCRIPT_ROOT, SRC_ROOT := REPO_ROOT / "src", REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from pure_torch_rwkv7 import RWKV7Torch
-
-from rwkv_tl import RWKV7 as ProjectRWKV7
+from demo.rwkv7_fp16 import RWKV7FP16 as ProjectRWKV7
+from demo.rwkv7_torch import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -195,7 +193,12 @@ def _prepare_tokens(model, tokens: torch.Tensor):
     Callers:
         - `benchmark_rwkv7.py:bench_case`: 生成输入 token 时调用。
     """
-    if model.__class__.__module__ in {"rwkv_tl", "pure_torch_rwkv7"}:
+    if model.__class__.__module__ in {
+        "demo.rwkv7_fp16",
+        "demo.rwkv7_bf16",
+        "demo.rwkv7_mx450",
+        "demo.rwkv7_torch",
+    }:
         return tokens.reshape(-1)
     return tokens
 
@@ -208,6 +211,7 @@ def parse_targets(text: str) -> list[str]:
     allowed = {
         "faster3a_2607",
         "rwkv_tl",
+        "mx450",
         "pure_torch",
         "graph_decoder",
         "fla",
@@ -417,6 +421,20 @@ def build_pure_torch_model(
     return RWKV7Torch(w, is_torch_compile=is_torch_compile)
 
 
+def build_mx450_model(
+    checkpoint_path: Path,
+    device: torch.device,
+    is_torch_compile: bool = False,
+    w: RWKV7Weight | None = None,
+):
+    """Build the sm_75 variant (RWKV7MX450) on the requested device."""
+    from demo.rwkv7_mx450 import RWKV7MX450
+
+    if w is None:
+        w = RWKV7Weight(str(checkpoint_path), device=device)
+    return RWKV7MX450(w, is_torch_compile=is_torch_compile)
+
+
 def build_graph_decoder(
     checkpoint_path: Path,
     vocab_path: Path,
@@ -540,6 +558,15 @@ def run_benchmark(args):
             )
             device = rwkv_device
             mode = "forward"
+        elif target == "mx450":
+            model = build_mx450_model(
+                Path(args.project_checkpoint),
+                rwkv_device,
+                args.compile,
+                _get_shared_w(),
+            )
+            device = rwkv_device
+            mode = "forward"
         elif target == "pure_torch":
             model = build_pure_torch_model(
                 Path(args.project_checkpoint),
@@ -574,7 +601,11 @@ def run_benchmark(args):
         # implementations (rwkv_tl, graph_decoder); pure_torch is
         # self-consistent. Third-party faster3a_2607 is not gated.
         reference = None
-        if not args.no_correctness_check and target in ("rwkv_tl", "graph_decoder"):
+        if not args.no_correctness_check and target in (
+            "rwkv_tl",
+            "mx450",
+            "graph_decoder",
+        ):
             if reference_model is None:
                 reference_model = build_pure_torch_model(
                     Path(args.project_checkpoint), rwkv_device, False, _get_shared_w()

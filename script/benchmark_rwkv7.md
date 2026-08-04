@@ -81,9 +81,11 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 > **fp16 迁移对 sm_75 的影响**：c2c4283 起 prefill 的批量 GEMM 从 bf16（cuBLAS magma
 > fp32 模拟）改为 fp16。Turing 的 cuBLAS fp16 tensor-core 内核对 `[T,C]@[C,C]`（T=32..128）
 > 病态慢（fp16 bmm ~1.3ms vs fp32 ~0.16ms，4-8x），导致 MX450 prefill 较旧记录 ~1.9x 变慢
-> （46.4 vs 24.7ms @ T=32）。已实测 batch GEMM 转 fp32 与 fp16 墙钟持平（CPU 启动开销抵消
-> 了 GEMM 收益，A/B: 38/41 vs 35/38ms），故保持全 fp16；RTX 3060（sm_86）无此问题，目标卡
-> 数据不受影响。MX450 上更彻底的解法是写 sm_75 可用的 tilelang fp16 GEMM（m16n8k8），未做。
+> （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`demo.rwkv7_fp16.RWKV7FP16`（全 fp16，sm_80+）
+> 与 `demo.rwkv7_bf16.RWKV7BF16`、`demo.rwkv7_mx450.RWKV7MX450`（sm_75：decode 同 fp16，batch GEMM 走 fp32 快路径），
+> `demo.make_rwkv7` 按 arch 自动选择。MX450 上 MX450 类 prefill 约快 15-20%
+> （T=32 42 vs 51ms，T=128 76 vs 93ms，受热降频影响有波动）。彻底解法是写 sm_75 可用的
+> tilelang fp16 GEMM（m16n8k8），未做。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|

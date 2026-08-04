@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 
-from rwkv_tl import RWKV7
+# Make the repo-root packages importable when run as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from demo import make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.tokenizer import Tokenizer
 from rwkv_tl.weight import RWKV7Weight
@@ -55,7 +60,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model = RWKV7(RWKV7Weight(args.checkpoint))
+    # auto: pick the implementation matching the current GPU (MX450 variant on
+    # sm_75, tilelang fp16 elsewhere), so the same chat works on any device.
+    model = make_rwkv7(RWKV7Weight(args.checkpoint))
     tokenizer = Tokenizer(args.vocab)
     S = State(
         model.w.N_LAYER,

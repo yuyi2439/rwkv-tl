@@ -1,3 +1,11 @@
+"""Pure PyTorch RWKV7 reference implementation (no fused custom kernels).
+
+A readable, kernel-free baseline that mirrors the ``decode``/``prefill``/
+``forward``/``generate`` API of ``demo.rwkv7_fp16.RWKV7FP16``. Slower than the
+tilelang path but serves as the numerical reference for correctness tests
+and benchmarking.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -8,6 +16,8 @@ from rwkv_tl._compat import maybe_torch_compile
 from rwkv_tl.sampling import apply_stop, sample_logits
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
+
+from ._rwkv7_abc import RWKV7Model
 
 
 def _sigmoid(x: Tensor) -> Tensor:
@@ -52,13 +62,13 @@ def _dplr_rwkv(
         + torch.einsum("hv,hk->hvk", V.float(), K.float())
     )
     y = torch.einsum("hvk,hk->hv", S_new, R.float())
-    return y.half(), S_new
+    return y.to(V.dtype), S_new
 
 
-class RWKV7Torch:
+class RWKV7Torch(RWKV7Model):
     """Pure PyTorch RWKV7 baseline without fused custom kernels.
 
-    Shares the same ``RWKV7Weight`` as ``rwkv_tl.RWKV7``; state is passed in
+    Shares the same ``RWKV7Weight`` as the tilelang models; state is passed in
     and out explicitly (``State``), so the instance itself is stateless.
     """
 
@@ -69,6 +79,7 @@ class RWKV7Torch:
         is_torch_compile: bool = True,
     ) -> None:
         self.w = w
+        self.dtype = w.emb.dtype
         self._is_torch_compile = is_torch_compile
         self.n_layer = w.N_LAYER
         self.C, self.N = w.N_EMBD, 64

@@ -12,11 +12,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO))
 
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from rwkv_tl import RWKV7
+from demo import make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -28,14 +29,14 @@ if not CKPT:
     raise RuntimeError("RWKV_CHECKPOINT_PATH must be set")
 
 with torch.device("cuda"):
-    model = RWKV7(RWKV7Weight(CKPT))
+    model = make_rwkv7(RWKV7Weight(CKPT))
 
 # warmup
 with torch.device("cuda"):
     S = State(model.w.N_LAYER, model.w.N_EMBD, 64, device="cuda")
     for _ in range(3):
         S.reset()
-        model.prefill(TOKENS, S)
+        model.prefill(torch.as_tensor(TOKENS, device=model.emb.device), S)
 torch.cuda.synchronize()
 
 # profile
@@ -49,7 +50,7 @@ with (
     record_function("prefill_T32"),
     torch.device("cuda"),
 ):
-    model.prefill(TOKENS, S)
+    model.prefill(torch.as_tensor(TOKENS, device=model.emb.device), S)
 
 # Group kernels by name keyword
 from collections import defaultdict

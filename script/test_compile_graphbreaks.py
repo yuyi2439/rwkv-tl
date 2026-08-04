@@ -20,11 +20,10 @@ import torch._dynamo
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "script"))
+sys.path.insert(0, str(REPO))
 
-from pure_torch_rwkv7 import RWKV7Torch
-
-from rwkv_tl import RWKV7
+from demo.rwkv7_fp16 import RWKV7FP16 as RWKV7
+from demo.rwkv7_torch import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 

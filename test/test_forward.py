@@ -2,7 +2,7 @@
 
 Runs the full RWKV7 forward over a fixed 32-token sequence through both the
 rwkv_tl implementation (tilelang fused kernels) and the pure-PyTorch reference
-(``script/pure_torch_rwkv7.py``), on both the batched-prefill path and the
+(``demo/rwkv7_torch.py``), on both the batched-prefill path and the
 per-token decode path.
 
 The fused kernels accumulate in fp32 but cast to bf16 at the store and evaluate
@@ -13,46 +13,42 @@ difference bounded by a loose tolerance (observed ~0.2 on 0.1B).
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-from rwkv_tl import RWKV7
+from demo.rwkv7_bf16 import RWKV7BF16
+from demo.rwkv7_fp16 import RWKV7FP16 as RWKV7
+from demo.rwkv7_torch import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
-
-# The pure-torch reference lives under script/.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "script"))
-from pure_torch_rwkv7 import RWKV7Torch
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
 MAX_ABS_TOL = 4.0  # bf16 rounding across 12 recurrent layers stays << this
 
 
-def _fresh_state(model) -> State:
+def _fresh_state(model, dtype: torch.dtype = torch.float16) -> State:
     return State(
         model.w.N_LAYER,
         model.w.N_EMBD,
         64,
         device=model.emb.device,
+        dtype=dtype,
     )
 
 
-def _run_decode(model, tokens) -> torch.Tensor:
+def _run_decode(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     with torch.device("cuda"):
-        S = _fresh_state(model)
+        S = _fresh_state(model, dtype)
         logits = None
         for t in tokens:
             logits, S = model.decode(t, S)
     return logits.float().cpu()
 
 
-def _run_prefill(model, tokens) -> torch.Tensor:
+def _run_prefill(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     with torch.device("cuda"):
-        S = _fresh_state(model)
+        S = _fresh_state(model, dtype)
         # prefill updates S in place (no logits); single-step the last token
         # to obtain the final logits.
         if len(tokens) > 1:
@@ -100,4 +96,22 @@ def test_decode_matches_prefill(models) -> None:
     tl, _ = models
     _assert_consistent(
         _run_decode(tl, TOKENS), _run_prefill(tl, TOKENS), "decode-vs-prefill"
+    )
+
+
+def test_bf16_consistent(ckpt_path: str) -> None:
+    """The bf16 model must match the pure-torch reference on bf16 weights."""
+    with torch.device("cuda"):
+        w = RWKV7Weight(ckpt_path, dtype=torch.bfloat16)
+        tl = RWKV7BF16(w, is_torch_compile=False)
+        ref = RWKV7Torch(w, is_torch_compile=False)
+    _assert_consistent(
+        _run_decode(tl, TOKENS, torch.bfloat16),
+        _run_decode(ref, TOKENS, torch.bfloat16),
+        "bf16-decode",
+    )
+    _assert_consistent(
+        _run_prefill(tl, TOKENS, torch.bfloat16),
+        _run_prefill(ref, TOKENS, torch.bfloat16),
+        "bf16-prefill",
     )

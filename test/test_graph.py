@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from rwkv_tl import RWKV7
+from demo.rwkv7_fp16 import RWKV7FP16 as RWKV7
 from rwkv_tl.graph_decode import GraphDecoder
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
