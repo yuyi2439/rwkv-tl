@@ -37,8 +37,10 @@ uv run python script/benchmark_rwkv7.py \
 注：
 - `--device cpu` 时，faster3a_2607 和 graph_decoder 自动跳过（CUDA-only）。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
-- 正确性门控默认开启：每个 case 计时前先把输出与 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。用 `--no-correctness-check` 关闭。
-- **MX450 2GB 显存注意**：0.4B 模型 + pure_torch 参考模型合计 ~2.4GB 超出显存，正确性门控会触发内存压力导致 0.4B rwkv_tl 延迟虚高 10x。0.4B MX450 数据使用 `--no-correctness-check` 采集。
+- 正确性门控**默认关闭**（`--correctness-check` 开启）：每个 case 计时前先把输出与同 dtype 的 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。默认关是为了省显存（参考模型共享 target 权重对象，但多 target 混跑仍可能压 2GB 卡）。
+- **权重按 target 加载/释放**：每个 target 独立 `RWKV7Weight`，跑完即删（`del` + `gc.collect()` + `empty_cache()`），同进程同时只有一份权重在显存。
+- **MX450 2GB 显存注意**：0.4B 模型 + pure_torch 参考模型合计 ~2.4GB 超出显存，正确性门控会触发内存压力导致 0.4B rwkv_tl 延迟虚高 10x。0.4B MX450 数据不要开 `--correctness-check` 采集。
+- **同一进程跑多个 target 也会压显存**：fp16 + bf16 权重与参考模型同驻（0.1B 也会 ~1.6GB+），MX450 的 fp32 权重副本叠加后接近 2GB，延迟虚高数倍。MX450 数据建议单独跑该 target（实测 T=128 73ms，混跑 1029ms）。
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 
@@ -87,8 +89,14 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 > 与 `demo.rwkv7_bf16.RWKV7BF16`、`demo.rwkv7_mx450.RWKV7MX450`（sm_75：decode 同 fp16，batch GEMM 走 fp32 快路径），
 > `demo.make_rwkv7` 按 arch 自动选择。**2026-08-04 实测 tl-bf16 是 MX450 prefill 最快的变体**：
 > T=8 20.5 vs tl-fp16 45.1ms，T=128 39.8 vs tl-fp16 92.2ms——bf16 的 tilelang kernel 在 Turing 走
-> fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。彻底解法是写 sm_75 可用的 tilelang fp16
-> GEMM（m16n8k8），未做。
+> fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。
+>
+> **sm_75 fp16 GEMM（m16n8k8）已实现**：`rwkv_tl.kernels.gemm` 为 sm_75 的 fp16 加了
+> T 特化 tilelang kernel（16×32×32/3 级流水，MX450 autotune），按允许长度集
+> （1..16 精确 + 32..16384 幂）二分选择最小覆盖长度、pad 输入后切回。实测比病态
+> cuBLAS fp16 bmm 快 4-6x（T=32 0.24 vs 0.79ms，T=128 0.83 vs 1.58ms），但**每个
+> 不同长度首次调用编译一次**（~8s on MX450）。bf16 无 sm_75 MMA，保持 bmm；sm_80+
+> 保持动态 kernel 不变。MX450 的 fp32 路径不受影响（dtype 检查兜底）。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
@@ -213,7 +221,7 @@ warmup=10, iters=20。
 - 对比 pure_torch：0.1B 1×128 tl-fp16 快 14x（92.2 vs 1332.2ms），tl-bf16 快 33x（39.8 vs 1332.2ms）。
 - T=1 decode 仍慢于 faster3a_2607（0.1B tl-fp16 15.4 vs 9.9ms，tl-bf16 18.3ms），因 fused kernel 逐 token dispatch 开销；graph_decoder（CUDA Graph）可弥补此差距。
 - faster3a_2607 在 0.4B 上 T=64（150ms）反比 T=32（166ms）快，因其 chunk kernel 对不同序列长度有不同性能特征。
-- **MX450 2GB 显存限制**：0.4B 正确性门控会同时加载 pure_torch 参考模型（合计 ~2.4GB > 2GB），导致 rwkv_tl 延迟虚高 10x（540ms vs 实际 56ms）。0.4B 数据用 `--no-correctness-check` 采集。
+- **MX450 2GB 显存限制**：0.4B 正确性门控会同时加载 pure_torch 参考模型（合计 ~2.4GB > 2GB），导致 rwkv_tl 延迟虚高 10x（540ms vs 实际 56ms）。0.4B 数据不开 `--correctness-check` 采集。
 
 ### CPU
 

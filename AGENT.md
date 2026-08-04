@@ -137,6 +137,18 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - AMD note: tilelang's `warp_reduce_sum` keeps 32-lane logical-warp semantics on HIP (CDNA wave64 and RDNA wave32) -- see `src/tl_templates/hip/reduce.h`. Do NOT set WARP to the AMD hardware wavefront (64): the reduce would then cover only lanes 0-31 and silently drop half the reduction. `SERIAL = HEAD_DIM // WARP` stays 2 on every backend.
 - `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmark_rwkv7_experiments.md for the RTX 3060 measurement that led to this decision).
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
+- **Turing sm_75 fp16 GEMM is T-specialized.** `kernels/gemm.py` compiles a
+  per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
+  MX450) for fp16 on sm_75, because a dynamic-T version cannot reach that
+  config's speed there (~12x slower). Lengths are restricted to `1..16` exact
+  plus powers of two `32..16384`; `fused_rkv_gemm` binary-searches the smallest
+  covering length, pads the input, runs, and slices back (measured fastest on
+  MX450 -- kernel time scales ~linearly, larger kernels only add pad waste).
+  Each distinct (C, length) compiles once lazily (~8 s on MX450) and is cached
+  by tilelang, so arbitrary prompt lengths pay a one-time compile. bf16 has no
+  sm_75 MMA atom -> stays on cuBLAS bmm (fast fp32 emulation there); sm_80+
+  keeps the dynamic-T kernel. The dtype check in `fused_rkv_gemm` protects
+  RWKV7MX450's fp32-input bmm path.
 - **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
 - Default inference is **fp16** (checkpoints are bf16, converted once at
   `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path

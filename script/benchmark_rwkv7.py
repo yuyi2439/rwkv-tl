@@ -28,6 +28,7 @@ Args via argparse:
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import os
 import sys
@@ -432,137 +433,141 @@ def run_benchmark(args):
         parsed_cases.append((int(batch_size_str), int(seq_len_str)))
 
     correctness_tol = args.correctness_tol
-    # Lazy per-dtype weight cache (bf16 loads the raw checkpoint dtype; the
-    # rest load as fp16) and per-dtype pure-torch reference for the gate.
-    shared_w: dict[torch.dtype, RWKV7Weight] = {}
-    references: dict[torch.dtype, RWKV7Model] = {}
-
-    def _get_shared_w(dtype: torch.dtype) -> RWKV7Weight:
-        w = shared_w.get(dtype)
-        if w is None:
-            w = RWKV7Weight(
-                str(args.project_checkpoint), device=rwkv_device, dtype=dtype
-            )
-            shared_w[dtype] = w
-        return w
 
     for target in targets:
-        if target == "faster3a_2607":
-            # Albatross is CUDA-only: skip (not error) when unavailable or when
-            # the user explicitly requested --device cpu for the project targets.
-            if rwkv_device.type != "cuda" or not torch.cuda.is_available():
-                print(
-                    f"SKIP label=faster3a_2607 reason=cuda_only_device={rwkv_device.type}",
-                    flush=True,
-                )
-                continue
-            model = build_fast_model(
-                Path(args.fast_script) / "rwkv7_fast_v3a.py", args.project_checkpoint
-            )
-            device = torch.device("cuda")
-            mode = "forward"
-            gate_dtype = torch.float16
-        elif target in BACKEND_FOR_TARGET:
-            dtype = DTYPE_FOR_TARGET[target]
-            model = make_rwkv7(
-                _get_shared_w(dtype),
-                backend=BACKEND_FOR_TARGET[target],
-                is_torch_compile=args.compile,
-            )
-            device = rwkv_device
-            mode = "forward"
-            gate_dtype = dtype
-        elif target == "graph_decoder":
-            # GraphDecoder is CUDA-only: skip when unavailable or --device cpu.
-            if rwkv_device.type != "cuda" or not torch.cuda.is_available():
-                print(
-                    f"SKIP label=graph_decoder reason=cuda_only_device={rwkv_device.type}",
-                    flush=True,
-                )
-                continue
-            from rwkv_tl.graph_decode import GraphDecoder
-
-            model = GraphDecoder(
-                make_rwkv7(
-                    _get_shared_w(torch.float16),
-                    backend="fp16",
-                    is_torch_compile=False,
-                )
-            )
-            device = torch.device("cuda")
-            mode = "decode"
-            gate_dtype = torch.float16
-        elif target in {"fla", "FlashRWKV"}:
-            raise NotImplementedError(
-                f"target '{target}' is reserved but not implemented yet"
-            )
-        else:
-            raise ValueError(f"unknown target: {target}")
-
-        # Correctness gate: compare each target's output against a pure-torch
-        # reference of the same dtype (built lazily, cached per dtype). pure-torch
-        # is self-consistent; third-party faster3a_2607 is not gated.
-        reference = None
-        if not args.no_correctness_check and target in GATED_TARGETS:
-            reference = references.get(gate_dtype)
-            if reference is None:
-                reference = make_rwkv7(
-                    _get_shared_w(gate_dtype), backend="torch", is_torch_compile=False
-                )
-                references[gate_dtype] = reference
-
-        for B, T in parsed_cases:
-            if mode == "decode" and B != 1:
-                print(
-                    f"SKIP label={target}({device.type}) B={B} T={T} reason=graph_decoder_requires_B1",
-                    flush=True,
-                )
-                continue
-            try:
-                if mode == "decode":
-                    p10, p50, p90, tok_s = bench_case_graph_decoder(
-                        model,
-                        T,
-                        args.warmup,
-                        args.iters,
-                        reference,
-                        correctness_tol,
+        model = None
+        w: RWKV7Weight | None = None
+        reference: RWKV7Model | None = None
+        try:
+            if target == "faster3a_2607":
+                # Albatross is CUDA-only: skip (not error) when unavailable or when
+                # the user explicitly requested --device cpu for the project targets.
+                if rwkv_device.type != "cuda" or not torch.cuda.is_available():
+                    print(
+                        f"SKIP label=faster3a_2607 reason=cuda_only_device={rwkv_device.type}",
+                        flush=True,
                     )
-                else:
-                    p10, p50, p90, tok_s = bench_case(
-                        model,
-                        B,
-                        T,
-                        args.warmup,
-                        args.iters,
-                        device,
-                        reference,
-                        correctness_tol,
+                    continue
+                model = build_fast_model(
+                    Path(args.fast_script) / "rwkv7_fast_v3a.py",
+                    args.project_checkpoint,
+                )
+                device = torch.device("cuda")
+                mode = "forward"
+                gate_dtype: torch.dtype | None = None
+            elif target in BACKEND_FOR_TARGET:
+                # One fresh weight per target, freed after the target's cases:
+                # only ONE weight copy is resident in VRAM at any time (MX450
+                # has 2GB and the correctness reference shares this same object).
+                dtype = DTYPE_FOR_TARGET[target]
+                w = RWKV7Weight(
+                    str(args.project_checkpoint), device=rwkv_device, dtype=dtype
+                )
+                model = make_rwkv7(
+                    w,
+                    backend=BACKEND_FOR_TARGET[target],
+                    is_torch_compile=args.compile,
+                )
+                device = rwkv_device
+                mode = "forward"
+                gate_dtype = dtype
+            elif target == "graph_decoder":
+                # GraphDecoder is CUDA-only: skip when unavailable or --device cpu.
+                if rwkv_device.type != "cuda" or not torch.cuda.is_available():
+                    print(
+                        f"SKIP label=graph_decoder reason=cuda_only_device={rwkv_device.type}",
+                        flush=True,
                     )
-            except CorrectnessError as exc:
-                print(
-                    f"SKIP label={target}({device.type}) B={B} T={T} "
-                    f"reason=incorrect ({exc})",
-                    flush=True,
+                    continue
+                from rwkv_tl.graph_decode import GraphDecoder
+
+                w = RWKV7Weight(
+                    str(args.project_checkpoint),
+                    device=rwkv_device,
+                    dtype=torch.float16,
                 )
-                continue
-            except RuntimeError as exc:
-                # A single case OOM-ing must not abort the whole benchmark
-                # run; skip it and keep going so later (smaller) cases and
-                # other targets still get measured.
-                if "out of memory" not in str(exc).lower():
-                    raise
-                print(
-                    f"SKIP label={target}({device.type}) B={B} T={T} reason=oom",
-                    flush=True,
+                model = GraphDecoder(
+                    make_rwkv7(w, backend="fp16", is_torch_compile=False)
                 )
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device=device)
-                    torch.cuda.empty_cache()
-                continue
-            _print_row(
-                f"{target}({device.type})", B, T, args.iters, p10, p50, p90, tok_s
-            )
+                device = torch.device("cuda")
+                mode = "decode"
+                gate_dtype = torch.float16
+            elif target in {"fla", "FlashRWKV"}:
+                raise NotImplementedError(
+                    f"target '{target}' is reserved but not implemented yet"
+                )
+            else:
+                raise ValueError(f"unknown target: {target}")
+
+            # Correctness gate (off by default): compare each target's output
+            # against a pure-torch reference that SHARES the target's weight
+            # object (no extra VRAM). pure-torch is self-consistent; third-party
+            # faster3a_2607 is not gated.
+            if args.correctness_check and target in GATED_TARGETS:
+                assert w is not None and gate_dtype is not None
+                reference = make_rwkv7(w, backend="torch", is_torch_compile=False)
+
+            for B, T in parsed_cases:
+                if mode == "decode" and B != 1:
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} reason=graph_decoder_requires_B1",
+                        flush=True,
+                    )
+                    continue
+                try:
+                    if mode == "decode":
+                        p10, p50, p90, tok_s = bench_case_graph_decoder(
+                            model,
+                            T,
+                            args.warmup,
+                            args.iters,
+                            reference,
+                            correctness_tol,
+                        )
+                    else:
+                        p10, p50, p90, tok_s = bench_case(
+                            model,
+                            B,
+                            T,
+                            args.warmup,
+                            args.iters,
+                            device,
+                            reference,
+                            correctness_tol,
+                        )
+                except CorrectnessError as exc:
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} "
+                        f"reason=incorrect ({exc})",
+                        flush=True,
+                    )
+                    continue
+                except RuntimeError as exc:
+                    # A single case OOM-ing must not abort the whole benchmark
+                    # run; skip it and keep going so later (smaller) cases and
+                    # other targets still get measured.
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    print(
+                        f"SKIP label={target}({device.type}) B={B} T={T} reason=oom",
+                        flush=True,
+                    )
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device=device)
+                        torch.cuda.empty_cache()
+                    continue
+                _print_row(
+                    f"{target}({device.type})", B, T, args.iters, p10, p50, p90, tok_s
+                )
+        finally:
+            del model
+            del reference
+            if w is not None:
+                del w
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
 
 def main():
@@ -611,10 +616,11 @@ def main():
         default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16",
     )
     parser.add_argument(
-        "--no-correctness-check",
+        "--correctness-check",
         action="store_true",
-        help="Disable the pure-torch correctness gate (SKIPs cases whose output "
-        "does not match the reference).",
+        help="Enable the pure-torch correctness gate (default off: keeps VRAM "
+        "low, important on 2GB GPUs like MX450). SKIPs cases whose output does "
+        "not match the same-dtype pure-torch reference.",
     )
     parser.add_argument(
         "--correctness-tol",

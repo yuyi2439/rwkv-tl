@@ -6,6 +6,11 @@ pathological fp16 tensor-core kernels for the small prefill shapes
 ([T, C] @ [C, C] with T=32..128), making fp16 matmul/bmm ~4-8x SLOWER than
 fp32 (measured on MX450: fp16 bmm ~1.3ms vs fp32 ~0.16ms). Ampere+ is
 unaffected, so the base RWKV7 keeps fp16 there.
+
+Small-T exception: for T<=16 the fused r/k/v projection goes through the
+T-specialized tilelang fp16 m16n8k8 kernel instead (it beats the fp32 cuBLAS
+bmm there -- measured 0.12 vs 0.21ms @ T=8); fp32 cuBLAS stays faster at
+T>=32 (0.42 vs 0.83ms @ T=128).
 """
 
 from __future__ import annotations
@@ -33,6 +38,10 @@ class RWKV7MX450(RWKV7FP16):
         ln_pre = b.ln_pret
 
         rWt_stack = torch.stack([rWt, kWt, vWt], dim=0).contiguous().float()
+        # Small-T prefill uses the tilelang fp16 m16n8k8 rkv kernel: on Turing it
+        # beats the fp32 cuBLAS bmm for T<=16 (measured 0.12 vs 0.21ms @ T=8);
+        # fp32 cuBLAS stays faster at T>=32 (0.42 vs 0.83ms @ T=128).
+        rWt_stack16 = rWt_stack.half()
         oWt = att.output_weight.T.float()
         w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
         a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
@@ -70,8 +79,12 @@ class RWKV7MX450(RWKV7FP16):
             # state["x"] stays fp16 (decode's fused_lerp6_rkv_copy requires it).
             state["x"] = x[-1].half()
 
-            rkv = fused_rkv_gemm(xr, xk, xv, rWt_stack)
-            r, k, v = rkv[0], rkv[1], rkv[2]
+            if T_len <= 16:
+                rkv = fused_rkv_gemm(xr.half(), xk.half(), xv.half(), rWt_stack16)
+                r, k, v = rkv[0].float(), rkv[1].float(), rkv[2].float()
+            else:
+                rkv = fused_rkv_gemm(xr, xk, xv, rWt_stack)
+                r, k, v = rkv[0], rkv[1], rkv[2]
 
             if v_first is None:
                 v_first = v
