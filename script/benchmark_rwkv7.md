@@ -1,6 +1,6 @@
 # RWKV7 Benchmark
 
-> 这个文件只记录可复现的测试入口、执行环境、主要结果和简要解释。更细的实验发现请见 [docs/benchmark_rwkv7_experiments.md](../docs/benchmark_rwkv7_experiments.md)，运行与维护注意事项请见 [AGENT.md](../AGENT.md)。
+> 这个文件只记录可复现的测试入口、执行环境、主要结果和简要解释。更细的实验发现请见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)，运行与维护注意事项请见 [AGENT.md](../AGENT.md)。
 
 ## 运行命令
 
@@ -62,6 +62,8 @@ uv run python script/benchmark_rwkv7.py \
   稳定 8.2ms（p10/p90 几乎重合），而 faster3a 受热降频影响波动到 8.3~23.2ms。
 - T=2/4/8 小 prefill：faster3a 仍占优（chunk kernel 对极小 T 高效）。
 - T≥16 prefill：mx450 反超。
+
+原因分析（kernel 级剖析）见 [docs/benchmarks/mx450_sm75.md](../docs/benchmarks/mx450_sm75.md)。
 
 ## 结果：0.1B (rwkv7-g1d-0.1b-20260129-ctx8192)
 
@@ -233,7 +235,7 @@ warmup=10, iters=20。
   - 0.4B：1×32 33.9ms（943 tok/s）vs faster3a 14.9ms（2148 tok/s）；1×128 33.7ms（3802 tok/s）vs faster3a 14.1ms（9109 tok/s）。仍落后 faster3a ~2.4x。
 - 对比 pure_torch：0.1B 1×128 快 28x（15.8 vs 447ms），0.4B 1×128 快 30x（33.7 vs 1001ms）。
 - eager rwkv_tl 的 T=1 已快于 pure_torch（0.1B 9.6 vs 14.5ms；0.4B 20.4 vs 32.6ms），得益于重构后更紧凑的 decode 路径。
-- 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `prefill` 保持 eager。详见 docs/benchmark_rwkv7_experiments.md。
+- 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `prefill` 保持 eager。详见 docs/benchmarks/rtx3060.md。
 
 ### CUDA (MX450, sm_75)
 
@@ -262,4 +264,4 @@ RWKV_CHECKPOINT_PATH=...0.1b.pth .venv/bin/python script/benchmark_rwkv7.py --ta
 RWKV_CHECKPOINT_PATH=...0.1b.pth .venv/bin/python script/benchmark_rwkv7.py --targets tl-fp16,tl-bf16,pure-torch --device cuda --cases 1x1,1x32,1x64 --warmup 5 --iters 10
 ```
 
-更细的实验发现请见 [docs/benchmark_rwkv7_experiments.md](../docs/benchmark_rwkv7_experiments.md)。
+更细的实验发现请见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)。

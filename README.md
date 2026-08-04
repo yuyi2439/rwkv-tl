@@ -50,7 +50,7 @@ Key points:
   (7.3 ms on 0.1B 1x128 vs 15.8 ms for rwkv_tl).
 - Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
-  `script/benchmark_rwkv7.md` and `docs/benchmark_rwkv7_experiments.md`.
+  `script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.
 
 ## MX450 tuning (sm_75) now partially beats the sm75-adapted faster3a_2607
 

@@ -26,7 +26,7 @@ This file is the canonical benchmark report for this repository. Follow these ru
 - Keep it in Chinese.
 - Keep it concise and report-like. It should only contain the benchmark entry script, environment, measured results, and short explanations that directly interpret those results.
 - Do not put exploratory findings, long reasoning, speculative conclusions, or operational caveats in this file.
-- Put extra experimental findings in [docs/benchmark_rwkv7_experiments.md](docs/benchmark_rwkv7_experiments.md).
+- Put extra experimental findings in [docs/benchmarks/rtx3060.md](docs/benchmarks/rtx3060.md).
 - Put runtime warnings, environment constraints, and maintenance guidance in this file.
 - When a new benchmark run is added, update this report with the new numbers and keep the narrative short.
 
@@ -128,7 +128,7 @@ relative comparisons as reliable, absolute numbers as noisy.
 - Keep correctness first: forward and prefill must use independent state objects in tests.
 - `prefill` is deliberately NOT torch.compile'd: each distinct prompt length recompiles a fresh graph (T=256 took ~12 min on 0.1B with the GPU idle) for a steady-state gain of only 1.11-1.43x. Keep it eager.
 - The benchmark harness (`benchmark_rwkv7.py`) builds rwkv_tl/pure_torch with `is_torch_compile=False` and routes them through `decode`/`prefill` (via `_eager_dispatch`) so a sweep measures the eager implementation and never triggers per-case torch.compile recompiles (which previously made it look frozen for minutes). The correctness gate is OFF by default (`--correctness-check` opt-in) to keep VRAM low on 2GB GPUs. The `graph_decoder` benchmark target is removed for now (CUDA-Graph decode now lives inside `tl-mx450`); re-add after testing on other devices.
-- MX450 tuning (0.1B) now partially beats the sm75-adapted faster3a_2607: a stable 8.2ms T=1 decode (CUDA Graph) and T>=16 prefill wins; faster3a still leads T=2/4/8. See `README.md` and `script/benchmark_rwkv7.md`.
+- MX450 tuning (0.1B) now partially beats the sm75-adapted faster3a_2607: a stable 8.2ms T=1 decode (CUDA Graph) and T>=16 prefill wins; faster3a still leads T=2/4/8. See `README.md`, `script/benchmark_rwkv7.md`, and the kernel-level analysis in `docs/benchmarks/mx450_sm75.md` (RTX 3060 experiments in `docs/benchmarks/rtx3060.md`).
 
 ## Benchmarks
 
@@ -150,7 +150,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - DPLR A term must be the L2-normalized key (kk/||kk||), not raw kk. Passing raw kk silently corrupts the state update and destabilizes the recurrence (decode/prefill diverged ~14 in logits and argmax flipped). `fused_l2norm_neg_kk_a` returns `(kk_norm, B)` for this reason.
 - `T.Kernel` defaults to 128 threads; reduce kernels (l2norm/dplr/gn_rkrk) only need one logical warp. The extra warps run `__shfl_xor_sync(0xffffffff, ...)` while sitting on the `threadIdx.x < 32` guard's off-path, which is UB and produces rare non-deterministic results that amplify through the recurrence. Use `threads=WARP` (defined in `_common.py`, 32 on both NVIDIA and AMD) for warp-reduce kernels.
 - AMD note: tilelang's `warp_reduce_sum` keeps 32-lane logical-warp semantics on HIP (CDNA wave64 and RDNA wave32) -- see `src/tl_templates/hip/reduce.h`. Do NOT set WARP to the AMD hardware wavefront (64): the reduce would then cover only lanes 0-31 and silently drop half the reduction. `SERIAL = HEAD_DIM // WARP` stays 2 on every backend.
-- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmark_rwkv7_experiments.md for the RTX 3060 measurement that led to this decision).
+- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
 - **Turing sm_75 fp16 GEMM is T-specialized.** `kernels/gemm.py` compiles a
   per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
@@ -209,7 +209,7 @@ done yet. When working on the related area, remind the user whether to proceed.
 
 - Compiled-prefill perf and the `forward` `Tensor.item()` graph break were
   verified on the RTX 3060 and are documented in
-  `docs/benchmark_rwkv7_experiments.md`. Compiled prefill was faster
+  `docs/benchmarks/rtx3060.md`. Compiled prefill was faster
   (1.11-1.43x) but kept eager due to per-length recompile cost.
 
 ## Reference

@@ -1,7 +1,7 @@
 # RTX 3060 验证测试记录
 
 > 本文档记录当前版本在 RTX 3060 上的验证测试结果。使用中文撰写。
-> 相关基准数据见 [benchmark_rwkv7.md](../script/benchmark_rwkv7.md)，实验发现见 [benchmark_rwkv7_experiments.md](benchmark_rwkv7_experiments.md)。
+> 相关基准数据见 [benchmark_rwkv7.md](../script/benchmark_rwkv7.md)，实验发现见 [benchmarks/rtx3060.md](benchmarks/rtx3060.md)。
 
 ## 版本与环境
 
