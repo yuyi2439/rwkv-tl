@@ -76,27 +76,33 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 ### MX450 (CUDA, sm_75, 旧参考)
 
 > 注：MX450 是笔记本 GPU，长时满载会热降频（SM 时钟从 1800MHz 降到 ~1155MHz），
-> 绝对延迟在不同会话间波动较大（本次数值整体比旧记录高 ~50%，系降频所致）；
-> 单次运行内的相对比较更可靠。以目标卡（RTX 3060+ / AMD MI）为准。
+> 绝对延迟在不同会话间波动较大；单次运行内的相对比较更可靠。以目标卡（RTX 3060+ / AMD MI）为准。
+>
+> **fp16 迁移对 sm_75 的影响**：c2c4283 起 prefill 的批量 GEMM 从 bf16（cuBLAS magma
+> fp32 模拟）改为 fp16。Turing 的 cuBLAS fp16 tensor-core 内核对 `[T,C]@[C,C]`（T=32..128）
+> 病态慢（fp16 bmm ~1.3ms vs fp32 ~0.16ms，4-8x），导致 MX450 prefill 较旧记录 ~1.9x 变慢
+> （46.4 vs 24.7ms @ T=32）。已实测 batch GEMM 转 fp32 与 fp16 墙钟持平（CPU 启动开销抵消
+> 了 GEMM 收益，A/B: 38/41 vs 35/38ms），故保持全 fp16；RTX 3060（sm_86）无此问题，目标卡
+> 数据不受影响。MX450 上更彻底的解法是写 sm_75 可用的 tilelang fp16 GEMM（m16n8k8），未做。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 9.80 | 102.02 |
-| faster3a_2607 | 1×32 | 43.93 | 728.39 |
-| faster3a_2607 | 1×64 | 46.93 | 1363.64 |
-| faster3a_2607 | 1×128 | 87.84 | 1457.13 |
-| rwkv_tl | 1×1 | 15.94 | 62.72 |
-| rwkv_tl | 1×32 | 24.71 | 1295.03 |
-| rwkv_tl | 1×64 | 27.74 | 2306.85 |
-| rwkv_tl | 1×128 | 37.56 | 3407.73 |
-| pure_torch | 1×1 | 23.01 | 43.46 |
-| pure_torch | 1×32 | 248.25 | 128.90 |
-| pure_torch | 1×64 | 410.57 | 155.88 |
-| pure_torch | 1×128 | 753.04 | 169.98 |
-| graph_decoder | 1×1 | 7.67 | 130.35 |
-| graph_decoder | 1×32 | 220.03 | 145.43 |
-| graph_decoder | 1×64 | 440.80 | 145.19 |
-| graph_decoder | 1×128 | 881.49 | 145.21 |
+| faster3a_2607 | 1×1 | 9.38 | 106.61 |
+| faster3a_2607 | 1×32 | 43.79 | 730.83 |
+| faster3a_2607 | 1×64 | 46.62 | 1372.88 |
+| faster3a_2607 | 1×128 | 87.90 | 1456.22 |
+| rwkv_tl | 1×1 | 14.05 | 71.19 |
+| rwkv_tl | 1×32 | 46.40 | 689.67 |
+| rwkv_tl | 1×64 | 48.86 | 1309.75 |
+| rwkv_tl | 1×128 | 92.04 | 1390.65 |
+| pure_torch | 1×1 | 29.72 | 33.65 |
+| pure_torch | 1×32 | 288.34 | 110.98 |
+| pure_torch | 1×64 | 510.95 | 125.26 |
+| pure_torch | 1×128 | 964.90 | 132.66 |
+| graph_decoder | 1×1 | 7.96 | 125.63 |
+| graph_decoder | 1×32 | 218.73 | 146.30 |
+| graph_decoder | 1×64 | 438.21 | 146.05 |
+| graph_decoder | 1×128 | 882.25 | 145.08 |
 
 ### CPU
 
@@ -190,11 +196,9 @@ warmup=10, iters=20。
 ### CUDA (MX450, sm_75)
 
 - T=1 decode 时，graph_decoder 最快，说明 CUDA Graph 对单 token 解码的 launch 开销消除是有效的。
-- **单 kernel prefill（fused_dplr_T）**：state 串行递推在 kernel 内、一次 launch 交付整个序列 + fp32io16 state。prefill 大幅提速并**反超 faster3a_2607**：
-  - 0.1B：1×32 24.7ms（1295 tok/s）vs faster3a 43.9ms（728 tok/s），快 **1.78x**；1×128 37.6ms（3408 tok/s）vs faster3a 87.8ms（1457 tok/s），快 **2.34x**。
-  - 0.4B：1×32 56.8ms（564 tok/s）vs faster3a 165.6ms（193 tok/s），快 **2.92x**；1×128 111.0ms（1153 tok/s）vs faster3a 212.8ms（602 tok/s），快 **1.92x**。
-- 对比 pure_torch：0.1B 1×128 快 20x（37.6 vs 753ms），0.4B 1×128 快 12x（111 vs 1328ms）。
-- T=1 decode 仍慢于 faster3a_2607（0.1B 15.9 vs 9.8ms，0.4B 21.4 vs 14.1ms），因 fused kernel 逐 token dispatch 开销；graph_decoder（CUDA Graph）可弥补此差距。
+- **单 kernel prefill（fused_dplr_T）**：state 串行递推在 kernel 内、一次 launch 交付整个序列 + fp32io16 state。fp16 迁移前 prefill 曾**反超 faster3a_2607**（0.1B 1×128 37.6ms vs 87.8ms，快 2.34x）；fp16 迁移后因 Turing fp16 GEMM 病态慢（见上表前注）退为与 faster3a 接近（1×128 92.0 vs 87.9ms）。0.4B 数据仍为 fp16 迁移前采集。
+- 对比 pure_torch：0.1B 1×128 快 10x（92.0 vs 964.9ms）。
+- T=1 decode 仍慢于 faster3a_2607（0.1B 14.0 vs 9.4ms，0.4B 21.4 vs 14.1ms），因 fused kernel 逐 token dispatch 开销；graph_decoder（CUDA Graph）可弥补此差距。
 - faster3a_2607 在 0.4B 上 T=64（150ms）反比 T=32（166ms）快，因其 chunk kernel 对不同序列长度有不同性能特征。
 - **MX450 2GB 显存限制**：0.4B 正确性门控会同时加载 pure_torch 参考模型（合计 ~2.4GB > 2GB），导致 rwkv_tl 延迟虚高 10x（540ms vs 实际 56ms）。0.4B 数据用 `--no-correctness-check` 采集。
 

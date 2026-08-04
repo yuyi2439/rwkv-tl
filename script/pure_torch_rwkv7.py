@@ -5,9 +5,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
-from rwkv_tl.model import RWKV7Weight
 from rwkv_tl.sampling import apply_stop, sample_logits
 from rwkv_tl.state import State
+from rwkv_tl.weight import RWKV7Weight
 
 
 def _sigmoid(x: Tensor) -> Tensor:

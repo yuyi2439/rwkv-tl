@@ -20,8 +20,8 @@ import pytest
 import torch
 
 from rwkv_tl import RWKV7
-from rwkv_tl.model import RWKV7Weight
 from rwkv_tl.state import State
+from rwkv_tl.weight import RWKV7Weight
 
 # The pure-torch reference lives under script/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "script"))

@@ -25,8 +25,8 @@ sys.path.insert(0, str(REPO / "script"))
 from pure_torch_rwkv7 import RWKV7Torch
 
 from rwkv_tl import RWKV7
-from rwkv_tl.model import RWKV7Weight
 from rwkv_tl.state import State
+from rwkv_tl.weight import RWKV7Weight
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH", "")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

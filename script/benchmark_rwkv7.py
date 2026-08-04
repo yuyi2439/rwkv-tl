@@ -47,8 +47,8 @@ for path in (SCRIPT_ROOT, SRC_ROOT):
 from pure_torch_rwkv7 import RWKV7Torch
 
 from rwkv_tl import RWKV7 as ProjectRWKV7
-from rwkv_tl.model import RWKV7Weight
 from rwkv_tl.state import State
+from rwkv_tl.weight import RWKV7Weight
 
 
 def percentile(values, q):

@@ -5,9 +5,9 @@ import argparse
 import torch
 
 from rwkv_tl import RWKV7
-from rwkv_tl.model import RWKV7Weight
 from rwkv_tl.state import State
 from rwkv_tl.tokenizer import Tokenizer
+from rwkv_tl.weight import RWKV7Weight
 
 
 def parse_args():

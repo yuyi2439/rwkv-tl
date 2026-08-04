@@ -20,9 +20,9 @@ from .kernels import (
     fused_v_gate,
     fused_w_gate,
 )
-from .model import LNWeight, RWKV7Weight
 from .sampling import apply_stop, sample_logits
 from .state import State
+from .weight import LNWeight, RWKV7Weight
 
 
 def RELUSQ(x: Tensor) -> Tensor:
