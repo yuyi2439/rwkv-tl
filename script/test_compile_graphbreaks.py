@@ -59,7 +59,7 @@ def detect_breaks(fn, args, label):
         return -1
 
 
-def test_consistency(eager_model, compiled_model, label):
+def check_consistency(eager_model, compiled_model, label):
     print(f"\n{'=' * 60}")
     print(f"CONSISTENCY: {label}")
     print(f"{'=' * 60}")
@@ -170,7 +170,7 @@ def main():
 
     # 2. Numerical consistency
     for label, model in models:
-        test_consistency(eagers[label], model, label)
+        check_consistency(eagers[label], model, label)
 
     # 3. Quick benchmark
     for label, model in models:
