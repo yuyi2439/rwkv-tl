@@ -37,7 +37,10 @@ def _baseline_logits(model: RWKV7, tokens: list[int]) -> torch.Tensor:
             64,
             device=model.emb.device,
         )
-        logits, _ = model.forward(tokens, S)
+        logits = None
+        for t in tokens:
+            logits, _ = model.decode(t, S)
+    assert logits is not None
     return logits.float().cpu()
 
 

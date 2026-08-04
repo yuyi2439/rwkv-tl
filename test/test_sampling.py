@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from rwkv_tl.sampling import sample_logits
+from rwkv_tl.sampling import apply_stop, sample_logits
 
 
 def test_greedy_argmax() -> None:
@@ -51,3 +51,32 @@ def test_generate_shape_and_dtype(temperature) -> None:
     t = sample_logits(logits, temperature=temperature)
     assert isinstance(t, int)
     assert 0 <= t < 65536
+
+
+def test_apply_stop_matches_and_truncates() -> None:
+    out = [1, 2, 3, 4, 5, 6]
+    assert apply_stop(out, [[7, 8]]) is False
+    assert out == [1, 2, 3, 4, 5, 6]
+    assert apply_stop(out, [[9, 10], [5, 6]]) is True
+    assert out == [1, 2, 3, 4]
+
+
+def test_apply_stop_longer_sequence() -> None:
+    # A stop sequence longer than the generated tail never matches.
+    out = [1, 2, 3]
+    assert apply_stop(out, [[1, 2, 3, 4]]) is False
+    assert out == [1, 2, 3]
+
+
+def test_apply_stop_disabled_and_empty() -> None:
+    out = [1, 2, 3]
+    assert apply_stop(out, None) is False
+    assert apply_stop(out, []) is False
+    assert apply_stop(out, [[]]) is False
+    assert out == [1, 2, 3]
+
+
+def test_apply_stop_first_match_wins() -> None:
+    out = [1, 2, 3, 4]
+    assert apply_stop(out, [[3, 4], [2, 3, 4]]) is True
+    assert out == [1, 2]

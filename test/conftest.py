@@ -17,6 +17,28 @@ import pytest
 import torch
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "compile: slow torch.compile-of-decode integration test (run with -m compile)",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    # Only run when explicitly selected via -m compile: compiling decode on
+    # the 0.1B model takes ~1 min on a small GPU, so keep it out of the
+    # default suite (fast correctness tests run eager).
+    if not config.getoption("markexpr"):
+        skip = pytest.mark.skip(
+            reason="slow; run with `-m compile` to exercise torch.compile"
+        )
+        for item in items:
+            if "compile" in item.keywords:
+                item.add_marker(skip)
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO

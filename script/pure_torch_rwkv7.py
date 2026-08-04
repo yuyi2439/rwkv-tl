@@ -6,7 +6,7 @@ from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
 from rwkv_tl.model import RWKV7Weight
-from rwkv_tl.sampling import sample_logits
+from rwkv_tl.sampling import apply_stop, sample_logits
 from rwkv_tl.state import State
 
 
@@ -96,8 +96,8 @@ class RWKV7Torch:
         v_first: Tensor | None = None
 
         for (TM, CM), tmix_state, cmix_state in zip(self.layers, S.tmix, S.cmix):
-            X, v_first, tmix_state = TM(X, v_first, tmix_state)
-            X, cmix_state = CM(X, cmix_state)
+            X, v_first = TM(X, v_first, tmix_state)
+            X = CM(X, cmix_state)
         return self.HEAD(self.LN_OUT(X)), S
 
     def forward(
@@ -105,11 +105,11 @@ class RWKV7Torch:
         tokens: list[int] | Tensor,
         S: State,
     ) -> tuple[Tensor, State]:
-        """Run inference over a token sequence.
+        """Run inference over a token sequence; returns ``(logits, S)``.
 
-        Single-token inputs use the `decode` path. Multi-token inputs are
-        routed to `prefill` for a batched-GEMM path instead of a per-token
-        Python loop of GEMVs.
+        Single-token inputs use `decode`. Multi-token inputs batch-fill all but
+        the last token via `prefill`, then single-step the last one for the
+        final logits.
         """
         if isinstance(tokens, Tensor):
             tok = tokens.reshape(-1)
@@ -121,13 +121,14 @@ class RWKV7Torch:
             raise RuntimeError("forward received an empty token sequence")
         if tok.numel() == 1:
             return self.decode(int(tok.item()), S)
-        return self.prefill(tok, S)
+        S = self.prefill(tok[:-1], S)
+        return self.decode(int(tok[-1].item()), S)
 
     def prefill(
         self,
         tokens: list[int] | Tensor,
         S: State,
-    ) -> tuple[Tensor, State]:
+    ) -> State:
         if isinstance(tokens, Tensor):
             tok = tokens.reshape(-1)
         else:
@@ -139,9 +140,9 @@ class RWKV7Torch:
         X = self.emb[tok]
         v_first: Tensor | None = None
         for (TM, CM), tmix_state, cmix_state in zip(self.layers_batch, S.tmix, S.cmix):
-            X, v_first, tmix_state = TM(X, v_first, tmix_state)
-            X, cmix_state = CM(X, cmix_state)
-        return self.HEAD(self.LN_OUT(X[-1])), S
+            X, v_first = TM(X, v_first, tmix_state)
+            X = CM(X, cmix_state)
+        return S
 
     def generate(
         self,
@@ -153,6 +154,7 @@ class RWKV7Torch:
         top_k: int = 0,
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
+        stop: list[list[int]] | None = None,
     ) -> tuple[list[int], State]:
         logits, S = self.forward(tokens, S)
         out: list[int] = []
@@ -166,11 +168,21 @@ class RWKV7Torch:
                 seen=out,
             )
             out.append(token)
-            logits, S = self.decode(token, S)
+            if apply_stop(out, stop):
+                break
+            # CUDA 0-dim tensor (not a Python int) so a compiled decode
+            # doesn't specialize/recompile per token value.
+            logits, S = self.decode(torch.as_tensor(token, device=self.emb.device), S)
         return out, S
 
-    def EMB(self, token: int) -> Tensor:
-        return self.emb[token]
+    def EMB(self, token: int | Tensor) -> Tensor:
+        idx = (
+            token
+            if isinstance(token, Tensor)
+            else torch.as_tensor(token, device=self.emb.device)
+        )
+        x = F.embedding(idx, self.emb)
+        return x.squeeze(0) if x.dim() > 1 else x
 
     def LN_OUT(self, X: Tensor) -> Tensor:
         return _layer_norm(X, self.ln_outW, self.ln_outB)
@@ -180,16 +192,16 @@ class RWKV7Torch:
 
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
-        ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        ) -> tuple[Tensor, Tensor]:
             x = _layer_norm(x0, b.ln_pret.w, b.ln_pret.b)
             prev = state["x"]
 
-            xr = _lerp(x, prev, att.x_r.reshape(-1))
-            xw = _lerp(x, prev, att.x_w.reshape(-1))
-            xk = _lerp(x, prev, att.x_k.reshape(-1))
-            xv = _lerp(x, prev, att.x_v.reshape(-1))
-            xa = _lerp(x, prev, att.x_a.reshape(-1))
-            xg = _lerp(x, prev, att.x_g.reshape(-1))
+            xr = _lerp(x, prev, att.x_r)
+            xw = _lerp(x, prev, att.x_w)
+            xk = _lerp(x, prev, att.x_k)
+            xv = _lerp(x, prev, att.x_v)
+            xa = _lerp(x, prev, att.x_a)
+            xg = _lerp(x, prev, att.x_g)
             # copy after reading prev: state["x"] aliases prev, so an
             # earlier in-place copy_ here would corrupt prev before use.
             state["x"].copy_(x)
@@ -225,23 +237,20 @@ class RWKV7Torch:
                 att.g2.T.contiguous(),
                 torch.sigmoid(torch.mv(att.g1.T.contiguous(), xg)),
             )
-            return torch.addmv(x0, att.output_weight, (y * g)), v_first, state
+            return torch.addmv(x0, att.output_weight, (y * g)), v_first
 
         return layer
 
     def make_CMIX(self, i: int):
         b, ffn = self.w.blocks[i], self.w.blocks[i].ffn
 
-        def layer(
-            x0: Tensor, state: dict[str, Tensor]
-        ) -> tuple[Tensor, dict[str, Tensor]]:
+        def layer(x0: Tensor, state: dict[str, Tensor]) -> Tensor:
             x_ln = _layer_norm(x0, b.ln_prec.w, b.ln_prec.b)
             prev = state["x"]
             x = _lerp(x_ln, prev, ffn.x_k.reshape(-1))
             state["x"].copy_(x_ln)
-            return (
-                torch.addmv(x0, ffn.value_weight, _relusq(torch.mv(ffn.key_weight, x))),
-                state,
+            return torch.addmv(
+                x0, ffn.value_weight, _relusq(torch.mv(ffn.key_weight, x))
             )
 
         return layer
@@ -269,16 +278,16 @@ class RWKV7Torch:
 
         def layer(
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
-        ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        ) -> tuple[Tensor, Tensor]:
             T_len = x0.shape[0]
             x = _layer_norm(x0, b.ln_pret.w, b.ln_pret.b)
             prev = torch.cat([state["x"].unsqueeze(0), x[:-1]], dim=0)
-            xr = _lerp(x, prev, att.x_r.reshape(-1))
-            xw = _lerp(x, prev, att.x_w.reshape(-1))
-            xk = _lerp(x, prev, att.x_k.reshape(-1))
-            xv = _lerp(x, prev, att.x_v.reshape(-1))
-            xa = _lerp(x, prev, att.x_a.reshape(-1))
-            xg = _lerp(x, prev, att.x_g.reshape(-1))
+            xr = _lerp(x, prev, att.x_r)
+            xw = _lerp(x, prev, att.x_w)
+            xk = _lerp(x, prev, att.x_k)
+            xv = _lerp(x, prev, att.x_v)
+            xa = _lerp(x, prev, att.x_a)
+            xg = _lerp(x, prev, att.x_g)
             state["x"] = x[-1]
 
             r = xr @ rWt
@@ -317,7 +326,7 @@ class RWKV7Torch:
             rkrk = torch.sum(r * k * att.r_k, dim=-1, keepdim=True)
             y = (y.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
             g = torch.sigmoid(xg @ g1) @ g2
-            return x0 + (y * g) @ oWt, v_first, state
+            return x0 + (y * g) @ oWt, v_first
 
         return layer
 
@@ -326,13 +335,11 @@ class RWKV7Torch:
         b, ffn = self.w.blocks[i], self.w.blocks[i].ffn
         kWt, vWt = ffn.key_weight.T.contiguous(), ffn.value_weight.T.contiguous()
 
-        def layer(
-            x0: Tensor, state: dict[str, Tensor]
-        ) -> tuple[Tensor, dict[str, Tensor]]:
+        def layer(x0: Tensor, state: dict[str, Tensor]) -> Tensor:
             x_ln = _layer_norm(x0, b.ln_prec.w, b.ln_prec.b)
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
             x = _lerp(x_ln, prev, ffn.x_k.reshape(-1))
             state["x"] = x_ln[-1]
-            return x0 + _relusq(x @ kWt) @ vWt, state
+            return x0 + _relusq(x @ kWt) @ vWt
 
         return layer

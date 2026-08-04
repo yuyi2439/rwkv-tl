@@ -53,7 +53,11 @@ def _run_decode(model, tokens) -> torch.Tensor:
 def _run_prefill(model, tokens) -> torch.Tensor:
     with torch.device("cuda"):
         S = _fresh_state(model)
-        logits, _ = model.prefill(tokens, S)
+        # prefill updates S in place (no logits); single-step the last token
+        # to obtain the final logits.
+        if len(tokens) > 1:
+            S = model.prefill(torch.as_tensor(tokens[:-1], device=model.emb.device), S)
+        logits, _ = model.decode(tokens[-1], S)
     return logits.float().cpu()
 
 

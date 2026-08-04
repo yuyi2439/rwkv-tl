@@ -18,20 +18,23 @@ class RWKV7ATTWeight(nn.Module):
     x_v: Tensor
     x_a: Tensor
     x_g: Tensor
+
     w0: Tensor
-    r_k: Tensor
     w1: Tensor
     w2: Tensor
+    a0: Tensor
     a1: Tensor
     a2: Tensor
-    a0: Tensor
+    v0: Tensor
+    v1: Tensor
+    v2: Tensor
     g1: Tensor
     g2: Tensor
-    v2: Tensor
-    v1: Tensor
-    v0: Tensor
+
+    r_k: Tensor
     k_k: Tensor
     k_a: Tensor
+
     receptance_weight: Tensor
     key_weight: Tensor
     value_weight: Tensor
@@ -40,26 +43,29 @@ class RWKV7ATTWeight(nn.Module):
 
     def __init__(self, W, prefix: str):
         super().__init__()
-        self.x_r = W[f"{prefix}.x_r"]
-        self.x_w = W[f"{prefix}.x_w"]
-        self.x_k = W[f"{prefix}.x_k"]
-        self.x_v = W[f"{prefix}.x_v"]
-        self.x_a = W[f"{prefix}.x_a"]
-        self.x_g = W[f"{prefix}.x_g"]
+        self.x_r = W[f"{prefix}.x_r"].reshape(-1)
+        self.x_w = W[f"{prefix}.x_w"].reshape(-1)
+        self.x_k = W[f"{prefix}.x_k"].reshape(-1)
+        self.x_v = W[f"{prefix}.x_v"].reshape(-1)
+        self.x_a = W[f"{prefix}.x_a"].reshape(-1)
+        self.x_g = W[f"{prefix}.x_g"].reshape(-1)
+
         self.w0 = W[f"{prefix}.w0"]
-        self.r_k = W[f"{prefix}.r_k"]
         self.w1 = W[f"{prefix}.w1"]
         self.w2 = W[f"{prefix}.w2"]
+        self.a0 = W[f"{prefix}.a0"]
         self.a1 = W[f"{prefix}.a1"]
         self.a2 = W[f"{prefix}.a2"]
-        self.a0 = W[f"{prefix}.a0"]
+        self.v0 = W[f"{prefix}.v0"]
+        self.v1 = W[f"{prefix}.v1"]
+        self.v2 = W[f"{prefix}.v2"]
         self.g1 = W[f"{prefix}.g1"]
         self.g2 = W[f"{prefix}.g2"]
-        self.v2 = W[f"{prefix}.v2"]
-        self.v1 = W[f"{prefix}.v1"]
-        self.v0 = W[f"{prefix}.v0"]
+
+        self.r_k = W[f"{prefix}.r_k"]
         self.k_k = W[f"{prefix}.k_k"]
         self.k_a = W[f"{prefix}.k_a"]
+
         self.receptance_weight = W[f"{prefix}.receptance.weight"]
         self.key_weight = W[f"{prefix}.key.weight"]
         self.value_weight = W[f"{prefix}.value.weight"]

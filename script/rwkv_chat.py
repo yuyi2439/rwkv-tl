@@ -80,6 +80,7 @@ def main():
             top_k=args.top_k,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
+            stop=[tokenizer.encode("\n\nUser:")],
         )
         response = tokenizer.decode(response_tokens)
 

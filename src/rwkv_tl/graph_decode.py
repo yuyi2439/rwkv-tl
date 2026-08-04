@@ -101,9 +101,9 @@ class GraphDecoder:
         for (TM, CM), tmix_state, cmix_state in zip(
             self.model.layers, self.state.tmix, self.state.cmix
         ):
-            X, v_first, tmix_state = TM(X, v_first, tmix_state)
-            X, cmix_state = CM(X, cmix_state)
-        return self.model.HEAD(self.model.LN_OUT(X))
+            X, v_first = TM(X, v_first, tmix_state)
+            X = CM(X, cmix_state)
+        return self.model.w.head @ self.model.LN_OUT(X)
 
     def _capture(self, warmup: int) -> None:
         """Warmup on a side stream then capture the graph."""

@@ -102,7 +102,7 @@ class CorrectnessError(RuntimeError):
 def _fresh_logits(
     model, input_tokens, batch_size: int, device: torch.device
 ) -> torch.Tensor:
-    """Run ``model.forward`` on a fresh state; return flattened final logits.
+    """Run the model on a fresh state; return flattened final logits.
 
     Handles both ``forward -> (logits, state)`` (rwkv_tl / pure_torch) and
     ``forward -> logits`` (faster3a_2607).
@@ -338,7 +338,10 @@ def bench_case_graph_decoder(
         assert got is not None
         w = reference.w
         ref_state = State(w.N_LAYER, w.N_EMBD, 64, device=reference.emb.device)
-        ref_logits, _ = reference.forward(tokens, ref_state)
+        ref_logits = None
+        for token in tokens:
+            ref_logits, _ = reference.decode(token, ref_state)
+        assert ref_logits is not None
         _check_correctness(
             got.reshape(-1).float(),
             ref_logits.reshape(-1).float(),

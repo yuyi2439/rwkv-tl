@@ -65,3 +65,26 @@ def sample_logits(
 
     probs = torch.softmax(l, dim=-1)
     return int(torch.multinomial(probs, 1).item())
+
+
+def apply_stop(out: list[int], stop: list[list[int]] | None) -> bool:
+    """If the generated tail ends with a stop sequence, truncate and stop.
+
+    Checks the generated tokens (``out``) against every sequence in ``stop``.
+    On a match the matched sequence is removed from the end and True is
+    returned so the caller halts generation.
+
+    Args:
+        out: Generated token ids (mutated in place on a match).
+        stop: Stop sequences (list of token-id lists); None/empty disables.
+
+    Returns:
+        True if a stop sequence matched and was truncated.
+    """
+    if not stop:
+        return False
+    for seq in stop:
+        if seq and out[-len(seq) :] == seq:
+            del out[-len(seq) :]
+            return True
+    return False
