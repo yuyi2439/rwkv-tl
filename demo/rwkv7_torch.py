@@ -78,31 +78,25 @@ class RWKV7Torch(RWKV7Model):
         *,
         is_torch_compile: bool = True,
     ) -> None:
-        self.w = w
-        self.dtype = w.emb.dtype
+        super().__init__(w, is_torch_compile=is_torch_compile)
         self._is_torch_compile = is_torch_compile
-        self.n_layer = w.N_LAYER
-        self.C, self.N = w.N_EMBD, 64
-        self.H = self.C // self.N
+        self.dtype = w.emb.dtype
         self.emb = _layer_norm(w.emb, w.ln_in.w, w.ln_in.b)
         self.ln_outW, self.ln_outB, self.head = (
             w.ln_out.w,
             w.ln_out.b,
             w.head,
         )
-        self.layers = [
-            (self.make_TMIX(i), self.make_CMIX(i)) for i in range(self.n_layer)
-        ]
+        self.layers = [(self.make_TMIX(i), self.make_CMIX(i)) for i in range(self.L)]
         self.layers_batch = [
-            (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
-            for i in range(self.n_layer)
+            (self.make_TMIX_batch(i), self.make_CMIX_batch(i)) for i in range(self.L)
         ]
 
     def HEAD(self, X: Tensor) -> Tensor:
         return self.head @ X
 
     @maybe_torch_compile
-    def decode(self, token: int, S: State) -> tuple[Tensor, State]:
+    def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
         X = self.EMB(token)
         v_first: Tensor | None = None
 
@@ -131,9 +125,9 @@ class RWKV7Torch(RWKV7Model):
         if tok.numel() == 0:
             raise RuntimeError("forward received an empty token sequence")
         if tok.numel() == 1:
-            return self.decode(int(tok.item()), S)
+            return self.decode(tok, S)
         S = self.prefill(tok[:-1], S)
-        return self.decode(int(tok[-1].item()), S)
+        return self.decode(tok[-1], S)
 
     def prefill(
         self,
@@ -186,13 +180,8 @@ class RWKV7Torch(RWKV7Model):
             logits, S = self.decode(torch.as_tensor(token, device=self.emb.device), S)
         return out, S
 
-    def EMB(self, token: int | Tensor) -> Tensor:
-        idx = (
-            token
-            if isinstance(token, Tensor)
-            else torch.as_tensor(token, device=self.emb.device)
-        )
-        x = F.embedding(idx, self.emb)
+    def EMB(self, token: Tensor) -> Tensor:
+        x = F.embedding(token, self.emb)
         return x.squeeze(0) if x.dim() > 1 else x
 
     def LN_OUT(self, X: Tensor) -> Tensor:

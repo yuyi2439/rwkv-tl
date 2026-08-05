@@ -29,8 +29,8 @@ MAX_ABS_TOL = 4.0  # bf16 rounding across 12 recurrent layers stays << this
 
 def _fresh_state(model, dtype: torch.dtype = torch.float16) -> State:
     return State(
-        model.w.N_LAYER,
-        model.w.N_EMBD,
+        model.w.L,
+        model.w.C,
         64,
         device=model.emb.device,
         dtype=dtype,
@@ -42,7 +42,7 @@ def _run_decode(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Tens
         S = _fresh_state(model, dtype)
         logits = None
         for t in tokens:
-            logits, S = model.decode(t, S)
+            logits, S = model.decode(torch.as_tensor([t], device=model.emb.device), S)
     return logits.float().cpu()
 
 
@@ -53,7 +53,9 @@ def _run_prefill(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Ten
         # to obtain the final logits.
         if len(tokens) > 1:
             S = model.prefill(torch.as_tensor(tokens[:-1], device=model.emb.device), S)
-        logits, _ = model.decode(tokens[-1], S)
+        logits, _ = model.decode(
+            torch.as_tensor([tokens[-1]], device=model.emb.device), S
+        )
     return logits.float().cpu()
 
 

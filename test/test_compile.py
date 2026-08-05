@@ -31,8 +31,8 @@ def test_compile_generate_no_recompile(ckpt_path: str) -> None:
     with torch.device("cuda"):
         model = RWKV7(RWKV7Weight(ckpt_path), is_torch_compile=True)
         S = State(
-            model.w.N_LAYER,
-            model.w.N_EMBD,
+            model.w.L,
+            model.w.C,
             64,
             device=model.emb.device,
         )

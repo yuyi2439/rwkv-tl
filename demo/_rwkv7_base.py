@@ -54,41 +54,31 @@ class RWKV7Base(RWKV7Model):
         *,
         is_torch_compile: bool = True,
     ) -> None:
-        self.w = w
+        super().__init__(w)
+        self._is_torch_compile = is_torch_compile
         self._k = kernels
         self.dtype = kernels.torch_dtype
-        self._is_torch_compile = is_torch_compile
-        self.N_LAYER = self.w.N_LAYER
-        self.N_EMBD = self.w.N_EMBD
-        self.HEAD_DIM = 64
-        self.HEAD_CNT = self.N_EMBD // self.HEAD_DIM
 
         self.emb = LAYER_NORM(self.w.emb, self.w.ln_in)
         use_custom_ops = self._is_torch_compile
         self._use_custom_ops = use_custom_ops
         self.layers = [
             (self.make_TMIX(i, use_custom_ops), self.make_CMIX(i, use_custom_ops))
-            for i in range(self.N_LAYER)
+            for i in range(self.L)
         ]
         # prefill is NOT torch.compile'd (recompiles per distinct prompt
         # length); keep it eager.
         self.layers_batch = [
-            (self.make_TMIX_batch(i), self.make_CMIX_batch(i))
-            for i in range(self.N_LAYER)
+            (self.make_TMIX_batch(i), self.make_CMIX_batch(i)) for i in range(self.L)
         ]
 
     def LN_OUT(self, X: Tensor) -> Tensor:
         return LAYER_NORM(X, self.w.ln_out)
 
     @maybe_torch_compile
-    def decode(self, token: int | Tensor, S: State) -> tuple[Tensor, State]:
+    def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
         """Advance one token and return `(logits, state)`."""
-        idx = (
-            token
-            if isinstance(token, Tensor)
-            else torch.as_tensor(token, device=self.emb.device)
-        )
-        x = F.embedding(idx, self.emb)
+        x = F.embedding(token, self.emb)
         if x.dim() > 1:
             x = x.squeeze(0)
         v_first: Tensor | None = None
@@ -144,7 +134,7 @@ class RWKV7Base(RWKV7Model):
     ) -> tuple[list[int], State]:
         """Generate autoregressively from a prompt."""
         logits, S = self.forward(tokens, S)
-        out: list[int] = []
+        out: Tensor = torch.tensor([], dtype=torch.long, device=self.emb.device)
         for _ in range(max_tokens):
             token = sample_logits(
                 logits,
@@ -154,16 +144,16 @@ class RWKV7Base(RWKV7Model):
                 repetition_penalty=repetition_penalty,
                 seen=out,
             )
-            out.append(token)
-            if apply_stop(out, stop):
+            out = torch.cat([out, token.unsqueeze(0)], dim=0)
+            if apply_stop(out.tolist(), stop):
                 break
             # CUDA 0-dim tensor (not a Python int) so a compiled decode
             # doesn't specialize/recompile per token value.
             logits, S = self.decode(torch.as_tensor(token, device=self.emb.device), S)
-        return out, S
+        return out.tolist(), S
 
     def make_TMIX(self, i: int, use_custom_ops: bool):
-        H, N = self.HEAD_CNT, self.HEAD_DIM
+        H, N = self.H, self.N
         b = self.w.blocks[i]
         att = b.att
         rWt = att.receptance_weight.T
@@ -263,7 +253,7 @@ class RWKV7Base(RWKV7Model):
     def make_TMIX_batch(self, i: int):
         # Batched TMIX for prefill: [T, C] GEMM path. DPLR stays per-token
         # (serial state), single-shot via fused_dplr_T.
-        H, N = self.HEAD_CNT, self.HEAD_DIM
+        H, N = self.H, self.N
         b = self.w.blocks[i]
         att = b.att
         rWt = att.receptance_weight.T

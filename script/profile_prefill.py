@@ -29,11 +29,13 @@ if not CKPT:
     raise RuntimeError("RWKV_CHECKPOINT_PATH must be set")
 
 with torch.device("cuda"):
-    model = make_rwkv7(RWKV7Weight(CKPT))
+    w = RWKV7Weight(CKPT)
+    model_cls = make_rwkv7(w.emb.device)
+    model = model_cls(w)
 
 # warmup
 with torch.device("cuda"):
-    S = State(model.w.N_LAYER, model.w.N_EMBD, 64, device="cuda")
+    S = State(model.w.L, model.w.C, 64, device="cuda")
     for _ in range(3):
         S.reset()
         model.prefill(torch.as_tensor(TOKENS, device=model.emb.device), S)
@@ -41,7 +43,7 @@ torch.cuda.synchronize()
 
 # profile
 with torch.device("cuda"):
-    S = State(model.w.N_LAYER, model.w.N_EMBD, 64, device="cuda")
+    S = State(model.w.L, model.w.C, 64, device="cuda")
     S.reset()
 with (
     profile(

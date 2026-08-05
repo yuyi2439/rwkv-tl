@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-import torch
 from torch import Tensor
 
 from rwkv_tl.state import State
@@ -18,22 +17,19 @@ from rwkv_tl.weight import RWKV7Weight
 
 
 class RWKV7Model(ABC):
-    """Common inference interface for all RWKV7 implementations.
+    """Common inference interface for all RWKV7 implementations."""
 
-    Attributes:
-        w: Loaded weights (``RWKV7Weight``); ``w.N_LAYER`` / ``w.N_EMBD``
-            are the model's layer count and embedding width.
-        emb: Normalized embedding matrix (``self.emb.device`` is the model
-            device).
-        dtype: Element type of the model's activations (fp16 or bf16).
-    """
+    def __init__(self, w: RWKV7Weight, *args, **kwargs) -> None:
+        """Initialize common RWKV7 model fields shared by all backends."""
+        self.w = w
 
-    w: RWKV7Weight
-    emb: Tensor
-    dtype: torch.dtype
+        self.L = w.L
+        self.C = w.C
+        self.N = 64  # head dimension (fixed at 64 for RWKV7)
+        self.H = self.C // self.N  # head count (C / N)
 
     @abstractmethod
-    def decode(self, token: int | Tensor, S: State) -> tuple[Tensor, State]:
+    def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
         """Advance one token; returns ``(logits, state)``."""
 
     @abstractmethod

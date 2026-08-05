@@ -66,14 +66,14 @@ class RWKV7MX450(RWKV7FP16):
         self._graph = GraphDecoder(self) if use_graph else None
         self._prefill_graphs: dict[int, PrefillGraph] = {}
 
-    def decode(self, token: int | Tensor, S: State) -> tuple[Tensor, State]:
+    def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
         """Advance one token; CUDA-graph replays when enabled, eager otherwise."""
         if self._graph is None:
             return super().decode(token, S)
 
         g = self._graph
         _copy_state(g.state, S)
-        logits = g.step(int(token.item()) if isinstance(token, Tensor) else int(token))
+        logits = g.step(int(token.item()))
         _copy_state(S, g.state)
         return logits.clone(), S
 
@@ -93,7 +93,7 @@ class RWKV7MX450(RWKV7FP16):
 
     def make_TMIX_batch(self, i: int):
         # Batched TMIX for prefill, GEMMs in fp32 (see module docstring).
-        H, N = self.HEAD_CNT, self.HEAD_DIM
+        H, N = self.H, self.N
         b = self.w.blocks[i]
         att = b.att
         rWt = att.receptance_weight.T

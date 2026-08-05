@@ -28,26 +28,30 @@ uv sync
 ## Benchmark status
 
 The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
-target validation GPU, after the stateless refactor with the single-shot
-`fused_dplr_T` prefill kernel. `rwkv_tl` and `pure_torch` run the eager path;
-the benchmark harness routes through the raw methods so a sweep does not
-recompile a fresh graph per token count.
+target validation GPU. `tl-rtx3060` is the CUDA-Graph-accelerated fp16 variant
+(`demo.tuned.rwkv7_rtx3060.RWKV7RTX3060`); `tl-fp16` is the eager fp16 base;
+`pure-torch` is the eager PyTorch baseline. The benchmark harness routes
+through the eager methods so a sweep does not recompile a fresh graph per
+token count.
 
-| Case | rwkv_tl | pure_torch | graph_decoder |
-|---|---:|---:|---:|
-| 1x1 | 9.58 ms / 104.41 tok/s | 14.50 ms / 68.98 tok/s | 1.66 ms / 602.63 tok/s |
-| 1x32 | 17.90 ms / 1787.72 tok/s | 121.82 ms / 262.68 tok/s | 51.57 ms / 620.50 tok/s |
-| 8x8 | 16.09 ms / 3978.86 tok/s | 214.81 ms / 297.94 tok/s | not supported |
-| 16x16 | 15.87 ms / 16135.64 tok/s | 969.97 ms / 263.93 tok/s | not supported |
+| Case | tl-fp16 | tl-rtx3060 | faster3a_2607 | pure-torch |
+|---|---:|---:|---:|---:|
+| 1x1 | 10.08 ms | **2.16 ms** | 4.40 ms | 15.78 ms |
+| 1x8 | 16.46 ms | **2.86 ms** | 6.41 ms | 41.44 ms |
+| 1x32 | 16.55 ms | **3.41 ms** | 8.16 ms | 119.29 ms |
+| 1x64 | 16.60 ms | **4.00 ms** | 7.71 ms | 228.87 ms |
+| 1x128 | 16.64 ms | 17.47 ms | **7.06 ms** | 428.54 ms |
+| 8x8 | 16.29 ms | **3.89 ms** | 7.69 ms | 223.73 ms |
+| 16x16 | 16.60 ms | **17.34 ms** | 8.02 ms | 850.39 ms |
 
 Key points:
-- GraphDecoder is best for single-token decode latency.
-- rwkv_tl is the only path that supports both batched prefill and decode.
-- The single-shot `fused_dplr_T` prefill kernel made prefill latency
-  flat across T (0.1B ~15-18 ms for all prefill cases); it now beats
-  `pure_torch` by ~28x at 1x128.
-- The Albatross reference (faster3a_2607) still leads prefill by ~2.2x
-  (7.3 ms on 0.1B 1x128 vs 15.8 ms for rwkv_tl).
+- The CUDA-Graph-accelerated `tl-rtx3060` (decode + per-T prefill graph for
+  T<=64) leads every implementation at T=1..64, beating faster3a_2607 by
+  ~1.5-2x and pure-torch by ~7-60x.
+- T=128 prefill stays eager (T>64 graph cap) and trails faster3a_2607
+  (~20 vs 7.8 ms) -- large-T prefill is the common tilelang-path bottleneck.
+- `tl-fp16` (eager, no CUDA Graph) is the slowest project path at small T
+  because launch gaps dominate; the graph is the whole win.
 - Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.

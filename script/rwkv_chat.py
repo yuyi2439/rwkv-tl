@@ -62,11 +62,13 @@ def main():
     args = parse_args()
     # auto: pick the implementation matching the current GPU (MX450 variant on
     # sm_75, tilelang fp16 elsewhere), so the same chat works on any device.
-    model = make_rwkv7(RWKV7Weight(args.checkpoint))
+    w = RWKV7Weight(args.checkpoint)
+    model_cls = make_rwkv7(w.emb.device)
+    model = model_cls(w)
     tokenizer = Tokenizer(args.vocab)
     S = State(
-        model.w.N_LAYER,
-        model.w.N_EMBD,
+        model.L,
+        model.C,
         64,
         device=model.emb.device,
     )

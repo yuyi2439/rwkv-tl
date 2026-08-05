@@ -72,36 +72,53 @@ uv run python script/benchmark_rwkv7.py \
 
 ### RTX 3060 (CUDA, sm_86, 目标卡)
 
-warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触发 torch.compile 重编译）。
+warmup=10, iters=20，正确性门控全过。`tl-rtx3060`/`tl-mx450` 为 CUDA-Graph 加速变体
+（decode + T≤64 per-T prefill graph），`tl-fp16` 为 eager fp16 基线。
 
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
-| faster3a_2607 | 1×1 | 5.00 | 199.95 |
-| faster3a_2607 | 1×8 | 6.06 | 1319.81 |
-| faster3a_2607 | 1×32 | 7.88 | 4062.20 |
-| faster3a_2607 | 1×64 | 7.89 | 8112.67 |
-| faster3a_2607 | 1×128 | 7.27 | 17618.43 |
-| faster3a_2607 | 8×8 | 7.14 | 8963.16 |
-| faster3a_2607 | 16×16 | 6.37 | 40218.79 |
-| rwkv_tl | 1×1 | 9.58 | 104.41 |
-| rwkv_tl | 1×8 | 15.38 | 520.20 |
-| rwkv_tl | 1×32 | 17.90 | 1787.72 |
-| rwkv_tl | 1×64 | 14.65 | 4368.65 |
-| rwkv_tl | 1×128 | 15.80 | 8103.51 |
-| rwkv_tl | 8×8 | 16.09 | 3978.86 |
-| rwkv_tl | 16×16 | 15.87 | 16135.64 |
-| pure_torch | 1×1 | 14.50 | 68.98 |
-| pure_torch | 1×8 | 40.15 | 199.26 |
-| pure_torch | 1×32 | 121.82 | 262.68 |
-| pure_torch | 1×64 | 236.38 | 270.75 |
-| pure_torch | 1×128 | 447.04 | 286.33 |
-| pure_torch | 8×8 | 214.81 | 297.94 |
-| pure_torch | 16×16 | 969.97 | 263.93 |
-| graph_decoder | 1×1 | 1.66 | 602.63 |
-| graph_decoder | 1×8 | 12.87 | 621.57 |
-| graph_decoder | 1×32 | 51.57 | 620.50 |
-| graph_decoder | 1×64 | 103.60 | 617.78 |
-| graph_decoder | 1×128 | 207.01 | 618.34 |
+| faster3a_2607 | 1×1 | 4.40 | 227.16 |
+| faster3a_2607 | 1×8 | 6.41 | 1249.03 |
+| faster3a_2607 | 1×32 | 8.16 | 3923.16 |
+| faster3a_2607 | 1×64 | 7.71 | 8298.46 |
+| faster3a_2607 | 1×128 | 7.06 | 18122.51 |
+| faster3a_2607 | 8×8 | 7.69 | 8317.81 |
+| faster3a_2607 | 16×16 | 8.02 | 31932.56 |
+| tl-fp16 | 1×1 | 10.08 | 99.23 |
+| tl-fp16 | 1×8 | 16.46 | 486.02 |
+| tl-fp16 | 1×32 | 16.55 | 1933.97 |
+| tl-fp16 | 1×64 | 16.60 | 3855.31 |
+| tl-fp16 | 1×128 | 16.64 | 7690.17 |
+| tl-fp16 | 8×8 | 16.29 | 3929.15 |
+| tl-fp16 | 16×16 | 16.60 | 15420.20 |
+| tl-mx450 | 1×1 | 2.35 | 425.98 |
+| tl-mx450 | 1×8 | 4.08 | 1958.62 |
+| tl-mx450 | 1×32 | 4.86 | 6590.96 |
+| tl-mx450 | 1×64 | 6.03 | 10608.56 |
+| tl-mx450 | 1×128 | 17.77 | 7203.44 |
+| tl-mx450 | 8×8 | 5.75 | 11132.32 |
+| tl-mx450 | 16×16 | 18.64 | 13735.13 |
+| tl-rtx3060 | 1×1 | 2.16 | 462.62 |
+| tl-rtx3060 | 1×8 | 2.86 | 2800.48 |
+| tl-rtx3060 | 1×32 | 3.41 | 9392.85 |
+| tl-rtx3060 | 1×64 | 4.00 | 16018.07 |
+| tl-rtx3060 | 1×128 | 17.47 | 7326.87 |
+| tl-rtx3060 | 8×8 | 3.89 | 16469.85 |
+| tl-rtx3060 | 16×16 | 17.34 | 14762.38 |
+| tl-tuned | 1×1 | 2.48 | 403.30 |
+| tl-tuned | 1×8 | 2.83 | 2823.46 |
+| tl-tuned | 1×32 | 3.53 | 9066.31 |
+| tl-tuned | 1×64 | 3.85 | 16614.88 |
+| tl-tuned | 1×128 | 18.08 | 7078.16 |
+| tl-tuned | 8×8 | 3.79 | 16887.83 |
+| tl-tuned | 16×16 | 17.35 | 14755.79 |
+| pure-torch | 1×1 | 15.78 | 63.37 |
+| pure-torch | 1×8 | 41.44 | 193.03 |
+| pure-torch | 1×32 | 119.29 | 268.26 |
+| pure-torch | 1×64 | 228.87 | 279.63 |
+| pure-torch | 1×128 | 428.54 | 298.69 |
+| pure-torch | 8×8 | 223.73 | 286.06 |
+| pure-torch | 16×16 | 850.39 | 301.04 |
 
 ### MX450 (CUDA, sm_75, 旧参考)
 
@@ -112,7 +129,7 @@ warmup=10, iters=20。rwkv_tl / pure_torch 走 eager 路径（benchmark 不触�
 > fp32 模拟）改为 fp16。Turing 的 cuBLAS fp16 tensor-core 内核对 `[T,C]@[C,C]`（T=32..128）
 > 病态慢（fp16 bmm ~1.3ms vs fp32 ~0.16ms，4-8x），导致 MX450 prefill 较旧记录 ~1.9x 变慢
 > （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`demo.rwkv7_fp16.RWKV7FP16`（全 fp16，sm_80+）
-> 与 `demo.rwkv7_bf16.RWKV7BF16`、`demo.rwkv7_mx450.RWKV7MX450`（sm_75：decode 同 fp16，batch GEMM 走 fp32 快路径），
+> 与 `demo.rwkv7_bf16.RWKV7BF16`、`demo.tuned.rwkv7_mx450.RWKV7MX450`（sm_75：decode 同 fp16，batch GEMM 走 fp32 快路径），
 > `demo.make_rwkv7` 按 arch 自动选择。**2026-08-04 实测 tl-bf16 是 MX450 prefill 最快的变体**：
 > T=8 20.5 vs tl-fp16 45.1ms，T=128 39.8 vs tl-fp16 92.2ms——bf16 的 tilelang kernel 在 Turing 走
 > fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。
@@ -232,12 +249,10 @@ warmup=10, iters=20。
 
 ### CUDA (RTX 3060, sm_86, 目标卡)
 
-- T=1 decode 时 graph_decoder 最快（0.1B 1.66ms、0.4B 4.11ms），CUDA Graph 消除 launch 开销的效果在 sm_86 上依旧成立。
-- **单 kernel prefill（fused_dplr_T）**：state 串行递推在 kernel 内、一次 launch 交付整个序列 + fp32 state。prefill 较重构前大幅提速（0.1B 1×128 从 479ms 降到 15.8ms，~30x），并已接近/反超 faster3a_2607：
-  - 0.1B：1×32 17.9ms（1788 tok/s）vs faster3a 7.9ms（4062 tok/s）；1×128 15.8ms（8104 tok/s）vs faster3a 7.3ms（17618 tok/s）。仍落后 faster3a ~2.2x。
-  - 0.4B：1×32 33.9ms（943 tok/s）vs faster3a 14.9ms（2148 tok/s）；1×128 33.7ms（3802 tok/s）vs faster3a 14.1ms（9109 tok/s）。仍落后 faster3a ~2.4x。
-- 对比 pure_torch：0.1B 1×128 快 28x（15.8 vs 447ms），0.4B 1×128 快 30x（33.7 vs 1001ms）。
-- eager rwkv_tl 的 T=1 已快于 pure_torch（0.1B 9.6 vs 14.5ms；0.4B 20.4 vs 32.6ms），得益于重构后更紧凑的 decode 路径。
+- **CUDA-Graph 加速变体全面领先**：`tl-rtx3060`（fp16 GEMM + CUDA-Graph decode + per-T prefill graph T≤64）在 T=1..64 全面超过 faster3a_2607（1×1 2.16 vs 4.40ms，1×8 2.86 vs 6.41ms，1×32 3.41 vs 8.16ms，1×64 4.00 vs 7.71ms，8×8 3.89 vs 7.69ms），快 ~1.5-2x。`tl-tuned`（按设备名选）与 `tl-rtx3060` 同源，结果一致。
+- **大 T prefill（T>64）仍落后 faster3a**：T=128 `tl-rtx3060` 17.5ms vs faster3a 7.1ms。T>64 走 eager（graph 内存随 T 增长），fp16 GEMM 路径与 faster3a 的优化 kernel 有差距——这是所有 tilelang 路径的共性瓶颈。
+- **对比 pure-torch**：T=1 快 7.3x（2.16 vs 15.78ms），T=64 快 57x（4.00 vs 228.87ms）。
+- **`tl-fp16`（eager 无 Graph）是最慢项目路径**：小 T 时 launch 间隙主导（T=1 10.08ms），CUDA Graph 是全部收益来源。
 - 编译 prefill 的结论：torch.compile 后 0.1B prefill 快 1.11-1.43x（T=8~256），但每个不同 T 都会重编译一张图（T=256 约 12 分钟，GPU 空闲），收益不抵成本，故 `prefill` 保持 eager。详见 docs/benchmarks/rtx3060.md。
 
 ### CUDA (MX450, sm_75)

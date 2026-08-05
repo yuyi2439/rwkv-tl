@@ -49,8 +49,8 @@ def test_generate_shape_and_dtype(temperature) -> None:
     torch.manual_seed(1)
     logits = torch.randn(65536)
     t = sample_logits(logits, temperature=temperature)
-    assert isinstance(t, int)
-    assert 0 <= t < 65536
+    assert isinstance(t, torch.Tensor) and t.ndim == 0
+    assert 0 <= int(t.item()) < 65536
 
 
 def test_apply_stop_matches_and_truncates() -> None:

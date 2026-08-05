@@ -47,9 +47,9 @@ class PrefillGraph:
         self.T = T
         self.token_buf = torch.zeros(T, dtype=torch.long, device="cuda")
         self.state = State(
-            model.w.N_LAYER,
-            model.w.N_EMBD,
-            64,
+            model.L,
+            model.C,
+            model.N,
             device="cuda",
             dtype=model.dtype,
         )

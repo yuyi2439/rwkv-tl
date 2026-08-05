@@ -99,8 +99,10 @@ class RWKV7Block(nn.Module):
 
 
 class RWKV7Weight(nn.Module):
-    N_LAYER: int
-    N_EMBD: int
+    L: int
+    """Number of layers (blocks)."""
+    C: int
+    """Channel width (embedding size)."""
 
     emb: Tensor
     head: Tensor
@@ -130,11 +132,9 @@ class RWKV7Weight(nn.Module):
         self.ln_in = LNWeight(W, "blocks.0.ln0")
         self.ln_out = LNWeight(W, "ln_out")
 
-        self.N_LAYER = 1 + max(
-            int(k.split(".")[1]) for k in W if k.startswith("blocks.")
-        )
-        self.N_EMBD = self.emb.shape[1]
+        self.L = 1 + max(int(k.split(".")[1]) for k in W if k.startswith("blocks."))
+        self.C = self.emb.shape[1]
 
         self.blocks = []
-        for i in range(self.N_LAYER):
+        for i in range(self.L):
             self.blocks.append(RWKV7Block(W, f"blocks.{i}"))

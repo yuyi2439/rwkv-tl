@@ -82,8 +82,22 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
   the model dtype. DPLR RNN state is always fp32 in both variants.
 - **`demo.make_rwkv7` backends**: `"auto"` (MX450 variant on CUDA sm_75,
-  fp16 elsewhere), `"fp16"`, `"bf16"`, `"mx450"`, `"torch"`. `use_graph=True`
-  (default) makes `RWKV7MX450` decode via a captured CUDA Graph.
+  fp16 elsewhere), `"fp16"`, `"bf16"`, `"mx450"`, `"rtx3060"`, `"tuned"`,
+  `"torch"`. `use_graph=True` (default) makes the tuned variants (`RWKV7MX450`,
+  `RWKV7RTX3060`) decode via a captured CUDA Graph.
+- **Device-tuned variants live in `demo/tuned/`.** `RWKV7MX450` (Turing sm_75:
+  fp32 batch GEMMs) and `RWKV7RTX3060` (Ampere+ sm_80+: fp16 GEMMs) both layer
+  CUDA-Graph decode + per-T prefill graph (T<=64) on the fp16 base.
+  `backend="tuned"` picks one by CUDA capability and falls back to `"auto"`.
+  Measured on RTX 3060 / 0.1B: `RWKV7RTX3060` leads faster3a_2607 at every T
+  <= 64 (2.30ms 1x1, 2.90ms 1x8, 3.19ms 1x32, 3.81ms 1x64); T=128 stays eager
+  and trails faster3a (~20 vs 7.8ms) -- large-T prefill is the common
+  tilelang-path bottleneck, out of scope here.
+- **CUDA-Graph prefill requires in-place `state["x"]`.** The batch closures
+  must `state["x"].copy_(x[-1])`, NOT rebind `state["x"] = x[-1]`, or the
+  captured graph silently corrupts state across replays (measured rnn max_abs
+  1.4 vs 0.0). The fp16 base (`_rwkv7_base.py`) rebinds, so the tuned variants
+  override `make_TMIX_batch`/`make_CMIX_batch` to use `copy_`.
 - **Models are stateless; `State` is passed explicitly.** `State` and model are
   decoupled: models never own runtime state, and `decode`/`prefill`/`forward`/
   `generate` take a `State` argument and return it. State creation is a
@@ -202,9 +216,12 @@ done yet. When working on the related area, remind the user whether to proceed.
   kernels + operators + state/sampling/weight/tokenizer; model implementations
   live in `demo/` (one class per device/kernel strategy):
   `demo.rwkv7_fp16.RWKV7FP16` (tilelang fp16, sm_80+), `demo.rwkv7_bf16.RWKV7BF16`
-  (tilelang bf16), `demo.rwkv7_mx450.RWKV7MX450`
-  (sm_75: fp32 batch GEMMs + T<=16 tilelang fp16 rkv + CUDA-Graph decode),
-  `demo.rwkv7_torch.RWKV7Torch` (pure torch reference).
+  (tilelang bf16), `demo.rwkv7_torch.RWKV7Torch` (pure torch reference).
+  Device-tuned variants live in `demo/tuned/`:
+  `demo.tuned.rwkv7_mx450.RWKV7MX450`
+  (sm_75: fp32 batch GEMMs + T<=16 tilelang fp16 rkv + CUDA-Graph decode/prefill)
+  and `demo.tuned.rwkv7_rtx3060.RWKV7RTX3060`
+  (sm_80+: fp16 GEMMs + CUDA-Graph decode/prefill).
   `demo.graph_decode.GraphDecoder` (moved here from `src/rwkv_tl/`) provides the
   CUDA-Graph single-token decode used by `RWKV7MX450`.
   `demo.make_rwkv7(w, backend=...)` picks by CUDA arch.

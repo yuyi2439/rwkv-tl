@@ -17,8 +17,8 @@ def sample_logits(
     top_k: int = 0,
     top_p: float = 1.0,
     repetition_penalty: float = 1.0,
-    seen: list[int] | None = None,
-) -> int:
+    seen: Tensor | None = None,
+) -> Tensor:
     """Sample a token id from logits.
 
     Args:
@@ -39,14 +39,13 @@ def sample_logits(
     """
     l = logits.float()
 
-    if repetition_penalty != 1.0 and seen:
-        idx = torch.as_tensor(seen, device=l.device)
-        lv = l[idx]
+    if repetition_penalty != 1.0 and seen is not None:
+        lv = l[seen]
         lv = torch.where(lv > 0, lv / repetition_penalty, lv * repetition_penalty)
-        l[idx] = lv
+        l[seen] = lv
 
     if temperature is None or temperature <= 0:
-        return int(l.argmax().item())
+        return l.argmax()
 
     l = l / temperature
 
@@ -64,7 +63,7 @@ def sample_logits(
         l[sorted_idx[drop]] = float("-inf")
 
     probs = torch.softmax(l, dim=-1)
-    return int(torch.multinomial(probs, 1).item())
+    return torch.multinomial(probs, 1).squeeze(0)
 
 
 def apply_stop(out: list[int], stop: list[list[int]] | None) -> bool:

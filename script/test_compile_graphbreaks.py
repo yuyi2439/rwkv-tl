@@ -36,8 +36,8 @@ TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_PREFILL)]
 
 def fresh_state(model) -> State:
     return State(
-        model.w.N_LAYER,
-        model.w.N_EMBD,
+        model.w.L,
+        model.w.C,
         64,
         device=model.emb.device,
     )
@@ -66,7 +66,7 @@ def check_consistency(eager_model, compiled_model, label):
 
     # Decode: eager vs compiled (identical on non-bf16-native devices where
     # torch.compile is disabled; on sm_80+/AMD this compares the two paths).
-    tok_int = TOKENS[0]
+    tok_int = torch.tensor([TOKENS[0]], dtype=torch.long, device=DEVICE)
     s1 = fresh_state(eager_model)
     s2 = fresh_state(compiled_model)
     with torch.no_grad():
@@ -89,7 +89,7 @@ def quick_bench(eager_model, compiled_model, label, iters=5):
         ("prefill", N_PREFILL, "prefill"),
     ]:
         tok = (
-            TOKENS[0]
+            torch.tensor([TOKENS[0]], dtype=torch.long, device=DEVICE)
             if fn_name == "decode"
             else torch.tensor(TOKENS, dtype=torch.long, device=DEVICE)
         )
@@ -159,7 +159,11 @@ def main():
         # decode: eager decode closures (custom ops on native-bf16 devices,
         # raw kernels elsewhere); traces the path torch.compile would compile.
         s_d = fresh_state(model)
-        detect_breaks(model.decode, (TOKENS[0], s_d), f"{label} decode")
+        detect_breaks(
+            model.decode,
+            (torch.tensor([TOKENS[0]], dtype=torch.long, device=DEVICE), s_d),
+            f"{label} decode",
+        )
 
         # prefill: prefill with 32 tokens. Not torch.compile'd (each
         # prompt length would recompile a graph for <1.5x; kept eager), so this

@@ -44,9 +44,9 @@ class GraphDecoder:
         self.model = model
         self.token_buf = torch.zeros(1, dtype=torch.long, device="cuda")
         self.state = State(
-            self.model.N_LAYER,
-            self.model.N_EMBD,
-            self.model.HEAD_DIM,
+            self.model.L,
+            self.model.C,
+            self.model.N,
             device="cuda",
         )
 

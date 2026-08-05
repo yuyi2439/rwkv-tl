@@ -51,6 +51,8 @@ BACKEND_FOR_TARGET = {
     "tl-fp16": "fp16",
     "tl-bf16": "bf16",
     "tl-mx450": "mx450",
+    "tl-rtx3060": "rtx3060",
+    "tl-tuned": "tuned",
     "pure-torch": "torch",
 }
 
@@ -58,11 +60,13 @@ DTYPE_FOR_TARGET = {
     "tl-fp16": torch.float16,
     "tl-bf16": torch.bfloat16,
     "tl-mx450": torch.float16,
+    "tl-rtx3060": torch.float16,
+    "tl-tuned": torch.float16,
     "pure-torch": torch.float16,
 }
 
 # Project targets gated against a matching-dtype pure-torch reference.
-GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450"}
+GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450", "tl-rtx3060", "tl-tuned"}
 
 
 def percentile(values, q):
@@ -123,8 +127,8 @@ def make_state(model, batch_size: int | None = None) -> State | list[torch.Tenso
     """
     if isinstance(model, RWKV7Model):
         return State(
-            model.w.N_LAYER,
-            model.w.N_EMBD,
+            model.w.L,
+            model.w.C,
             64,
             device=model.emb.device,
             dtype=model.dtype,
@@ -198,6 +202,8 @@ def parse_targets(text: str) -> list[str]:
         "tl-fp16",
         "tl-bf16",
         "tl-mx450",
+        "tl-rtx3060",
+        "tl-tuned",
         "pure-torch",
         "fla",
         "FlashRWKV",
@@ -228,7 +234,7 @@ def _eager_dispatch(
     if isinstance(model, RWKV7Model):
         assert isinstance(state, State)
         if input_tokens.numel() == 1:
-            return model.decode(int(input_tokens.item()), state)
+            return model.decode(input_tokens, state)
         return model.prefill(input_tokens, state)
     return model.forward(input_tokens, state)
 
@@ -403,11 +409,11 @@ def run_benchmark(args):
                 w = RWKV7Weight(
                     str(args.project_checkpoint), device=rwkv_device, dtype=dtype
                 )
-                model = make_rwkv7(
-                    w,
+                model_cls = make_rwkv7(
+                    rwkv_device,
                     backend=BACKEND_FOR_TARGET[target],
-                    is_torch_compile=args.compile,
                 )
+                model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
                 gate_dtype = dtype
             elif target in {"fla", "FlashRWKV"}:
@@ -423,7 +429,8 @@ def run_benchmark(args):
             # faster3a_2607 is not gated.
             if args.correctness_check and target in GATED_TARGETS:
                 assert w is not None and gate_dtype is not None
-                reference = make_rwkv7(w, backend="torch", is_torch_compile=False)
+                ref_cls = make_rwkv7(rwkv_device, backend="torch")
+                reference = ref_cls(w, is_torch_compile=False)  # type: ignore[call-arg]
 
             for B, T in parsed_cases:
                 try:
@@ -494,7 +501,7 @@ def main():
         default="faster3a_2607,tl-fp16,pure-torch",
         help=(
             "Comma/space separated targets: faster3a_2607, tl-fp16, tl-bf16, "
-            "tl-mx450, pure-torch, fla, FlashRWKV. Defaults to the implemented "
+            "tl-tuned, pure-torch, fla, FlashRWKV. Defaults to the implemented "
             "targets."
         ),
     )
