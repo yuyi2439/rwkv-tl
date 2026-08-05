@@ -10,8 +10,8 @@
   need to know which one was selected.
 
 ``make_rwkv7`` selects a model class by backend / device; on CUDA it returns a
-class pre-wrapped in ``CUDAGraph`` (unless ``use_graph=False`` or the eager
-``torch`` reference), so decode and per-T prefill run from captured graphs.
+class pre-wrapped in ``CUDAGraph`` (unless ``use_graph=False``), so decode and
+per-T prefill run from captured graphs.
 """
 
 from __future__ import annotations
@@ -39,10 +39,6 @@ __all__ = [
 # kernels are the auto-selected base, at/above it bf16 is the platform default.
 _SM80 = (8, 0)
 
-# Classes that must never be CUDA-Graph wrapped: the eager reference has to
-# stay a true eager path so it can gate the other implementations.
-_GRAPH_OPT_OUT = frozenset({RWKV7Torch})
-
 
 def make_rwkv7(
     device: torch.device,
@@ -63,12 +59,12 @@ def make_rwkv7(
             - ``"tuned"``: per-device variant selected by CUDA device name;
                 unknown CUDA devices fall back to ``RWKV7FP16``, non-CUDA
                 devices to ``"auto"``.
-            - ``"torch"``: ``RWKV7Torch`` (pure PyTorch reference, never
-                graph-wrapped).
+            - ``"torch"``: ``RWKV7Torch`` (pure PyTorch reference). Like every
+                CUDA class it honors ``use_graph``.
         use_graph: Wrap the returned class in a ``CUDAGraph`` so ``decode`` and
             per-T ``prefill`` run from captured CUDA Graphs. Applies to every
-            CUDA class except ``RWKV7Torch`` (which must stay a true eager
-            reference for correctness gating).
+            CUDA class; pass ``use_graph=False`` to keep a class truly eager
+            (e.g. the torch reference used for correctness gating).
         device_name: CUDA device name for the ``"tuned"`` backend; when omitted
             it is auto-detected from ``device``. Pass e.g. ``"mx450"`` to force
             a specific tuned variant on any machine.
@@ -77,7 +73,7 @@ def make_rwkv7(
         A class implementing the ``RWKV7Model`` interface.
     """
     cls = _resolve_cls(device, backend=backend, device_name=device_name)
-    if use_graph and device.type == "cuda" and cls not in _GRAPH_OPT_OUT:
+    if use_graph and device.type == "cuda":
         return make_graph_cls(cls)
     return cls
 

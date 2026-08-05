@@ -8,7 +8,8 @@ functions) so every target goes through the same entry point:
 - tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
 - tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
 - tl-tuned: per-device tuned variant (``backend="tuned"``).
-- pure-torch: pure PyTorch baseline (``backend="torch"``).
+- pure-torch: pure PyTorch baseline (``backend="torch"``; graph-wrapped on
+  CUDA by default, eager reference available via ``use_graph=False``).
 
 Reserved but not yet implemented targets:
 - fla
@@ -419,7 +420,7 @@ def run_benchmark(args):
                     # The tuned selector is device-name based; surface which
                     # variant was picked so a run is reproducible on paper.
                     print(
-                        f"MODEL label={target} class={type(model_cls).__name__}",
+                        f"MODEL label={target} class={model_cls.__name__}",
                         flush=True,
                     )
             elif target in {"fla", "FlashRWKV"}:
@@ -435,7 +436,9 @@ def run_benchmark(args):
             # faster3a_2607 is not gated.
             if args.correctness_check and target in GATED_TARGETS:
                 assert w is not None and gate_dtype is not None
-                ref_cls = make_rwkv7(rwkv_device, backend="torch")
+                ref_cls = make_rwkv7(
+                    rwkv_device, backend="torch", use_graph=False
+                )
                 reference = ref_cls(w, is_torch_compile=False)  # type: ignore[call-arg]
 
             for B, T in parsed_cases:

@@ -4,6 +4,10 @@ A readable, kernel-free baseline that mirrors the ``decode``/``prefill``/
 ``forward``/``generate`` API of ``demo.rwkv7_fp16.RWKV7FP16``. Slower than the
 tilelang path but serves as the numerical reference for correctness tests
 and benchmarking.
+
+State tensors are updated in place (``copy_``), never rebound, so the class is
+CUDA-Graph capturable: ``make_rwkv7(..., backend="torch", use_graph=True)``
+wraps it like any other CUDA model.
 """
 
 from __future__ import annotations
@@ -105,7 +109,8 @@ def time_mix(
     r, w, k, v, kk, a = [z.reshape(H, N) for z in (r, w, k, v, kk, a)]
     kk = _l2_rwkv(kk)
 
-    y, state["rnn"] = _dplr_rwkv(state["rnn"], r, w, k, v, kk, -kk * a)
+    y, rnn_new = _dplr_rwkv(state["rnn"], r, w, k, v, kk, -kk * a)
+    state["rnn"].copy_(rnn_new)
     y = _group_norm(y, weight.ln_x.w, weight.ln_x.b, 64e-5)
     y += (torch.sum(r * k * weight.r_k, dim=1, keepdim=True) * v).reshape(-1)
     g = torch.mv(
@@ -189,7 +194,7 @@ class RWKV7Torch(RWKV7Model):
             xv = _lerp(x, prev, att.x_v)
             xa = _lerp(x, prev, att.x_a)
             xg = _lerp(x, prev, att.x_g)
-            state["x"] = x[-1]
+            state["x"].copy_(x[-1])
 
             r, k, v = torch.bmm(
                 torch.stack([xr, xk, xv], 0), att.rkvWt
@@ -220,9 +225,10 @@ class RWKV7Torch(RWKV7Model):
 
             y = torch.empty(T_len, self.H, self.N, dtype=x0.dtype, device=x0.device)
             for t in range(T_len):
-                y_t, state["rnn"] = _dplr_rwkv(
+                y_t, rnn_new = _dplr_rwkv(
                     state["rnn"], r[t], w[t], k[t], v[t], kk[t], neg_kk_a[t]
                 )
+                state["rnn"].copy_(rnn_new)
                 y[t] = y_t
 
             y = F.group_norm(
@@ -245,7 +251,7 @@ class RWKV7Torch(RWKV7Model):
             x_ln = ffn.ln_pre(x0)
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
             x = _lerp(x_ln, prev, ffn.x_k)
-            state["x"] = x_ln[-1]
+            state["x"].copy_(x_ln[-1])
             return x0 + _relusq(x @ ffn.kWt) @ ffn.vWt
 
         return layer

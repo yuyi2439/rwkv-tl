@@ -49,8 +49,9 @@ Key points:
   ~1.5-2x and pure-torch by ~7-60x.
 - T=128 prefill stays eager (T>64 graph cap) and trails faster3a_2607
   (~20 vs 7.8 ms) -- large-T prefill is the common tilelang-path bottleneck.
-- Every CUDA model is graph-wrapped by default (`make_rwkv7(use_graph=True)`);
-  `backend="torch"` stays a true eager reference for gating.
+- Every CUDA model -- including `backend="torch"` -- is graph-wrapped by
+  default (`make_rwkv7(use_graph=True)`); pass `use_graph=False` for a truly
+  eager class (e.g. the torch reference used for correctness gating).
 - Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.

@@ -90,9 +90,10 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   `RWKV7BF16` otherwise -- including sm >= 80 and non-CUDA devices), `"fp16"`,
   `"bf16"`, `"mx450"`, `"rtx3060"`, `"tuned"`, `"torch"`. `use_graph=True`
   (default) makes `make_rwkv7` return a class pre-wrapped in `CUDAGraph` for
-  the tuned backends (`"tuned"`/`"mx450"`/`"rtx3060"` on CUDA), so `decode`
-  and per-T `prefill` run from captured CUDA Graphs. `"torch"` is never
-  wrapped (stays a true eager reference).
+  every CUDA backend, so `decode` and per-T `prefill` run from captured CUDA
+  Graphs. `RWKV7Torch` updates its state in place, so it captures too; pass
+  `use_graph=False` to keep a truly eager class (e.g. the torch reference
+  used for correctness gating).
 - **`demo.cuda_graph.CUDAGraph` is THE CUDA-Graph mechanism** (merges the old
   `demo/graph_decode.py` `GraphDecoder` + `demo/prefill_graph.py` `PrefillGraph`).
   Wrap any `RWKV7Model` instance: `model = CUDAGraph(RWKV7MX450(w))`, or via
