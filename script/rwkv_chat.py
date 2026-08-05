@@ -60,17 +60,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # auto: pick the implementation matching the current GPU (MX450 variant on
-    # sm_75, tilelang fp16 elsewhere), so the same chat works on any device.
+    # tuned (default): device-name-matched CUDA-Graph variant (MX450/RTX3060),
+    # falling back to auto (fp16 on sm<80, bf16 otherwise), so the same chat
+    # works on any device.
     w = RWKV7Weight(args.checkpoint)
-    model_cls = make_rwkv7(w.emb.device)
+    model_cls = make_rwkv7(w.device)
     model = model_cls(w)
     tokenizer = Tokenizer(args.vocab)
     S = State(
         model.L,
         model.C,
         64,
-        device=model.emb.device,
+        device=model.w.device,
     )
 
     print("Simple RWKV chat. Empty input exits.")
@@ -89,7 +90,6 @@ def main():
             top_k=args.top_k,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
-            stop=[tokenizer.encode("\n\nUser:")],
         )
         response = tokenizer.decode(response_tokens)
 

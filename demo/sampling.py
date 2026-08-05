@@ -1,6 +1,6 @@
 """Token sampling helpers for autoregressive generation.
 
-Shared by ``rwkv_tl.RWKV7.generate`` and the pure_torch reference, so both
+Shared by ``RWKV7Model.generate`` and the pure_torch reference, so both
 shells sample identically.
 """
 
@@ -22,7 +22,8 @@ def sample_logits(
     """Sample a token id from logits.
 
     Args:
-        logits: Model logits, [V].
+        logits: Model logits, 1-D ``[V]`` or 2-D ``[B, V]`` (one row per
+            sequence). All filtering happens along the last dimension.
         temperature: Softmax temperature. None or <= 0 means greedy argmax.
         top_k: Restrict sampling to the top-k logits (0 = no restriction).
         top_p: Nucleus sampling threshold (1.0 = no restriction). Only the
@@ -32,58 +33,38 @@ def sample_logits(
             in ``seen``, divide its logit by the penalty when the logit > 0 and
             multiply when < 0 (1.0 = no penalty).
         seen: Previously generated token ids (penalized if repetition_penalty
-            is set).
+            is set). Indexes the last (vocab) dimension.
 
     Returns:
-        Sampled token id.
+        Sampled token ids as a tensor with ``ndim = logits.ndim - 1``: a 0-dim
+        scalar for ``[V]`` logits, a 1-D ``[B]`` tensor for ``[B, V]`` logits.
     """
     l = logits.float()
 
     if repetition_penalty != 1.0 and seen is not None:
-        lv = l[seen]
+        lv = l[..., seen]
         lv = torch.where(lv > 0, lv / repetition_penalty, lv * repetition_penalty)
-        l[seen] = lv
+        l[..., seen] = lv
 
     if temperature is None or temperature <= 0:
-        return l.argmax()
+        return l.argmax(dim=-1)
 
     l = l / temperature
 
     if top_k > 0:
-        k = min(top_k, l.numel())
-        if k < l.numel():
-            cutoff = torch.topk(l, k).values[-1]
+        k = min(top_k, l.shape[-1])
+        if k < l.shape[-1]:
+            cutoff = torch.topk(l, k, dim=-1).values[..., -1:]
             l = torch.where(l >= cutoff, l, torch.full_like(l, float("-inf")))
 
     if top_p < 1.0:
         probs = torch.softmax(l, dim=-1)
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+        sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
         cum = torch.cumsum(sorted_probs, dim=-1)
         drop = cum - sorted_probs > top_p
-        l[sorted_idx[drop]] = float("-inf")
+        kept = torch.gather(l, -1, sorted_idx)
+        vals = torch.where(drop, torch.full_like(kept, float("-inf")), kept)
+        l = l.scatter(-1, sorted_idx, vals)
 
     probs = torch.softmax(l, dim=-1)
-    return torch.multinomial(probs, 1).squeeze(0)
-
-
-def apply_stop(out: list[int], stop: list[list[int]] | None) -> bool:
-    """If the generated tail ends with a stop sequence, truncate and stop.
-
-    Checks the generated tokens (``out``) against every sequence in ``stop``.
-    On a match the matched sequence is removed from the end and True is
-    returned so the caller halts generation.
-
-    Args:
-        out: Generated token ids (mutated in place on a match).
-        stop: Stop sequences (list of token-id lists); None/empty disables.
-
-    Returns:
-        True if a stop sequence matched and was truncated.
-    """
-    if not stop:
-        return False
-    for seq in stop:
-        if seq and out[-len(seq) :] == seq:
-            del out[-len(seq) :]
-            return True
-    return False
+    return torch.multinomial(probs, 1).squeeze(-1)

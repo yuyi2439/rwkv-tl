@@ -39,7 +39,7 @@ def fresh_state(model) -> State:
         model.w.L,
         model.w.C,
         64,
-        device=model.emb.device,
+        device=model.w.device,
     )
 
 

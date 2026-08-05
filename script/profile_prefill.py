@@ -30,7 +30,7 @@ if not CKPT:
 
 with torch.device("cuda"):
     w = RWKV7Weight(CKPT)
-    model_cls = make_rwkv7(w.emb.device)
+    model_cls = make_rwkv7(w.device)
     model = model_cls(w)
 
 # warmup
@@ -38,7 +38,7 @@ with torch.device("cuda"):
     S = State(model.w.L, model.w.C, 64, device="cuda")
     for _ in range(3):
         S.reset()
-        model.prefill(torch.as_tensor(TOKENS, device=model.emb.device), S)
+        model.prefill(torch.as_tensor(TOKENS, device=model.w.device), S)
 torch.cuda.synchronize()
 
 # profile
@@ -52,7 +52,7 @@ with (
     record_function("prefill_T32"),
     torch.device("cuda"),
 ):
-    model.prefill(torch.as_tensor(TOKENS, device=model.emb.device), S)
+    model.prefill(torch.as_tensor(TOKENS, device=model.w.device), S)
 
 # Group kernels by name keyword
 from collections import defaultdict

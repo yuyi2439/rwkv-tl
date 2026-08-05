@@ -12,10 +12,12 @@ T-specialized tilelang fp16 m16n8k8 kernel instead (it beats the fp32 cuBLAS
 bmm there -- measured 0.12 vs 0.21ms @ T=8); fp32 cuBLAS stays faster at
 T>=32 (0.42 vs 0.83ms @ T=128).
 
-Decode is CUDA-Graph accelerated by default (``use_graph=True``): a single
-token step is captured once and replayed. The model stays stateless -- the
-graph replays against its own fixed-address shadow state and ``decode`` copies
-the caller's ``State`` in/out around each replay, so any ``State`` works.
+This class is deliberately EAGER: CUDA-Graph acceleration is applied from the
+outside by wrapping an instance with ``demo.cuda_graph.CUDAGraph`` (e.g.
+``CUDAGraph(RWKV7MX450(w))``, or ``make_rwkv7(backend="tuned")`` which returns
+a pre-wrapped class). The batch closures below update ``state["x"]`` in place
+(``copy_``, not rebinding) so that a wrapping ``CUDAGraph`` can capture and
+replay prefill -- rebinding would silently corrupt a replayed graph.
 """
 
 from __future__ import annotations
@@ -24,91 +26,28 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from demo._rwkv7_base import LAYER_NORM, RELUSQ
-from demo.graph_decode import GraphDecoder
-from demo.prefill_graph import PrefillGraph
+from demo._rwkv7_base import RELUSQ
 from demo.rwkv7_fp16 import RWKV7FP16
 from rwkv_tl.kernels import fused_dplr_T, fused_rkv_gemm
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
 
 __all__ = ["RWKV7MX450"]
 
 
-def _copy_state(dst: State, src: State) -> None:
-    """Copy all state tensors from ``src`` into ``dst`` in place."""
-    for ds, ss in zip(dst.tmix, src.tmix):
-        for k in ds:
-            ds[k].copy_(ss[k])
-    for ds, ss in zip(dst.cmix, src.cmix):
-        for k in ds:
-            ds[k].copy_(ss[k])
-
-
 class RWKV7MX450(RWKV7FP16):
-    # Small-T prefill is launch-bound (constant ~2175 launches regardless of T),
-    # so it is CUDA-graphed per exact T up to this cap; larger T runs eager
-    # (launch overhead is amortized there and graph memory scales with T).
-    PREFILL_GRAPH_MAX_T = 64
-
-    def __init__(
-        self,
-        w: RWKV7Weight,
-        *,
-        is_torch_compile: bool = True,
-        use_graph: bool = True,
-    ) -> None:
-        super().__init__(w, is_torch_compile=is_torch_compile)
-        # CUDA Graph single-token decode: the captured graph replays against its
-        # own fixed-address shadow state; decode copies the caller's State
-        # in/out around the replay, so the model stays stateless and any State
-        # works (MX450 is a CUDA-only sm_75 variant, so the graph is default-on).
-        self._graph = GraphDecoder(self) if use_graph else None
-        self._prefill_graphs: dict[int, PrefillGraph] = {}
-
-    def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
-        """Advance one token; CUDA-graph replays when enabled, eager otherwise."""
-        if self._graph is None:
-            return super().decode(token, S)
-
-        g = self._graph
-        _copy_state(g.state, S)
-        logits = g.step(int(token.item()))
-        _copy_state(S, g.state)
-        return logits.clone(), S
-
-    def prefill(self, tokens: Tensor, S: State) -> State:
-        """Batched prefill; CUDA-graph replays per exact T when enabled."""
-        if self._graph is None:
-            return super().prefill(tokens, S)
-        tok = tokens.reshape(-1)
-        T = tok.numel()
-        if T < 2 or T > self.PREFILL_GRAPH_MAX_T:
-            return super().prefill(tok, S)
-        g = self._prefill_graphs.get(T)
-        if g is None:
-            g = PrefillGraph(self, T)
-            self._prefill_graphs[T] = g
-        return g.step(tok, S)
-
     def make_TMIX_batch(self, i: int):
         # Batched TMIX for prefill, GEMMs in fp32 (see module docstring).
         H, N = self.H, self.N
         b = self.w.blocks[i]
         att = b.att
-        rWt = att.receptance_weight.T
-        kWt = att.key_weight.T
-        vWt = att.value_weight.T
-        ln_pre = b.ln_pret
 
-        rWt_stack = torch.stack([rWt, kWt, vWt], dim=0).contiguous().float()
+        # One shared fp32 r/k/v batch from the weight's stacked fp16 form;
+        # .float() casts once at construction (the weight stays fp16).
+        rWt_stack = att.rkvWt.float()
         # Small-T prefill uses the tilelang fp16 m16n8k8 rkv kernel: on Turing it
         # beats the fp32 cuBLAS bmm for T<=16 (measured 0.12 vs 0.21ms @ T=8);
         # fp32 cuBLAS stays faster at T>=32 (0.42 vs 0.83ms @ T=128).
         rWt_stack16 = rWt_stack.half()
-        # .contiguous() matters: a transposed fp32 view is ~2.7x slower in cuBLAS
-        # (measured [128,768]@[768,3072]: 1.52 vs 0.55ms non-contiguous vs contiguous).
-        oWt = att.output_weight.T.contiguous().float()
+        oWt = att.oWt.float()
         w0, w1, w2 = att.w0.reshape(-1), att.w1, att.w2
         a0, a1, a2 = att.a0.reshape(-1), att.a1, att.a2
         v0, v1, v2 = att.v0.reshape(-1), att.v1, att.v2
@@ -132,7 +71,7 @@ class RWKV7MX450(RWKV7FP16):
             x0: Tensor, v_first: Tensor | None, state: dict[str, Tensor]
         ) -> tuple[Tensor, Tensor]:
             T_len = x0.shape[0]
-            x = LAYER_NORM(x0, ln_pre).float()
+            x = att.ln_pre(x0).float()
             # token-shift: prev[t] = x[t-1], prev[0] = state["x"]
             prev = torch.cat([state["x"].unsqueeze(0), x[:-1]], dim=0)
             diff = prev - x
@@ -190,13 +129,12 @@ class RWKV7MX450(RWKV7FP16):
         # Batched CMIX for prefill, GEMMs in fp32 (see module docstring).
         b = self.w.blocks[i]
         ffn = b.ffn
-        ln_pre = b.ln_prec
-        x_k = ffn.x_k.reshape(-1)
-        kWt = ffn.key_weight.T.contiguous().float()
-        vWt = ffn.value_weight.T.contiguous().float()
+        x_k = ffn.x_k
+        kWt = ffn.kWt.float()
+        vWt = ffn.vWt.float()
 
         def layer(x0: Tensor, state: dict[str, Tensor]) -> Tensor:
-            x_ln = LAYER_NORM(x0, ln_pre)
+            x_ln = ffn.ln_pre(x0)
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
             x = x_ln + x_k * (prev - x_ln)
             state["x"].copy_(x_ln[-1])

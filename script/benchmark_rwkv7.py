@@ -7,11 +7,10 @@ functions) so every target goes through the same entry point:
 - faster3a_2607: Albatross CUDA implementation (external module).
 - tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
 - tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
-- tl-mx450: sm_75 variant (``backend="mx450"``, CUDA-Graph decode).
+- tl-tuned: per-device tuned variant (``backend="tuned"``).
 - pure-torch: pure PyTorch baseline (``backend="torch"``).
 
 Reserved but not yet implemented targets:
-- graph_decoder (re-add after testing on other devices)
 - fla
 - FlashRWKV
 
@@ -130,8 +129,8 @@ def make_state(model, batch_size: int | None = None) -> State | list[torch.Tenso
             model.w.L,
             model.w.C,
             64,
-            device=model.emb.device,
-            dtype=model.dtype,
+            device=model.w.device,
+            dtype=model.w.dtype,
         )
     return model.zero_state(batch_size or 1)
 
@@ -416,6 +415,13 @@ def run_benchmark(args):
                 model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
                 gate_dtype = dtype
+                if target == "tl-tuned":
+                    # The tuned selector is device-name based; surface which
+                    # variant was picked so a run is reproducible on paper.
+                    print(
+                        f"MODEL label={target} class={type(model_cls).__name__}",
+                        flush=True,
+                    )
             elif target in {"fla", "FlashRWKV"}:
                 raise NotImplementedError(
                     f"target '{target}' is reserved but not implemented yet"

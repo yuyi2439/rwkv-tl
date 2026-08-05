@@ -5,8 +5,8 @@ RWKV7 inference with TileLang fused CUDA kernels and CUDA Graph. The goal is to 
 - Model: RWKV7-g1d (0.1B and 0.4B variants)
 - Precision: float16 compute with float32 accumulation (DPLR state stays fp32), matching Albatross
 - Paths:
-  - Decode (T=1): fused TMIX/CMIX kernels plus GraphDecoder
-  - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM
+  - Decode (T=1): fused TMIX/CMIX kernels, CUDA-Graph accelerated via `CUDAGraph`
+  - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM; per-T CUDA-Graph replay for T<=64
 
 ## Project layout
 
@@ -28,11 +28,10 @@ uv sync
 ## Benchmark status
 
 The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
-target validation GPU. `tl-rtx3060` is the CUDA-Graph-accelerated fp16 variant
-(`demo.tuned.rwkv7_rtx3060.RWKV7RTX3060`); `tl-fp16` is the eager fp16 base;
-`pure-torch` is the eager PyTorch baseline. The benchmark harness routes
-through the eager methods so a sweep does not recompile a fresh graph per
-token count.
+target validation GPU. `tl-fp16`/`tl-rtx3060` are the fp16 base wrapped with
+`CUDAGraph` (CUDA-Graph decode + per-T prefill graph); `pure-torch` is the
+eager PyTorch baseline. The benchmark harness routes through the eager methods
+so a sweep does not recompile a fresh graph per token count.
 
 | Case | tl-fp16 | tl-rtx3060 | faster3a_2607 | pure-torch |
 |---|---:|---:|---:|---:|
@@ -50,8 +49,8 @@ Key points:
   ~1.5-2x and pure-torch by ~7-60x.
 - T=128 prefill stays eager (T>64 graph cap) and trails faster3a_2607
   (~20 vs 7.8 ms) -- large-T prefill is the common tilelang-path bottleneck.
-- `tl-fp16` (eager, no CUDA Graph) is the slowest project path at small T
-  because launch gaps dominate; the graph is the whole win.
+- Every CUDA model is graph-wrapped by default (`make_rwkv7(use_graph=True)`);
+  `backend="torch"` stays a true eager reference for gating.
 - Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
   fresh graph per prompt length (minutes), so it stays eager. See
   `script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.

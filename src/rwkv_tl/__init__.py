@@ -8,7 +8,6 @@ dtype into ``fp16`` / ``bf16`` bindings over a shared dtype-parameterized
 """
 
 from . import operators  # noqa: F401  (registers torch.library custom ops)
-from .sampling import apply_stop, sample_logits
 from .state import State
 from .weight import LNWeight, RWKV7Weight
 
@@ -16,6 +15,4 @@ __all__ = [
     "LNWeight",
     "RWKV7Weight",
     "State",
-    "apply_stop",
-    "sample_logits",
 ]

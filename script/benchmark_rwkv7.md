@@ -35,7 +35,7 @@ uv run python script/benchmark_rwkv7.py \
 
 注：
 - `--device cpu` 时，faster3a_2607 自动跳过（CUDA-only）。
-- graph_decoder benchmark target 已暂时移除（等测试其他设备后加回）；CUDA Graph decode 现在集成在 tl-mx450 的 decode 路径里。
+- graph_decoder benchmark target 已移除：CUDA Graph 现由 `demo.cuda_graph.CUDAGraph` 通用包装器提供，`tl-mx450`/`tl-rtx3060`/`tl-tuned` 通过 `make_rwkv7(use_graph=True)`（默认）自动叠加 decode + 小 T prefill 的 graph。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
 - 正确性门控**默认关闭**（`--correctness-check` 开启）：每个 case 计时前先把输出与同 dtype 的 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。默认关是为了省显存（参考模型共享 target 权重对象，但多 target 混跑仍可能压 2GB 卡）。
 - **权重按 target 加载/释放**：每个 target 独立 `RWKV7Weight`，跑完即删（`del` + `gc.collect()` + `empty_cache()`），同进程同时只有一份权重在显存。

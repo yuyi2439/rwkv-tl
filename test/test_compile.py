@@ -34,7 +34,7 @@ def test_compile_generate_no_recompile(ckpt_path: str) -> None:
             model.w.L,
             model.w.C,
             64,
-            device=model.emb.device,
+            device=model.w.device,
         )
         # Greedy degenerates into a repeated-token loop on this model
         # (only ~5 distinct ids), so sample with a fixed seed to get a

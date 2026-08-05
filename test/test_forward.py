@@ -32,7 +32,7 @@ def _fresh_state(model, dtype: torch.dtype = torch.float16) -> State:
         model.w.L,
         model.w.C,
         64,
-        device=model.emb.device,
+        device=model.w.device,
         dtype=dtype,
     )
 
@@ -42,7 +42,7 @@ def _run_decode(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Tens
         S = _fresh_state(model, dtype)
         logits = None
         for t in tokens:
-            logits, S = model.decode(torch.as_tensor([t], device=model.emb.device), S)
+            logits, S = model.decode(torch.as_tensor([t], device=model.w.device), S)
     return logits.float().cpu()
 
 
@@ -52,9 +52,9 @@ def _run_prefill(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Ten
         # prefill updates S in place (no logits); single-step the last token
         # to obtain the final logits.
         if len(tokens) > 1:
-            S = model.prefill(torch.as_tensor(tokens[:-1], device=model.emb.device), S)
+            S = model.prefill(torch.as_tensor(tokens[:-1], device=model.w.device), S)
         logits, _ = model.decode(
-            torch.as_tensor([tokens[-1]], device=model.emb.device), S
+            torch.as_tensor([tokens[-1]], device=model.w.device), S
         )
     return logits.float().cpu()
 

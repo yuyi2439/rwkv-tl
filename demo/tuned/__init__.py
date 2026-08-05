@@ -1,27 +1,41 @@
-"""Device-tuned RWKV7 model implementations (CUDA-Graph accelerated)."""
+"""Eager device-tuned RWKV7 model implementations (internal).
+
+The tuned variants are deliberately eager; CUDA-Graph acceleration is applied
+from the outside by ``demo.cuda_graph.CUDAGraph`` (``make_rwkv7(use_graph=True)``
+returns pre-wrapped classes).
+
+The selector is internal: callers pass a CUDA device name (auto-detected by
+``make_rwkv7``, or supplied manually to force a variant) and only ``make_rwkv7``
+consumes the result.
+"""
 
 from __future__ import annotations
-
-import torch
 
 from .._rwkv7_abc import RWKV7Model
 
 __all__ = ["make_tuned_model"]
 
 
-def make_tuned_model(device) -> type[RWKV7Model] | None:
-    """Select a tuned RWKV7 model class by torch-detected CUDA device.
+def make_tuned_model(device_name: str) -> type[RWKV7Model] | None:
+    """Select a tuned RWKV7 model class by CUDA device name.
 
-    Returns a class derived from ``RWKV7Model``, or ``None`` when no tuned
-    variant is applicable.
+    Args:
+        device_name: CUDA device name (e.g. ``torch.cuda.get_device_name()``),
+            or a substring used to force a specific variant.
+
+    Returns:
+        A class derived from ``RWKV7Model``, or ``None`` when no tuned
+        variant is applicable.
     """
-    name = torch.cuda.get_device_name(device).lower().replace(" ", "")
+    name = device_name.lower().replace(" ", "")
     if "mx450" in name:
         from .rwkv7_mx450 import RWKV7MX450
 
         return RWKV7MX450
     if "rtx3060" in name:
-        from .rwkv7_rtx3060 import RWKV7RTX3060
+        # base fp16 is now graph-capturable (copy_ in base); RTX3060 needs no
+        # dedicated tuning any more.
+        from ..rwkv7_fp16 import RWKV7FP16
 
-        return RWKV7RTX3060
+        return RWKV7FP16
     return None
