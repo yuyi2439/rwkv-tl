@@ -28,27 +28,30 @@ uv sync
 ## Benchmark status
 
 The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
-target validation GPU. `tl-fp16`/`tl-rtx3060` are the fp16 base wrapped with
-`CUDAGraph` (CUDA-Graph decode + per-T prefill graph); `pure-torch` is the
-eager PyTorch baseline. The benchmark harness routes through the eager methods
-so a sweep does not recompile a fresh graph per token count.
+target validation GPU. `tl-fp16` is the fp16 base wrapped with `CUDAGraph`
+(CUDA-Graph decode + per-T prefill graph); `tl-bf16` is the bf16 variant;
+`pure-torch` is the PyTorch reference, also graph-wrapped by default. The
+benchmark harness routes through the eager methods so a sweep does not
+recompile a fresh graph per token count.
 
-| Case | tl-fp16 | tl-rtx3060 | faster3a_2607 | pure-torch |
+| Case | tl-fp16 | tl-bf16 | faster3a_2607 | pure-torch |
 |---|---:|---:|---:|---:|
-| 1x1 | 10.08 ms | **2.16 ms** | 4.40 ms | 15.78 ms |
-| 1x8 | 16.46 ms | **2.86 ms** | 6.41 ms | 41.44 ms |
-| 1x32 | 16.55 ms | **3.41 ms** | 8.16 ms | 119.29 ms |
-| 1x64 | 16.60 ms | **4.00 ms** | 7.71 ms | 228.87 ms |
-| 1x128 | 16.64 ms | 17.47 ms | **7.06 ms** | 428.54 ms |
-| 8x8 | 16.29 ms | **3.89 ms** | 7.69 ms | 223.73 ms |
-| 16x16 | 16.60 ms | **17.34 ms** | 8.02 ms | 850.39 ms |
+| 1x1 | **2.35 ms** | 10.58 ms | 5.16 ms | 4.93 ms |
+| 1x8 | **3.09 ms** | 17.20 ms | 6.61 ms | 5.77 ms |
+| 1x32 | **3.37 ms** | 17.52 ms | 8.89 ms | 14.83 ms |
+| 1x64 | **3.88 ms** | 16.60 ms | 8.36 ms | 28.39 ms |
+| 1x128 | **5.38 ms** | 22.17 ms | 7.49 ms | 506.87 ms |
+| 8x8 | **4.06 ms** | 18.44 ms | 7.95 ms | 27.23 ms |
+| 16x16 | **17.15 ms** | 21.23 ms | 8.37 ms | 1084.18 ms |
 
 Key points:
-- The CUDA-Graph-accelerated `tl-rtx3060` (decode + per-T prefill graph for
-  T<=64) leads every implementation at T=1..64, beating faster3a_2607 by
-  ~1.5-2x and pure-torch by ~7-60x.
-- T=128 prefill stays eager (T>64 graph cap) and trails faster3a_2607
-  (~20 vs 7.8 ms) -- large-T prefill is the common tilelang-path bottleneck.
+- The CUDA-Graph-accelerated `tl-fp16` (decode + per-T prefill graph, cap 1024)
+  leads every implementation at T=1..128, beating faster3a_2607 at T=128 too
+  (5.38 vs 7.49 ms). bf16 is slower on sm_86 (fp16 tensor cores win there).
+- The prefill graph is now capped at T=1024 (was 64): the old cap made T=128
+  prefill 17.7ms (eager, launch-bound); graph T=128 is 5.38ms. At T=512 the
+  graph still wins over eager but trails faster3a's fused `wkv_seq` kernels
+  (26.7 vs 12.0 ms) -- large-T kernel fusion is the next target.
 - Every CUDA model -- including `backend="torch"` -- is graph-wrapped by
   default (`make_rwkv7(use_graph=True)`); pass `use_graph=False` for a truly
   eager class (e.g. the torch reference used for correctness gating).

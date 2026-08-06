@@ -59,20 +59,18 @@ def build(DTYPE: str, fused_rkv_gemm: Callable) -> SimpleNamespace:
             xg: T.Tensor((C,), DTYPE),
         ):
             """Fused 6x LERP: out_i = x + w_i * (prev - x)."""
-            for bx in T.thread_binding(  # type: ignore[operator]
-                (C + BLOCK - 1) // BLOCK, "blockIdx.x"
-            ):
-                for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-                    i = bx * BLOCK + tx
-                    if i < C:
-                        xi = x[i]
-                        diff = prev[i] - xi
-                        xr[i] = xi + x_r[i] * diff
-                        xw[i] = xi + x_w[i] * diff
-                        xk[i] = xi + x_k[i] * diff
-                        xv[i] = xi + x_v[i] * diff
-                        xa[i] = xi + x_a[i] * diff
-                        xg[i] = xi + x_g[i] * diff
+            with T.Kernel(T.ceildiv(C, BLOCK), threads=BLOCK) as bx:
+                tx = T.get_thread_binding(0)
+                i = bx * BLOCK + tx
+                if i < C:
+                    xi = x[i]
+                    diff = prev[i] - xi
+                    xr[i] = xi + x_r[i] * diff
+                    xw[i] = xi + x_w[i] * diff
+                    xk[i] = xi + x_k[i] * diff
+                    xv[i] = xi + x_v[i] * diff
+                    xa[i] = xi + x_a[i] * diff
+                    xg[i] = xi + x_g[i] * diff
 
         return _impl
 
@@ -97,21 +95,19 @@ def build(DTYPE: str, fused_rkv_gemm: Callable) -> SimpleNamespace:
             xg: T.Tensor((C,), DTYPE),
         ):
             """Fused 6x LERP + copy x to x_copy buffer (in-place)."""
-            for bx in T.thread_binding(  # type: ignore[operator]
-                (C + BLOCK - 1) // BLOCK, "blockIdx.x"
-            ):
-                for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-                    i = bx * BLOCK + tx
-                    if i < C:
-                        xi = x[i]
-                        diff = prev[i] - xi
-                        x_copy[i] = xi
-                        xr[i] = xi + x_r[i] * diff
-                        xw[i] = xi + x_w[i] * diff
-                        xk[i] = xi + x_k[i] * diff
-                        xv[i] = xi + x_v[i] * diff
-                        xa[i] = xi + x_a[i] * diff
-                        xg[i] = xi + x_g[i] * diff
+            with T.Kernel(T.ceildiv(C, BLOCK), threads=BLOCK) as bx:
+                tx = T.get_thread_binding(0)
+                i = bx * BLOCK + tx
+                if i < C:
+                    xi = x[i]
+                    diff = prev[i] - xi
+                    x_copy[i] = xi
+                    xr[i] = xi + x_r[i] * diff
+                    xw[i] = xi + x_w[i] * diff
+                    xk[i] = xi + x_k[i] * diff
+                    xv[i] = xi + x_v[i] * diff
+                    xa[i] = xi + x_a[i] * diff
+                    xg[i] = xi + x_g[i] * diff
 
         return _impl
 
@@ -126,14 +122,12 @@ def build(DTYPE: str, fused_rkv_gemm: Callable) -> SimpleNamespace:
             out: T.Tensor((C,), DTYPE),
         ):
             """Fused single LERP + copy x to x_copy buffer (in-place)."""
-            for bx in T.thread_binding(  # type: ignore[operator]
-                (C + BLOCK - 1) // BLOCK, "blockIdx.x"
-            ):
-                for tx in T.thread_binding(BLOCK, "threadIdx.x"):
-                    i = bx * BLOCK + tx
-                    if i < C:
-                        x_copy[i] = x[i]
-                        out[i] = x[i] + w[i] * (prev[i] - x[i])
+            with T.Kernel(T.ceildiv(C, BLOCK), threads=BLOCK) as bx:
+                tx = T.get_thread_binding(0)
+                i = bx * BLOCK + tx
+                if i < C:
+                    x_copy[i] = x[i]
+                    out[i] = x[i] + w[i] * (prev[i] - x[i])
 
         return _impl
 

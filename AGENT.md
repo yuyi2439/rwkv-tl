@@ -207,16 +207,27 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   MX450 prefill T=128 by ~40% (70.6 -> 43.4ms). Note the FFN is 4x expanded
   (`[C, C]` weights are actually `[4*C, C]`), so CMIX GEMMs are the prefill
   bottleneck, not the TMIX gate chains.
-- **MX450 prefill is CUDA-Graphed for T<=64.** Small-T prefill launches a
-  constant ~2175 kernels regardless of T (every layer runs the same op
-  sequence), so T=2..8 is launch-bound (~15-20ms of dispatch overhead on
-  MX450). `CUDAGraph` (demo/cuda_graph.py) captures the whole prefill per exact
-  T (no padding -- the DPLR recurrence advances the state per token) and replays
-  it, copying the caller's State in/out like the decode graph, keeping the model
-  stateless. This cut T=4 prefill 33 -> 11.7ms and MX450 now
-  leads or ties the sm75-adapted faster3a at every T. T>64 stays eager (launch
-  overhead amortized, graph memory scales with T). Requires the batch closures
-  to update `state["x"]` in place (`copy_`, not rebind) so addresses stay fixed.
+- **Prefill is CUDA-Graphed per exact T up to `prefill_graph_max_t` (default
+  1024; `None` = no cap).** Small-T prefill is launch-bound (a constant
+  ~2175 kernels regardless of T), and `CUDAGraph` (demo/cuda_graph.py)
+  captures the whole prefill per exact T (no padding -- the DPLR recurrence
+  advances state per token), replaying with a State copy-in/out so the model
+  stays stateless. Graph beats eager at EVERY T, not just small T: measured
+  on RTX 3060 / 0.1B, T=128 graph 5.72 vs eager 23.06ms, T=256 graph 9.39ms,
+  T=1024 graph 32.27ms (all ~4x faster than eager). The old `T<=64` cap was
+  wrong (it made T=128 prefill 17.7ms, slower than faster3a's 7.6ms); it was
+  based on a "graph memory scales with T" worry that did not hold. Requires
+  the batch closures to update `state["x"]` in place (`copy_`, not rebind) so
+  addresses stay fixed.
+- **faster3a_2607's prefill is fast WITHOUT a graph**: every op is a fused
+  CUDA kernel (`wkv_seq` runs the T-dim serial DPLR in one kernel,
+  `wkv_seq_grid2d` switches to a 2D-grid variant for large T via a (B,T)
+  tuning table), and CUDA-Graph is only an extra launch-cost layer on top (it
+  captures the whole `forward` for any BxT with no T cap, `bench_case`).
+  Our eager prefill is a per-layer Python loop over many small kernels, so
+  without the graph it is launch-bound. The graph closes most of that gap;
+  further gains need fusing the eager prefill ops (TMIX/CMIX GEMMs and gates
+  are the launch-heavy part; `fused_dplr_T` is already single-kernel).
 - **Turing sm_75 fp16 GEMM is T-specialized.** `kernels/gemm.py` compiles a
   per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
   MX450) for fp16 on sm_75, because a dynamic-T version cannot reach that
@@ -229,6 +240,23 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   sm_75 MMA atom -> stays on cuBLAS bmm (fast fp32 emulation there); sm_80+
   keeps the dynamic-T kernel. The dtype check in `fused_rkv_gemm` protects
   RWKV7MX450's fp32-input bmm path.
+- **tilelang `T.gemm` is NOT inherently slow on sm_80+ -- a 1D grid is.** The
+  earlier "tilelang GEMM can't beat cuBLAS" claim was wrong: it came from a 1D
+  grid (grid over token rows only) that serializes the whole output width in one
+  block and under-parallelizes the GPU. With a 2D grid (rows x output columns)
+  and a tuned tile, tilelang GEMMs MATCH cuBLAS on the RTX 3060 (0.1B, C=768,
+  fp16): pure `[N,768]x[768,3072]` GEMM parity with cuBLAS; fusing the relu2
+  epilogue into the up-GEMM beats the eager relu+square path ~1.1-2.4x (small N
+  largest); fused up+relu2 + down+residual as two 2D kernels lands ~parity to
+  1.06x vs the eager 5-kernel CMIX. Measured 2026-08-06, tuned tile
+  BM=32/BN=128/BK=32/threads=128/stages=2 (`kernels/neo/cmix.py`).
+- **Full one-kernel FFN fusion (up+relu2+down+residual) is NOT viable, keep it
+  as a reference only.** The hidden `[BM, 4C]` must stay on-chip, forcing a 1D
+  grid (one block per row-group serializes all hidden columns; M>=16 MMA and
+  hidden `[16,4C]` exceed shared memory), and every block re-reads the full
+  weights -- measured ~20x slower than eager at every T. Use the two 2D-grid
+  kernels above instead: each is a plain GEMM + epilogue (relu2 / residual),
+  so the grid tiles both dimensions and weights are read once.
 - **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
 - Default inference is **fp16** (checkpoints are bf16, converted once at
   `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path

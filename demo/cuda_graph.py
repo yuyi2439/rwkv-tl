@@ -64,8 +64,11 @@ class CUDAGraph(RWKV7Model):
     Args:
         model: Any ``RWKV7Model`` instance (its weights must be on CUDA to
             capture; non-CUDA models are passed through eagerly).
-        prefill_graph_max_t: Capture prefill as a graph only for T in
-            ``[2, prefill_graph_max_t]``; larger T runs eager.
+        prefill_graph_max_t: Capture prefill as a graph for T in
+            ``[2, prefill_graph_max_t]`` (or any T when ``None``); larger T
+            runs eager. The default 1024 covers long prompts (a graph is far
+            faster than eager even at T=1024 -- measured 32 vs ~90ms on RTX
+            3060 / 0.1B); ``None`` removes the cap entirely.
         warmup: Warmup iterations per captured graph (initialises cuBLAS
             handles / forces lazy allocations so the graph is self-contained).
     """
@@ -74,7 +77,7 @@ class CUDAGraph(RWKV7Model):
         self,
         model: RWKV7Model,
         *,
-        prefill_graph_max_t: int = 64,
+        prefill_graph_max_t: int | None = 1024,
         warmup: int = 3,
     ) -> None:
         super().__init__(model.w)
@@ -134,7 +137,9 @@ class CUDAGraph(RWKV7Model):
             return self.model.prefill(tokens, S)
         tok = tokens.reshape(-1)
         T = tok.numel()
-        if T < 2 or T > self.prefill_graph_max_t:
+        if T < 2 or (
+            self.prefill_graph_max_t is not None and T > self.prefill_graph_max_t
+        ):
             return self.model.prefill(tok, S)
         if T not in self._graphs:
             self._capture_prefill(T)
@@ -239,7 +244,7 @@ class CUDAGraph(RWKV7Model):
 def wrap_model(
     model: RWKV7Model,
     *,
-    prefill_graph_max_t: int = 64,
+    prefill_graph_max_t: int | None = 1024,
     warmup: int = 3,
 ) -> CUDAGraph:
     """Wrap an existing ``RWKV7Model`` instance with CUDA-Graph acceleration."""
@@ -253,7 +258,7 @@ def wrap_model(
 def make_graph_cls(
     base_cls: type[RWKV7Model],
     *,
-    prefill_graph_max_t: int = 64,
+    prefill_graph_max_t: int | None = 1024,
     warmup: int = 3,
 ) -> type[RWKV7Model]:
     """Build a class that constructs ``base_cls(w, **kwargs)`` and wraps it.
