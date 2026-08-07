@@ -94,21 +94,28 @@ def fused_down_add(C: int, DTYPE: str):
 def fused_cmix(x, kWt, vWt, x0):
     """Fused FFN block: out = x0 + relu2(x @ kWt) @ vWt.
 
-    Pure host glue: pads N to the kernel tile multiple, allocates the hidden
-    and output buffers, runs the two tilelang kernels, slices the padding back
-    off. Target-agnostic -- device/dtype come from the input tensors; the
-    caller decides which target to compile for.
+    Pure host glue. The GEMM kernels tile rows in ``_BM``-row blocks (MMA M
+    floor), so N must be a multiple of ``_BM``: this wrapper zero-pads x and x0
+    up to ``ceil(N / _BM) * _BM`` rows, runs the two tilelang kernels, and
+    slices the padding back off. GEMMs are row-independent, so the zero rows
+    never affect the real outputs. Target-agnostic -- device/dtype come from
+    the input tensors; the caller decides which target to compile for.
     """
     N, C = x.shape
     dty = x.dtype
     dty_s = "float16" if dty == torch.float16 else "bfloat16"
+    # tilelang's T.copy expects contiguous row-major operands; no-op when already
+    # contiguous, guards against slices/transposes from the caller.
+    x = x.contiguous()
+    x0 = x0.contiguous()
+    kWt = kWt.contiguous()
+    vWt = vWt.contiguous()
+    # Rows to pad so N2 is the smallest multiple of _BM >= N (F.pad zero-fills).
     pad = (-N) % _BM
+    N2 = N + pad
     if pad:
         x = F.pad(x, (0, 0, 0, pad))
         x0 = F.pad(x0, (0, 0, 0, pad))
-        N2 = N + pad
-    else:
-        N2 = N
     h = torch.empty((N2, 4 * C), dtype=dty, device=x.device)
     out = torch.empty((N2, C), dtype=dty, device=x.device)
     fused_up_relu2(C, dty_s)(x, kWt, h)

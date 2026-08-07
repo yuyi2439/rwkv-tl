@@ -240,6 +240,22 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   sm_75 MMA atom -> stays on cuBLAS bmm (fast fp32 emulation there); sm_80+
   keeps the dynamic-T kernel. The dtype check in `fused_rkv_gemm` protects
   RWKV7MX450's fp32-input bmm path.
+- **One prim_func can contain MULTIPLE `with T.Kernel` blocks -- each becomes a
+  separate `__global__` kernel, launched in order.** Verified 2026-08-07: two
+  sequential `with T.Kernel` with DIFFERENT grid/thread shapes in one
+  `@T.prim_func` compile and run correctly (generated source has two
+  `__global__` with different `__launch_bounds__`). The earlier "one prim_func =
+  one kernel / full fusion forces a single shared 1D grid" claim was WRONG: an
+  up-GEMM (2D grid over hidden 4C columns) and a down-GEMM (2D grid over C
+  columns) can each keep their own optimal grid as two `with T.Kernel` blocks in
+  ONE prim_func. The `[T,4C]` intermediate between them still round-trips
+  GLOBAL memory (shared/registers do not survive across the two launches), so
+  this is performance-equivalent to two separate jit kernels (measured N=128:
+  0.090 vs 0.092 ms) -- it only packages two launches into one compiled unit /
+  host call. Allocate the intermediate internally with `T.alloc_global`
+  (verified). The original 1D-grid full-fusion kernel was ~20x slow not because
+  "one kernel has one grid" but because that kernel was written with a single
+  1D grid serializing the hidden width; keep it as a reference only.
 - **tilelang `T.gemm` is NOT inherently slow on sm_80+ -- a 1D grid is.** The
   earlier "tilelang GEMM can't beat cuBLAS" claim was wrong: it came from a 1D
   grid (grid over token rows only) that serializes the whole output width in one
@@ -250,13 +266,6 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   largest); fused up+relu2 + down+residual as two 2D kernels lands ~parity to
   1.06x vs the eager 5-kernel CMIX. Measured 2026-08-06, tuned tile
   BM=32/BN=128/BK=32/threads=128/stages=2 (`kernels/neo/cmix.py`).
-- **Full one-kernel FFN fusion (up+relu2+down+residual) is NOT viable, keep it
-  as a reference only.** The hidden `[BM, 4C]` must stay on-chip, forcing a 1D
-  grid (one block per row-group serializes all hidden columns; M>=16 MMA and
-  hidden `[16,4C]` exceed shared memory), and every block re-reads the full
-  weights -- measured ~20x slower than eager at every T. Use the two 2D-grid
-  kernels above instead: each is a plain GEMM + epilogue (relu2 / residual),
-  so the grid tiles both dimensions and weights are read once.
 - **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
 - Default inference is **fp16** (checkpoints are bf16, converted once at
   `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path
