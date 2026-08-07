@@ -13,6 +13,12 @@ launch. Dispatch by device and GPU arch:
   sm_75, so bf16 falls back to torch.bmm -> cuBLAS (fast fp32 emulation).
 - Any compile failure: torch.bmm -> cuBLAS strided batched GEMM.
 
+FFN / output-projection matmuls (``ffn_h``/``ffn_v``/``out_mm``) have the same
+sm_75 story: cuBLAS fp16 there is pathological (``volta_s884gemm_fp16_*``), so
+fp16 routes them through the general tilelang m16n8k8 kernel with
+shape-tuned block configs (autotuned on MX450); bf16 keeps plain matmul
+(cuBLAS fp32 emulation) and Ampere+ keeps cuBLAS fp16.
+
 ``build(DTYPE)`` returns a namespace with the kernels bound to one element type.
 """
 
@@ -168,6 +174,44 @@ def build(DTYPE: str) -> SimpleNamespace:
 
         return _impl
 
+    @tilelang.jit(out_idx=[2])
+    def _try_compile_tl_mm(K: int, N: int, block_n: int, block_k: int, num_stages: int):
+        """General fp16 ``[M, K] @ [K, N]`` tilelang GEMM for Turing sm_75.
+
+        Routes the FFN / output-projection matmuls away from the pathological
+        cuBLAS fp16 kernels on Turing (``volta_s884gemm_fp16_*``), which for the
+        small prefill shapes are ~4-8x slower than fp32 / bf16. The
+        ``(block_n, block_k, num_stages)`` triplets were autotuned on MX450 for
+        the ``[T, C] @ [C, 4C]`` (ffn_h: 64, 32, 3) and ``[T, 4C] @ [4C, C]``
+        (ffn_v: 128, 64, 3) shapes; a naive 16x32x32 config is ~2-4x slower.
+        Compiled once per (K, N) and cached by tilelang.
+        """
+        M_T = T.dynamic("M_T")
+
+        @T.prim_func
+        def _impl(
+            A: T.Tensor((M_T, K), DTYPE),
+            B: T.Tensor((K, N), DTYPE),
+            C_out: T.Tensor((M_T, N), DTYPE),
+        ):
+            """A @ B -> C_out (both operands in ``[K, N]`` B-layout)."""
+            with T.Kernel(
+                T.ceildiv(N, block_n),
+                T.ceildiv(M_T, 16),
+                threads=128,
+            ) as (bx, by):
+                A_shared = T.alloc_shared((16, block_k), DTYPE)
+                B_shared = T.alloc_shared((block_k, block_n), DTYPE)
+                C_local = T.alloc_fragment((16, block_n), "float32")
+                T.clear(C_local)
+                for kk in T.Pipelined(T.ceildiv(K, block_k), num_stages=num_stages):
+                    T.copy(A[by * 16, kk * block_k], A_shared)
+                    T.copy(B[kk * block_k, bx * block_n], B_shared)
+                    T.gemm(A_shared, B_shared, C_local)
+                T.copy(C_local, C_out[by * 16, bx * block_n])
+
+        return _impl
+
     def fused_rkv_gemm(xr: Tensor, xk: Tensor, xv: Tensor, Wb: Tensor) -> Tensor:
         """Fused r/k/v projection GEMM: rkv[b] = X[b] @ Wb[b].
 
@@ -217,4 +261,52 @@ def build(DTYPE: str) -> SimpleNamespace:
         except Exception:  # noqa: BLE001  (compile failure -> bmm fallback)
             return _torch_bmm_rkv(xr, xk, xv, Wb)
 
-    return SimpleNamespace(fused_rkv_gemm=fused_rkv_gemm)
+    def _use_tl_mm() -> bool:
+        """Use the tilelang fp16 GEMM for FFN / output-projection matmuls.
+
+        Only on Turing sm_75 + fp16: cuBLAS fp16 is pathologically slow there
+        (``volta_s884gemm_fp16_*``). Ampere+ cuBLAS fp16 is fine, and bf16
+        cuBLAS already uses the fast fp32 emulation.
+        """
+        if DTYPE != "float16" or not torch.cuda.is_available():
+            return False
+        major, minor = torch.cuda.get_device_capability()
+        return (major, minor) < (8, 0)
+
+    def _tl_mm(a: Tensor, b: Tensor, block_n: int, block_k: int, num_stages: int) -> Tensor:
+        """Run ``a @ b`` through the tilelang fp16 kernel (Turing only)."""
+        kernel = _try_compile_tl_mm(b.shape[0], b.shape[1], block_n, block_k, num_stages)
+        return kernel(a, b)
+
+    def _tl_mm_or_none(
+        a: Tensor, b: Tensor, block_n: int, block_k: int, num_stages: int
+    ) -> Tensor | None:
+        """Turing fp16 tilelang matmul, or ``None`` when unavailable/failed."""
+        if not _use_tl_mm():
+            return None
+        try:
+            return _tl_mm(a, b, block_n, block_k, num_stages)
+        except Exception:  # noqa: BLE001 - compile failure -> fall back to cuBLAS
+            return None
+
+    def ffn_h(x: Tensor, kWt: Tensor) -> Tensor:
+        """FFN first projection: ``h = x @ kWt``, ``[T, C] @ [C, 4C] -> [T, 4C]``."""
+        out = _tl_mm_or_none(x, kWt, 64, 32, 3)
+        return x @ kWt if out is None else out
+
+    def ffn_v(h: Tensor, vWt: Tensor) -> Tensor:
+        """FFN second projection: ``out = h @ vWt``, ``[T, 4C] @ [4C, C] -> [T, C]``."""
+        out = _tl_mm_or_none(h, vWt, 128, 64, 3)
+        return h @ vWt if out is None else out
+
+    def out_mm(y: Tensor, oWt: Tensor) -> Tensor:
+        """Output projection: ``y @ oWt``, ``[T, C] @ [C, C] -> [T, C]``."""
+        out = _tl_mm_or_none(y, oWt, 64, 32, 3)
+        return y @ oWt if out is None else out
+
+    return SimpleNamespace(
+        fused_rkv_gemm=fused_rkv_gemm,
+        ffn_h=ffn_h,
+        ffn_v=ffn_v,
+        out_mm=out_mm,
+    )

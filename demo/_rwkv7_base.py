@@ -240,7 +240,9 @@ class RWKV7Base(RWKV7Model):
             rkrk = (r * k * r_k).sum(dim=2, keepdim=True)
             y_out = (y_flat.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
             g = torch.sigmoid(xg @ g1) @ g2
-            return x0 + (y_out * g) @ att.oWt, v_first
+            # Output projection via tilelang fp16 on sm_75 (cuBLAS fp16 is
+            # pathological there); plain matmul elsewhere.
+            return x0 + self._k.out_mm(y_out * g, att.oWt), v_first
 
         return layer
 
@@ -273,6 +275,9 @@ class RWKV7Base(RWKV7Model):
             prev = torch.cat([state["x"].unsqueeze(0), x_ln[:-1]], dim=0)
             x = x_ln + x_k * (prev - x_ln)
             state["x"].copy_(x_ln[-1])
-            return x0 + RELUSQ(x @ ffn.kWt) @ ffn.vWt
+            # FFN GEMMs via tilelang fp16 on sm_75 (cuBLAS fp16 is pathological
+            # there); plain matmul elsewhere.
+            h = self._k.ffn_h(x, ffn.kWt)
+            return x0 + self._k.ffn_v(RELUSQ(h), ffn.vWt)
 
         return layer

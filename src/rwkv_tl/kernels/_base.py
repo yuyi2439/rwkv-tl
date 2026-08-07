@@ -37,6 +37,9 @@ class Kernels:
     fused_dplr: Callable[..., tuple[Tensor, Tensor]]
     fused_dplr_T: Callable[..., tuple[Tensor, Tensor]]
     fused_rkv_gemm: Callable[..., Tensor]
+    ffn_h: Callable[..., Tensor]
+    ffn_v: Callable[..., Tensor]
+    out_mm: Callable[..., Tensor]
 
 
 def build_kernels(DTYPE: str) -> Kernels:
@@ -70,4 +73,7 @@ def build_kernels(DTYPE: str) -> Kernels:
     k.fused_dplr = d.fused_dplr
     k.fused_dplr_T = d.fused_dplr_T
     k.fused_rkv_gemm = g.fused_rkv_gemm
+    k.ffn_h = g.ffn_h
+    k.ffn_v = g.ffn_v
+    k.out_mm = g.out_mm
     return k
