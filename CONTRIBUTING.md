@@ -29,8 +29,7 @@ covers some pattern this project relies on:
 - `examples/elementwise/` — fusion patterns used by `lerp.py`, `gates.py`.
 - `examples/reduction/` and the `warp_reduce` / `pipeline` examples — needed for
   the DPLR state-reduction and warp-level reductions in `dplr.py`.
-- `examples/dynamic_shape/` — `T.dynamic("C")` / `T.dynamic("H")` parameterization,
-  which all kernels in this project use to support 0.1B and 0.4B models.
+- `examples/dynamic_shape/` — `T.dynamic` for sequence-length parameterization (our `T_LEN` / `M_T`);
 
 Prefer copying a working example structure (block dims, `T.alloc_fragment`
 usage, `T.gemm` invocation, reduction idiom) over inventing a new pattern. When in
@@ -40,8 +39,7 @@ TileLang version more reliably than memory.
 ## Conventions
 
 - Docstrings in `src/rwkv_tl/` are concise English; no `Callers` sections.
-- Kernels are parameterized with `T.dynamic("C")` / `T.dynamic("H")` /
-  `T.dynamic("T_LEN")` — never hard-code model dimensions.
+- H and C are compile-time fixed (closure variables in each `@tilelang.jit` kernel); distinct model sizes compile separate kernels cached by `@tilelang.jit`. Only `T_LEN` / `M_T` use `T.dynamic` for sequence-length flexibility.
 - Weight pre-stacking (e.g. `rWt_stack = torch.stack([rWt, kWt, vWt])`) is done
   outside runtime closures.
 - Fused kernels must come with a unit test under `test/` (e.g. `test_fused_lerp.py`).
