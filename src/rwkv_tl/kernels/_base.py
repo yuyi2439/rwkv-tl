@@ -34,9 +34,14 @@ class Kernels:
     fused_a_kk_k: Callable[..., tuple[Tensor, Tensor, Tensor]]
     fused_l2norm_neg_kk_a: Callable[..., tuple[Tensor, Tensor]]
     fused_gn_rkrk: Callable[..., Tensor]
+    fused_gates: Callable[..., tuple[Tensor, ...]]
+    fused_rank_gemv: Callable[..., Tensor]
     fused_dplr: Callable[..., tuple[Tensor, Tensor]]
     fused_dplr_T: Callable[..., tuple[Tensor, Tensor]]
     fused_rkv_gemm: Callable[..., Tensor]
+    ffn_h: Callable[..., Tensor]
+    ffn_v: Callable[..., Tensor]
+    out_mm: Callable[..., Tensor]
 
 
 def build_kernels(DTYPE: str) -> Kernels:
@@ -67,7 +72,12 @@ def build_kernels(DTYPE: str) -> Kernels:
     k.fused_a_kk_k = ga.fused_a_kk_k
     k.fused_l2norm_neg_kk_a = d.fused_l2norm_neg_kk_a
     k.fused_gn_rkrk = d.fused_gn_rkrk
+    k.fused_gates = ga.fused_gates
+    k.fused_rank_gemv = ga.fused_rank_gemv
     k.fused_dplr = d.fused_dplr
     k.fused_dplr_T = d.fused_dplr_T
     k.fused_rkv_gemm = g.fused_rkv_gemm
+    k.ffn_h = g.ffn_h
+    k.ffn_v = g.ffn_v
+    k.out_mm = g.out_mm
     return k

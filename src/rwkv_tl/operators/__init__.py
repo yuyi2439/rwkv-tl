@@ -194,6 +194,66 @@ def _ensure_ops_registered() -> None:
         _a_kk_k_meta,
     )
 
+    def _gates_cuda(
+        vr, wr, ar, gr, v, v_first, k, v2t, w2t, a2t, g2t, v0, w0, a0, k_k, k_a
+    ) -> tuple[Tensor, ...]:
+        return _kernels_for(v).fused_gates(
+            vr, wr, ar, gr, v, v_first, k, v2t, w2t, a2t, g2t, v0, w0, a0, k_k, k_a
+        )
+
+    def _gates_cpu(
+        vr, wr, ar, gr, v, v_first, k, v2t, w2t, a2t, g2t, v0, w0, a0, k_k, k_a
+    ) -> tuple[Tensor, ...]:
+        import math
+
+        v12 = v2t @ vr
+        w12 = w2t @ torch.tanh(wr)
+        a12 = a2t @ ar
+        g12 = g2t @ torch.sigmoid(gr)
+        v_out = v + torch.sigmoid(v0 + v12) * (v_first - v)
+        w_out = torch.exp(-torch.sigmoid(w0 + w12) / math.sqrt(math.e))
+        a = torch.sigmoid(a0 + a12)
+        return v_out, w_out, a, k * k_k, k + k_a * (k * a - k), g12
+
+    def _gates_meta(v, *_) -> tuple[Tensor, ...]:
+        return tuple(torch.empty_like(v) for _ in range(6))
+
+    _register(
+        "rwkv_tl::fused_gates",
+        "(Tensor vr, Tensor wr, Tensor ar, Tensor gr, Tensor v, Tensor v_first,"
+        " Tensor k, Tensor v2t, Tensor w2t, Tensor a2t, Tensor g2t, Tensor v0,"
+        " Tensor w0, Tensor a0, Tensor k_k, Tensor k_a)"
+        " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+        _gates_cuda,
+        _gates_cpu,
+        _gates_meta,
+    )
+
+    def _rank_gemv_cuda(xv, xw, xa, xg, packed, rv, rw, ra, rg) -> Tensor:
+        return _kernels_for(xv).fused_rank_gemv(xv, xw, xa, xg, packed, rv, rw, ra, rg)
+
+    def _rank_gemv_cpu(xv, xw, xa, xg, packed, rv, rw, ra, rg) -> Tensor:
+        return torch.cat(
+            [
+                packed[:rv] @ xv,
+                packed[rv : rv + rw] @ xw,
+                packed[rv + rw : rv + rw + ra] @ xa,
+                packed[rv + rw + ra :] @ xg,
+            ]
+        )
+
+    def _rank_gemv_meta(xv, xw, xa, xg, packed, *_) -> Tensor:
+        return torch.empty(packed.shape[0], dtype=xv.dtype, device=xv.device)
+
+    _register(
+        "rwkv_tl::fused_rank_gemv",
+        "(Tensor xv, Tensor xw, Tensor xa, Tensor xg, Tensor packed,"
+        " int rv, int rw, int ra, int rg) -> Tensor",
+        _rank_gemv_cuda,
+        _rank_gemv_cpu,
+        _rank_gemv_meta,
+    )
+
     # ---- dplr.py ----
 
     def _l2norm_cuda(kk, a) -> tuple[Tensor, Tensor]:

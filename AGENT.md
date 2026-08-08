@@ -2,6 +2,8 @@
 
 Working notes for agents working on this repository.
 
+**Read [CONTRIBUTING.md](CONTRIBUTING.md) first.** It is the canonical, human-facing project standard (repository layout, kernel-writing reference, conventions). AGENT.md only adds agent-specific operating rules on top of it.
+
 ## Management rules for AGENT.md
 
 This file is the operating guide for future agents. Follow these rules strictly:
@@ -43,7 +45,7 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - Docs and reports under `docs/` and the benchmark report must be written in Chinese. Source code comments/docstrings stay in English.
 - Test results must be saved to a file under `docs/`. Do not leave test outcomes only in chat history.
 - When a new benchmark/test run is completed, record the results in the docs before moving on.
-- Models live in `~/rwkv/model/` (rwkv7-g1d-0.1b, rwkv7-g1d-0.4b, rwkv7-g1i-7.2b). Test the originally-used model first, then the others; the 7.2B may OOM on 12GB.
+- Model checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var / `--project-checkpoint` flag (the run command in `script/benchmark_rwkv7.md` shows the exact names used); the directory is machine-specific. Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the originally-used model first, then the others; watch ou for OOM.
 - `prefill` stays eager: torch.compile of prefill recompiles a fresh graph per distinct prompt length (minutes, GPU idle) for only 1.11-1.43x steady-state. This was validated on RTX 3060 and is a firm decision -- do not re-enable without new evidence.
 - Long benchmarks must run as background processes writing to a log file, then be monitored -- never as a blocking foreground command that looks frozen.
 - If a script appears to hang with idle CPU/GPU, investigate before assuming it failed: torch.compile or first-call kernel compilation can idle the GPU for minutes.
@@ -178,7 +180,7 @@ relative comparisons as reliable, absolute numbers as noisy.
 Use the real scripts in script/ rather than ad-hoc snippets.
 
 ```bash
-cd /home/yuyi2439/rwkv/rwkv-tl
+# From the repo root
 .venv/bin/python -m pytest test/ -v
 .venv/bin/python script/benchmark_rwkv7.py --device cuda ...
 ```

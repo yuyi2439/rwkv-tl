@@ -84,7 +84,6 @@ class CUDAGraph(RWKV7Model):
         self.model = model
         self.prefill_graph_max_t = prefill_graph_max_t
         self._warmup = warmup
-        self._dtype = getattr(model, "dtype", torch.float16)
 
         dev = self.w.device
         self._cuda = torch.cuda.is_available() and dev.type == "cuda"
@@ -162,7 +161,7 @@ class CUDAGraph(RWKV7Model):
         if not self._cuda:
             return
         tok = torch.zeros(1, dtype=torch.long, device="cuda")
-        shadow = State(self.L, self.C, self.N, device="cuda", dtype=self._dtype)
+        shadow = State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
         logits: Tensor | None = None
 
         def run() -> None:
@@ -184,7 +183,7 @@ class CUDAGraph(RWKV7Model):
             self._graphs[T] = None
             return
         buf = torch.zeros(T, dtype=torch.long, device="cuda")
-        shadow = State(self.L, self.C, self.N, device="cuda", dtype=self._dtype)
+        shadow = State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
 
         def run() -> None:
             self.model.prefill(buf, shadow)

@@ -2,8 +2,10 @@
 
 RWKV7 models share a fixed head dimension (N=64); the embedding width C and
 head count H vary by model size (e.g. 0.1B: C=768,H=12; 0.4B: C=1024,H=16).
-Reduction kernels use T.dynamic for H and elementwise kernels for C, so a
-single compilation serves any RWKV7 model.
+H and C are fixed at compile time (captured as closure variables in each
+@tilelang.jit kernel); distinct model sizes compile separate kernels, cached
+automatically by @tilelang.jit. Only T_LEN / M_T use T.dynamic so one kernel
+serves any sequence length.
 """
 
 from __future__ import annotations

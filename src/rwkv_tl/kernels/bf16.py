@@ -21,6 +21,8 @@ fused_lerp6_rkv_copy = kernels.fused_lerp6_rkv_copy
 fused_w_gate = kernels.fused_w_gate
 fused_v_gate = kernels.fused_v_gate
 fused_a_kk_k = kernels.fused_a_kk_k
+fused_gates = kernels.fused_gates
+fused_rank_gemv = kernels.fused_rank_gemv
 fused_l2norm_neg_kk_a = kernels.fused_l2norm_neg_kk_a
 fused_gn_rkrk = kernels.fused_gn_rkrk
 fused_dplr = kernels.fused_dplr
@@ -33,12 +35,14 @@ __all__ = [
     "fused_a_kk_k",
     "fused_dplr",
     "fused_dplr_T",
+    "fused_gates",
     "fused_gn_rkrk",
     "fused_l2norm_neg_kk_a",
     "fused_lerp1_copy",
     "fused_lerp6",
     "fused_lerp6_copy",
     "fused_lerp6_rkv_copy",
+    "fused_rank_gemv",
     "fused_rkv_gemm",
     "fused_v_gate",
     "fused_w_gate",
