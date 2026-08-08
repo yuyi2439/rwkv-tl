@@ -16,7 +16,11 @@
 6 个输入向量（xr/xk/xv/xw/xa/xg）× 1 个打包权重 `[3C+rank_sum, C]`，
 kernel 内用 `T.if_then_else` 按行段（r_end/k_end/v_end/w_end/...）选输入。
 我们现在是 `fused_lerp6_rkv_copy`（RKV）+ 独立低秩 GEMV，decode 多一次 launch。
-合并后 decode 路径少一个 kernel。
+
+**进度（2026-08-08）**：低秩 first-step 已打包为 `fused_rank_gemv`
+（`[v1t;w1t;a1t;g1t] @ [xv;xw;xa;xg]` 单 kernel，替换 4 个 cuBLAS fp16 GEMV，
+Turing 上它们病态慢）；RKV 三个 GEMV 本身仍走 `fused_rkv_gemm`（T=1 特化 kernel），
+未并入。decode eager GPU 实测 ~1.08x（0.4B/MX450）。
 
 ## #6 T=1 专精 WKV
 
@@ -34,7 +38,10 @@ decode 场景 launch 敏感，合并可省一次 launch + 一次中间写回。
 
 官方 `post_state` 一个 kernel 完成：3 个 `tvm_thread_allreduce`（sum/square_sum/rkv_sum）
 + GroupNorm affine + RKV 残差 + gate 终化。我们现在是 `fused_gn_rkrk` + 后续 torch 算子。
-合并可省多次中间写回和 launch。
+
+**进度（2026-08-08）**：低秩 gate 的 rank-out second-step + 激活 + v/w/a gate 数学已融合为
+`fused_gates` 单 kernel（原 4 matmul + 2 激活 + 3 gate op → 1，实测快 ~5.3x）。
+GroupNorm + RKV 残差 + oWt 部分尚未融合。
 
 ## #9 手写 GEMV（decode 路径，不走 TensorCore）
 

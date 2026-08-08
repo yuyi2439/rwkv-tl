@@ -101,33 +101,40 @@ class RWKV7Base(RWKV7Model):
         H, N = self.H, self.N
         b = self.w.blocks[i]
         att = b.att
-        w0, w2 = att.w0.reshape(-1), att.w2
-        a0, a2 = att.a0.reshape(-1), att.a2
-        v0, v2 = att.v0.reshape(-1), att.v2
-        g2 = att.g2
+        v0 = att.v0.reshape(-1)
+        w0 = att.w0.reshape(-1)
+        a0 = att.a0.reshape(-1)
         k_k, k_a, r_k = att.k_k.reshape(-1), att.k_a.reshape(-1), att.r_k
 
         _fused_lerp6_rkv_copy: Callable[..., tuple[Tensor, ...]]
-        _akk: Callable[..., tuple[Tensor, Tensor, Tensor]]
         _l2kk: Callable[..., tuple[Tensor, Tensor]]
-        _vgate: Callable[..., Tensor]
-        _wgate: Callable[..., Tensor]
         _gn: Callable[..., Tensor]
+        _fgates: Callable[..., tuple[Tensor, ...]]
+        _frank: Callable[..., Tensor]
         if use_custom_ops:
             _fused_lerp6_rkv_copy = torch.ops.rwkv_tl.fused_lerp6_rkv_copy
-            _vgate = torch.ops.rwkv_tl.fused_v_gate
-            _wgate = torch.ops.rwkv_tl.fused_w_gate
-            _akk = torch.ops.rwkv_tl.fused_a_kk_k
             _l2kk = torch.ops.rwkv_tl.fused_l2norm_neg_kk_a
             _gn = torch.ops.rwkv_tl.fused_gn_rkrk
+            _fgates = torch.ops.rwkv_tl.fused_gates
+            _frank = torch.ops.rwkv_tl.fused_rank_gemv
         else:
             ks = self._k
             _fused_lerp6_rkv_copy = ks.fused_lerp6_rkv_copy
-            _vgate = ks.fused_v_gate
-            _wgate = ks.fused_w_gate
-            _akk = ks.fused_a_kk_k
             _l2kk = ks.fused_l2norm_neg_kk_a
             _gn = ks.fused_gn_rkrk
+            _fgates = ks.fused_gates
+            _frank = ks.fused_rank_gemv
+
+        # Rank weights transposed to [C, R] for the fused rank-out steps, and
+        # packed [v1t; w1t; a1t; g1t] for the fused first-step GEMVs (RWKV7
+        # checkpoints use distinct per-gate ranks).
+        v2t = att.v2.T.contiguous()
+        w2t = att.w2.T.contiguous()
+        a2t = att.a2.T.contiguous()
+        g2t = att.g2.T.contiguous()
+        packed_rank = torch.cat([att.v1t, att.w1t, att.a1t, att.g1t], dim=0)
+        rv, rw, ra = att.v1t.shape[0], att.w1t.shape[0], att.a1t.shape[0]
+        rg = att.g1t.shape[0]
 
         def _dplr(
             rnn: Tensor,
@@ -163,18 +170,38 @@ class RWKV7Base(RWKV7Model):
                 att.rkvWt,
             )
 
+            # Fused low-rank gates: packed first-step GEMVs + rank-out second
+            # steps + v/w/a gate math (replaces 4 cuBLAS GEMVs + 4 rank matmuls
+            # + activations + 3 gate ops with 2 kernels).
+            rank = _frank(xv, xw, xa, xg, packed_rank, rv, rw, ra, rg)
             if v_first is None:
+                vf = v
                 v_first = v
             else:
-                v = _vgate(v, v_first, v0, torch.mv(att.v1t, xv) @ v2)
-            w = _wgate(torch.tanh(torch.mv(att.w1t, xw)) @ w2, w0)
-            a, kk, k = _akk(a0, torch.mv(att.a1t, xa) @ a2, k, k_k, k_a)
+                vf = v_first
+            v, w, a, kk, k, g = _fgates(
+                rank[:rv],
+                rank[rv : rv + rw],
+                rank[rv + rw : rv + rw + ra],
+                rank[rv + rw + ra :],
+                v,
+                vf,
+                k,
+                v2t,
+                w2t,
+                a2t,
+                g2t,
+                v0,
+                w0,
+                a0,
+                k_k,
+                k_a,
+            )
             r, w, k, v, kk, a = [z.reshape(H, N) for z in (r, w, k, v, kk, a)]
             kk_norm, B = _l2kk(kk, a)
             y = _dplr(state["rnn"], r, w, k, v, kk_norm, B)
             # state["rnn"] is updated in-place by _dplr; no copy needed.
             y = _gn(y, r, k, v, r_k, att.ln_x.w, att.ln_x.b)
-            g = torch.sigmoid(torch.mv(att.g1t, xg)) @ g2
             assert v_first is not None
             return torch.add(x0, (y * g) @ att.oWt), v_first
 
