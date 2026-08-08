@@ -6,20 +6,13 @@ Working notes for agents working on this repository.
 
 ## Management rules for AGENT.md
 
-This file is the operating guide for future agents. Follow these rules strictly:
+This file is the operating guide for future agents. Follow these rules strictly.
+(Doc-writing style rules -- what to write, what to skip, conventions -- live in
+the `docs-writer` skill; read it before updating this file.)
 
-- Keep it concise and practical. Prefer short bullets over long prose.
-- Keep the content in English unless a specific repository report is intentionally written in Chinese.
 - Update it when a new constraint, bug, environment limitation, or workflow rule is discovered.
 - Do not leave important findings only in chat history; record them here when they affect future work.
-- **Documenting project standards is itself a project standard.** Whenever a
-  decision establishes a lasting constraint or convention (package layout,
-  interface contracts, device/dtype strategy, workflow rules), write it down
-  here in the same session, before moving on -- future agents follow this
-  file, not chat history. "I'll remember" is not an acceptable substitute.
-- Keep this file focused on actionable guidance. Avoid personal notes, speculation, or long retrospective writing.
 - When a new benchmark or experiment note is added, make sure the relevant link and summary are also reflected here.
-- Update this file when a new constraint, bug, or performance path is discovered. Keep it concise and actionable.
 - **After a large external/pulled refactor, verify the code against this file's claims line-by-line before trusting the commit message.** Code behavior and AGENT.md/README descriptions can silently diverge in the same commit (e.g. `make_rwkv7` `"auto"` mapping changed while AGENT.md still described the old one). Diff the actual branches, not the narrative.
 - **Before cross-linking per-GPU docs, confirm the machines actually match.** A claim like "see validation_rtx3060.md (same machine)" was wrong -- MX450 (laptop, 2GB) and RTX 3060 (desktop, 12GB) are different machines. Verify hardware before asserting a shared test record.
 
@@ -53,7 +46,6 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - **Never run git write/state-changing operations on your own** (no `git add`, `git commit`, `git reset`, `git restore`, `git rm`, etc.). Reading state via git (`git status`, `git diff`, `git log`, `git show`, `git fetch`) is always allowed. The ONLY state-changing git operation permitted without approval is renaming/moving an already-tracked file (`git mv`). Permission for any other git write (commit/push/amend) is ALWAYS temporary and scoped to that single action; each commit/push needs its own explicit approval. When in doubt, ask.
 - **Report incompatibilities; do not fix design choices on your own.** When you hit an incompatibility in user-authored code (dtype/API mismatches, a crash you can repro), STOP and tell the user directly with a repro, instead of silently changing their design (e.g. rewriting `out` dtype or adding conversions). Fixing genuine bugs (undefined behavior, crashes) is fine, but prefer flagging + suggesting the one-line fix and let the user decide. This rule came from the `generate` `out`-dtype episode.
 - **Ask before design decisions.** Before proposing/implementing an architecture change (new params, new weight-storage schemes, refactors touching `weight.py` layout), present the plan and ask the user to confirm -- they have strong opinions about naming and where logic lives (e.g. "no computation-time terms like `gemm` in `weight.py`", fp32 handled in the model class not the weight). Confirm scope + naming before writing code.
-- **Distill reusable lessons into AGENT.md; do not keep a running "mistakes" log.** An already-fixed code bug is not worth recording -- it will not recur, and a fresh diagnosis is fast. Only record a mistake when it teaches a reusable lesson (a workflow rule, an API pitfall, a doc-accuracy check, real friction) and write that lesson into the relevant AGENT.md section in the same session.
 
 ## Project structure and standards
 
@@ -77,13 +69,12 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   re-exports the fp16 bindings by default. Add a new kernel in its function
   file and expose it through BOTH bindings, never one dtype file only.
   Custom ops (`operators`) route by input tensor dtype via `_kernels_for`.
-- **Tilelang closure-dtype gotcha.** `kernels/{gemm,lerp,gates,dplr}.py`
-  deliberately have NO `from __future__ import annotations`: tilelang's eager
-  builder evaluates the annotation expressions, and a stringified annotation
-  only has module globals + direct nonlocals available, so a closure `DTYPE`
-  param fails with `NameError`. The pre-dtype-split files used literal
-  `"float16"`/`"bfloat16"` strings and could keep the import; the `build(DTYPE)`
-  files cannot.
+- **Tilelang DSL files are a Python project standard: no `from __future__ import
+  annotations`.** tilelang's eager builder evaluates annotation expressions at
+  build time, and a stringified annotation only resolves module globals +
+  direct nonlocals, so a closure `DTYPE`/`C` param fails with `NameError`. The
+  pre-dtype-split files used literal `"float16"`/`"bfloat16"` strings and could
+  keep the import; `build(DTYPE)` files cannot.
 - **Dtype plumbing.** `RWKV7Weight(path, dtype=...)` controls weight precision
   (default `torch.float16`, converts the bf16 checkpoint once at load; pass
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
@@ -156,6 +147,15 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 - Keep new docstrings in src/rwkv_tl short and in English.
 - Do not create extra files unless they are clearly necessary.
 
+## Skills
+
+Project-guide and TileLang-writing knowledge lives in skills under
+`.agent/skill/`, not in this file. Before writing/editing a TileLang kernel,
+read `tilelang-writer`; before updating AGENT.md / adding a skill, read
+`docs-writer` (placement rules, what not to write, skill conventions).
+Apply the skill; do not re-derive or re-document what it already covers. Add
+new hard-won TileLang findings to the skill, not to AGENT.md.
+
 ## Hardware note
 
 Validation completed on an RTX 3060 (sm_86, 12GB). MX450 (sm_75, 2GB) is now an
@@ -193,8 +193,6 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.
 - DPLR A term must be the L2-normalized key (kk/||kk||), not raw kk. Passing raw kk silently corrupts the state update and destabilizes the recurrence (decode/prefill diverged ~14 in logits and argmax flipped). `fused_l2norm_neg_kk_a` returns `(kk_norm, B)` for this reason.
-- `T.Kernel` defaults to 128 threads; reduce kernels (l2norm/dplr/gn_rkrk) only need one logical warp. The extra warps run `__shfl_xor_sync(0xffffffff, ...)` while sitting on the `threadIdx.x < 32` guard's off-path, which is UB and produces rare non-deterministic results that amplify through the recurrence. Use `threads=WARP` (defined in `_common.py`, 32 on both NVIDIA and AMD) for warp-reduce kernels.
-- AMD note: tilelang's `warp_reduce_sum` keeps 32-lane logical-warp semantics on HIP (CDNA wave64 and RDNA wave32) -- see `src/tl_templates/hip/reduce.h`. Do NOT set WARP to the AMD hardware wavefront (64): the reduce would then cover only lanes 0-31 and silently drop half the reduction. `SERIAL = HEAD_DIM // WARP` stays 2 on every backend.
 - `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
 - Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
 - **Non-contiguous cuBLAS operands are ~2.7x slower on Turing.** A transposed
@@ -242,32 +240,6 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   sm_75 MMA atom -> stays on cuBLAS bmm (fast fp32 emulation there); sm_80+
   keeps the dynamic-T kernel. The dtype check in `fused_rkv_gemm` protects
   RWKV7MX450's fp32-input bmm path.
-- **One prim_func can contain MULTIPLE `with T.Kernel` blocks -- each becomes a
-  separate `__global__` kernel, launched in order.** Verified 2026-08-07: two
-  sequential `with T.Kernel` with DIFFERENT grid/thread shapes in one
-  `@T.prim_func` compile and run correctly (generated source has two
-  `__global__` with different `__launch_bounds__`). The earlier "one prim_func =
-  one kernel / full fusion forces a single shared 1D grid" claim was WRONG: an
-  up-GEMM (2D grid over hidden 4C columns) and a down-GEMM (2D grid over C
-  columns) can each keep their own optimal grid as two `with T.Kernel` blocks in
-  ONE prim_func. The `[T,4C]` intermediate between them still round-trips
-  GLOBAL memory (shared/registers do not survive across the two launches), so
-  this is performance-equivalent to two separate jit kernels (measured N=128:
-  0.090 vs 0.092 ms) -- it only packages two launches into one compiled unit /
-  host call. Allocate the intermediate internally with `T.alloc_global`
-  (verified). The original 1D-grid full-fusion kernel was ~20x slow not because
-  "one kernel has one grid" but because that kernel was written with a single
-  1D grid serializing the hidden width; keep it as a reference only.
-- **tilelang `T.gemm` is NOT inherently slow on sm_80+ -- a 1D grid is.** The
-  earlier "tilelang GEMM can't beat cuBLAS" claim was wrong: it came from a 1D
-  grid (grid over token rows only) that serializes the whole output width in one
-  block and under-parallelizes the GPU. With a 2D grid (rows x output columns)
-  and a tuned tile, tilelang GEMMs MATCH cuBLAS on the RTX 3060 (0.1B, C=768,
-  fp16): pure `[N,768]x[768,3072]` GEMM parity with cuBLAS; fusing the relu2
-  epilogue into the up-GEMM beats the eager relu+square path ~1.1-2.4x (small N
-  largest); fused up+relu2 + down+residual as two 2D kernels lands ~parity to
-  1.06x vs the eager 5-kernel CMIX. Measured 2026-08-06, tuned tile
-  BM=32/BN=128/BK=32/threads=128/stages=2 (`kernels/neo/cmix.py`).
 - **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
 - Default inference is **fp16** (checkpoints are bf16, converted once at
   `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path
@@ -275,9 +247,9 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   checkpoint dtype and is a reference/experimental variant. The compile
   decision is purely `is_torch_compile`.
 - `RWKV7Weight(model_path, device=None)` loads directly to the target device via `torch.load(..., map_location=device)` -- the repo checkpoints are saved on cuda, so without `device` the tensors land on cuda regardless of context. The benchmark loads ONE fresh `RWKV7Weight` per target and frees it (`del` + `gc.collect()` + `empty_cache()`) before the next target, so only one weight copy is resident at a time (MX450 has 2GB VRAM); the correctness reference shares the target's weight object.
-- Kernels are compiled PER-MODEL with static H/C (model constants baked at compile time; only T_LEN stays dynamic): each kernel file exposes `@functools.cache` factories (`_dplr_kernel(H)`, `_lerp6_kernel(C)`, ...) and the wrappers dispatch by input shape. Only compile-time model constants go static; per-call sizes (token count) stay dynamic. Caveat: a factory param used ONLY in a type annotation (not the kernel body) is not captured by tilelang's `get_func_nonlocals` and causes `NameError` -- reference it in the body too (e.g. `H * N` in annotations is fine since H is used in the body).
+- Kernels are compiled PER-MODEL with static H/C (model constants baked at compile time; only T_LEN stays dynamic): each kernel file exposes `@functools.cache` factories (`_dplr_kernel(H)`, `_lerp6_kernel(C)`, ...) and the wrappers dispatch by input shape. Only compile-time model constants go static; per-call sizes (token count) stay dynamic.
 - Compute is **fp16 IO + fp32 accumulation**, DPLR state is **fp32** (matching Albatross): RNN state `[H,N,N]` is fp32 (not fp16-rounded each step), IO (r/w/k/v) stays fp16. Weights are converted bf16->fp16 once at `RWKV7Weight` load. `_dplr_kernel`/`_dplr_T_kernel` read/write fp32 S; pure_torch reference matches.
-- Prefill DPLR is a **single-shot kernel** (`fused_dplr_T` / `_dplr_T_kernel`): one launch processes the whole [T,H,N] sequence, serial state recurrence inside each (h,v_n) block. Verified: y outputs bit-match the reference through long T. Known tilelang quirk: the STORED S_out comes out fp16-rounded despite being declared fp32 (y, computed from the fp32 local, is exact); treat state precision as fp16-level across calls for now.
+- Prefill DPLR is a **single-shot kernel** (`fused_dplr_T` / `_dplr_T_kernel`): one launch processes the whole [T,H,N] sequence, serial state recurrence inside each (h,v_n) block. Verified: y outputs bit-match the reference through long T.
 
 ## Planned architecture direction
 
