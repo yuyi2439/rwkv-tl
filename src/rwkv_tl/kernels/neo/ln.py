@@ -1,6 +1,5 @@
 # pyright: reportInvalidTypeForm=false
 
-
 import tilelang
 import tilelang.language as T
 
@@ -27,6 +26,11 @@ def ln_macro(LEN, C: int, DTYPE: str, THREADS: int = 256):
         *,
         out: T.Tensor((LEN, C), DTYPE),
     ):
+        """LayerNorm
+        
+        Args:
+            out: modified in-place
+        """
         with T.Kernel(LEN, threads=THREADS) as n:
             s = T.alloc_fragment((1,), "float32")
             x_frag = T.alloc_fragment((C,), "float32")

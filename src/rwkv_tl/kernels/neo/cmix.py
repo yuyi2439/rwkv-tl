@@ -3,8 +3,11 @@
 import tilelang
 import tilelang.language as T
 
+from .lerp import fused_lerp1_macro
+from .ln import ln_macro
 
-def fused_cmix_main_macro(C: int, DTYPE: str, LEN_block: int):
+
+def fused_multi_cmix_main_macro(LEN, C: int, DTYPE: str, LEN_block: int):
     """Fused cmix main: x0 + relusq(x @ kWt) @ vWt.
 
     Args:
@@ -25,7 +28,8 @@ def fused_cmix_main_macro(C: int, DTYPE: str, LEN_block: int):
     # shared ≤ 48KB  (note: `^` is XOR, use `**` for power)
     assert (LEN_block * _BK + _BK * HID_block) * STAGES * bytes <= 48 * 2**10
 
-    LEN = T.dynamic("LEN")
+    # # Look at https://github.com/tile-ai/tilelang/issues/2916
+    # LEN = T.dynamic("LEN")
     assert HID % HID_block == 0
     assert C % _BK == 0
 
@@ -91,6 +95,64 @@ def fused_cmix_main_macro(C: int, DTYPE: str, LEN_block: int):
     return _impl
 
 
+def fused_cmix_prologue_macro(LEN, C: int, DTYPE: str):
+    # TODO: tune this
+    THREADS = 256
+
+    assert C % THREADS == 0
+
+    # LEN = T.dynamic("LEN")
+    ln = ln_macro(LEN, C, DTYPE, THREADS)
+    fused_lerp1 = fused_lerp1_macro(LEN, C, DTYPE, THREADS)
+
+    @T.macro
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_k: T.Tensor((C,), DTYPE),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        out: T.Tensor((LEN, C), DTYPE),
+    ):
+        # ln pre
+        x_ln = T.alloc_global((LEN, C), DTYPE)
+        ln(x0, ln_preW, ln_preB, out=x_ln)
+
+        # lerp & write out
+        fused_lerp1(x_ln, prev_x, x_k, out=out)
+
+        # copy back to prev_x
+        with T.Kernel(1, threads=THREADS):
+            T.copy(x_ln[LEN - 1, :], prev_x)
+
+    return _impl
+
+
 @tilelang.jit
-def fused_cmix():
-    pass
+def fused_multi_cmix(C: int, DTYPE: str, LEN_block: int):
+
+    LEN = T.dynamic("LEN")
+    prologue = fused_cmix_prologue_macro(LEN, C, DTYPE)
+    main = fused_multi_cmix_main_macro(LEN, C, DTYPE, LEN_block)
+
+    @T.prim_func
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_k: T.Tensor((C,), DTYPE),
+        kWt: T.Tensor((C, 4 * C), DTYPE),
+        vWt: T.Tensor((4 * C, C), DTYPE),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        out: T.Tensor((LEN, C), DTYPE),
+    ):
+        # ln pre + lerp
+        x = T.alloc_global((LEN, C), DTYPE)
+        prologue(x0, ln_preW, ln_preB, x_k, prev_x=prev_x, out=x)
+
+        # main
+        main(x, x0, kWt, vWt, out=out)
+
+    return _impl

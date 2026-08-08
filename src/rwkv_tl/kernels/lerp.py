@@ -123,11 +123,11 @@ def build(DTYPE: str, fused_rkv_gemm: Callable) -> SimpleNamespace:
         ):
             """Fused single LERP + copy x to x_copy buffer (in-place)."""
             with T.Kernel(T.ceildiv(C, BLOCK), threads=BLOCK) as bx:
-                tx = T.get_thread_binding(0)
-                i = bx * BLOCK + tx
-                if i < C:
-                    x_copy[i] = x[i]
-                    out[i] = x[i] + w[i] * (prev[i] - x[i])
+                for i in T.Parallel(BLOCK):
+                    idx = bx * BLOCK + i
+                    if idx < C:
+                        x_copy[idx] = x[idx]
+                        out[idx] = x[idx] + w[idx] * (prev[idx] - x[idx])
 
         return _impl
 
