@@ -41,6 +41,11 @@ cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不
 `fused_gn_rkrk`/`fused_dplr` register pressure）、occupancy 下降（H=64 时 grid 更大）、
 DPLR N 维并行度变化。7.2B 需等量化支持后再测（bf16 ~14.4GB）。
 
+**进度（2026-08-08）**：`rwkv7-g1i-1.5b-20260805-ctx16384.pth`（C=2048, H=32, N=64,
+L=24）已在本机 3060 加载成功（g1i 权重键结构与 g1d 一致，`RWKV7Weight` 零改动），
+decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。完整 benchmark 待补。
+详见 docs/benchmarks/rtx3060.md。
+
 ## P2 — 训练路径
 
 ### #5 DPLR backward

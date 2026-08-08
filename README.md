@@ -2,11 +2,11 @@
 
 RWKV7 inference with TileLang fused CUDA kernels and CUDA Graph. The goal is to make decode and prefill faster than the pure PyTorch baseline and approach the performance of the Albatross reference implementation.
 
-- Model: RWKV7-g1d (0.1B and 0.4B variants)
+- Model: RWKV7-g1d (0.1B and 0.4B variants) and RWKV7-g1i 1.5B (loading + correctness verified; full benchmark pending)
 - Precision: float16 compute with float32 accumulation (DPLR state stays fp32), matching Albatross
 - Paths:
   - Decode (T=1): fused TMIX/CMIX kernels, CUDA-Graph accelerated via `CUDAGraph`
-  - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM; per-T CUDA-Graph replay for T<=64
+  - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM; per-T CUDA-Graph replay up to `prefill_graph_max_t=1024`
 
 ## Project layout
 
@@ -36,22 +36,33 @@ recompile a fresh graph per token count.
 
 | Case | tl-fp16 | tl-bf16 | faster3a_2607 | pure-torch |
 |---|---:|---:|---:|---:|
-| 1x1 | **2.35 ms** | 10.58 ms | 5.16 ms | 4.93 ms |
-| 1x8 | **3.09 ms** | 17.20 ms | 6.61 ms | 5.77 ms |
-| 1x32 | **3.37 ms** | 17.52 ms | 8.89 ms | 14.83 ms |
-| 1x64 | **3.88 ms** | 16.60 ms | 8.36 ms | 28.39 ms |
-| 1x128 | **5.38 ms** | 22.17 ms | 7.49 ms | 506.87 ms |
-| 8x8 | **4.06 ms** | 18.44 ms | 7.95 ms | 27.23 ms |
-| 16x16 | **17.15 ms** | 21.23 ms | 8.37 ms | 1084.18 ms |
+| 1x1 | **2.36 ms** | 2.08 ms | 5.94 ms | 3.74 ms |
+| 1x8 | **2.92 ms** | 3.24 ms | 7.97 ms | 5.93 ms |
+| 1x32 | **3.35 ms** | 3.30 ms | 9.55 ms | 14.96 ms |
+| 1x64 | **3.81 ms** | 4.07 ms | 9.92 ms | 26.81 ms |
+| 1x128 | **5.15 ms** | 5.45 ms | 9.15 ms | 51.14 ms |
+| 8x8 | **3.88 ms** | 4.10 ms | 7.97 ms | 26.67 ms |
+| 16x16 | **9.22 ms** | 8.88 ms | **7.78 ms** | 100.11 ms |
+
+0.4B (same harness, 2026-08-08): T=1..64 tl-fp16 leads faster3a (5.12 vs
+6.57 ms at T=1, 10.55 vs 15.69 ms at T=64); T=128 has caught up (14.63 vs
+13.58 ms); 16x16 still trails (real batch). Full tables in
+`script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.
 
 Key points:
 - The CUDA-Graph-accelerated `tl-fp16` (decode + per-T prefill graph, cap 1024)
-  leads every implementation at T=1..128, beating faster3a_2607 at T=128 too
-  (5.38 vs 7.49 ms). bf16 is slower on sm_86 (fp16 tensor cores win there).
-- The prefill graph is now capped at T=1024 (was 64): the old cap made T=128
-  prefill 17.7ms (eager, launch-bound); graph T=128 is 5.38ms. At T=512 the
-  graph still wins over eager but trails faster3a's fused `wkv_seq` kernels
-  (26.7 vs 12.0 ms) -- large-T kernel fusion is the next target.
+  leads at T=1..128, beating faster3a_2607 ~1.8-2.5x (e.g. 2.36 vs 5.94 ms at
+  T=1, 5.15 vs 9.15 ms at T=128). `tl-bf16` now matches `tl-fp16` -- the old
+  "bf16 is slower on sm_86" gap (4x at T=1) disappeared once bf16 decode went
+  through the fused gates + CUDA-Graph path.
+- Raising the prefill graph cap from 64 to 1024 is a big win for large-T
+  prefill: T=256 (16x16) tl-fp16 dropped 17.15 -> 9.22 ms and pure-torch
+  T=128 dropped 506 -> 51 ms, because those cases now replay a captured graph
+  instead of running ~2175 eager launches. The remaining large-T cost is the
+  GEMM compute itself (chunk-parallel prefill, TODO #3).
+- The 16x16 case still trails faster3a (9.22 vs 7.78 ms): faster3a runs real
+  batch `[16,16]` in parallel while rwkv_tl processes 256 tokens as one serial
+  sequence -- catching up needs real batch support.
 - Every CUDA model -- including `backend="torch"` -- is graph-wrapped by
   default (`make_rwkv7(use_graph=True)`); pass `use_graph=False` for a truly
   eager class (e.g. the torch reference used for correctness gating).
@@ -91,6 +102,13 @@ prefill through **fp16 tensor-core GEMMs** (`volta_fp16_s884gemm...` ~39ms of
 slower than fp32 for these shapes). `tl-mx450` deliberately uses **fp32 GEMMs**
 for prefill, which is the correct sm_75 adaptation. This is an architecture-level
 difference, not a measurement artifact.
+
+> **Note (project decision):** the fp32 GEMM workaround is a historical record
+> only. Per the current project standard, weights are never stored above 16
+> bit/param and fp32 is used only for compute internals (accumulation, RNN
+> state). The fp32 prefill GEMM path is being retired; the fix for Turing's
+> pathological fp16 cuBLAS kernel choice is tilelang hand-written kernels (the
+> T-specialized sm_75 fp16 GEMM already is one).
 
 ## Run benchmark
 

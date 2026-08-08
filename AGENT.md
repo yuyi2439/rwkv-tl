@@ -45,6 +45,16 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
   not doc work -- fix it in the same pass as the rename, and grep for stale
   names (e.g. the old `kernels/`/`operators` paths) after moving code.
 - Model checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var / `--project-checkpoint` flag (the run command in `script/benchmark_rwkv7.md` shows the exact names used); the directory is machine-specific. Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the originally-used model first, then the others; watch ou for OOM.
+- **Weights are never stored or duplicated above 16 bit/param.** No fp32
+  weights, fp32 weight copies, or fp32-input GEMMs as a performance lever
+  (2x weight VRAM). fp32 is allowed only for compute internals: fp32
+  accumulation inside kernels, fp32 RNN state (`[H,N,N]`, matches Albatross),
+  fp32 intermediate math. This includes dropping the old MX450 sm_75
+  workaround (fp32 prefill GEMMs to dodge Turing's pathological fp16 cuBLAS
+  kernel selection): solve the cuBLAS kernel-choice problem with tilelang
+  hand-written kernels instead (the T-specialized sm_75 fp16 GEMM already does
+  this). The planned memory-savings direction is quantization (int8/any4
+  weights, dequant fused into the hand-written GEMV); see TODO #6.
 - `prefill` stays eager: torch.compile of prefill recompiles a fresh graph per distinct prompt length (minutes, GPU idle) for only 1.11-1.43x steady-state. This was validated on RTX 3060 and is a firm decision -- do not re-enable without new evidence.
 - Long benchmarks must run as background processes writing to a log file, then be monitored -- never as a blocking foreground command that looks frozen.
 - If a script appears to hang with idle CPU/GPU, investigate before assuming it failed: torch.compile or first-call kernel compilation can idle the GPU for minutes.
@@ -117,7 +127,9 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   faster3a_2607 at every T
   <= 64 (2.30ms 1x1, 2.90ms 1x8, 3.19ms 1x32, 3.81ms 1x64); T=128 stays eager
   and trails faster3a (~20 vs 7.8ms) -- large-T prefill is the common
-  tilelang-path bottleneck, out of scope here.
+  tilelang-path bottleneck, out of scope here. With the prefill graph cap now
+  1024 (was 64), the current 0.1B numbers are in the baseline section of
+  `docs/benchmarks/rtx3060.md` (T=128 tl-fp16 5.15ms, 16x16 9.22ms).
 - **CUDA-Graph prefill requires in-place `state["x"]`.** The batch closures
   must `state["x"].copy_(x[-1])`, NOT rebind `state["x"] = x[-1]`, or a
   captured graph silently corrupts state across replays (measured rnn max_abs
@@ -219,8 +231,8 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   captures the whole prefill per exact T (no padding -- the DPLR recurrence
   advances state per token), replaying with a State copy-in/out so the model
   stays stateless. Graph beats eager at EVERY T, not just small T: measured
-  on RTX 3060 / 0.1B, T=128 graph 5.72 vs eager 23.06ms, T=256 graph 9.39ms,
-  T=1024 graph 32.27ms (all ~4x faster than eager). The old `T<=64` cap was
+  on RTX 3060 / 0.1B, T=128 graph 5.15 vs eager 23.06ms, T=256 (16x16) graph
+  9.22ms, T=1024 graph 32.27ms (all ~4x faster than eager). The old `T<=64` cap was
   wrong (it made T=128 prefill 17.7ms, slower than faster3a's 7.6ms); it was
   based on a "graph memory scales with T" worry that did not hold. Requires
   the batch closures to update `state["x"]` in place (`copy_`, not rebind) so
