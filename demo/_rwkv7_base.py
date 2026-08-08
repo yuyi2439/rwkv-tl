@@ -1,7 +1,7 @@
 """Shared RWKV7 model base, parameterized by a kernel namespace.
 
-Subclasses bind a dtype-specific kernel namespace (``rwkv_tl.kernels.fp16`` /
-``rwkv_tl.kernels.bf16``) so the same forward/decode/prefill/generate code runs
+Subclasses bind a dtype-specific kernel namespace (``rwkv_tl.kernel.fp16`` /
+``rwkv_tl.kernel.bf16``) so the same forward/decode/prefill/generate code runs
 with either element type. The DPLR RNN state stays fp32 in both variants.
 
 The decode path dispatches through the registered custom ops
@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
-from rwkv_tl.kernels import Kernels
+from rwkv_tl.kernel import Kernels
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -36,8 +36,8 @@ class RWKV7Base(RWKV7Model):
     Args:
         w: Loaded weights (``rwkv_tl.weight.RWKV7Weight``) in the model's
             dtype (fp16 or bf16).
-        kernels: Dtype-bound kernel namespace (``rwkv_tl.kernels.fp16`` or
-            ``rwkv_tl.kernels.bf16``).
+        kernels: Dtype-bound kernel namespace (``rwkv_tl.kernel.fp16`` or
+            ``rwkv_tl.kernel.bf16``).
         is_torch_compile: Compile ``decode`` via torch.compile + custom ops.
     """
 

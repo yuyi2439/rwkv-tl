@@ -20,6 +20,6 @@ class RWKV7FP16(RWKV7Base):
         *,
         is_torch_compile: bool = True,
     ) -> None:
-        from rwkv_tl.kernels import fp16
+        from rwkv_tl.kernel import fp16
 
         super().__init__(w, fp16.kernels, is_torch_compile=is_torch_compile)

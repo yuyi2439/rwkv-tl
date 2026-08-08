@@ -38,6 +38,12 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - Docs and reports under `docs/` and the benchmark report must be written in Chinese. Source code comments/docstrings stay in English.
 - Test results must be saved to a file under `docs/`. Do not leave test outcomes only in chat history.
 - When a new benchmark/test run is completed, record the results in the docs before moving on.
+- **A refactor (module rename/move, path changes) must update every affected
+  reference in code docstrings and project docs (AGENT.md, CONTRIBUTING.md,
+  `script/benchmark_rwkv7.md`, `docs/`). Do not leave old path/name references
+  behind just because the code still imports.** This is ordinary code hygiene,
+  not doc work -- fix it in the same pass as the rename, and grep for stale
+  names (e.g. the old `kernels/`/`operators` paths) after moving code.
 - Model checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var / `--project-checkpoint` flag (the run command in `script/benchmark_rwkv7.md` shows the exact names used); the directory is machine-specific. Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the originally-used model first, then the others; watch ou for OOM.
 - `prefill` stays eager: torch.compile of prefill recompiles a fresh graph per distinct prompt length (minutes, GPU idle) for only 1.11-1.43x steady-state. This was validated on RTX 3060 and is a firm decision -- do not re-enable without new evidence.
 - Long benchmarks must run as background processes writing to a log file, then be monitored -- never as a blocking foreground command that looks frozen.
@@ -62,13 +68,13 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   build models via `demo.make_rwkv7(w, backend="auto")` and operate on the
   ABC; do not hard-code a specific model class into an application script.
 - **Kernels are split by function AND bound by IO dtype.** The kernel
-  definitions live in `kernels/{gemm,lerp,gates,dplr}.py`, each exposing
-  `build(DTYPE)`; `kernels/_base.py` is just the assembler
-  (`build_kernels(DTYPE) -> Kernels`); `kernels/fp16.py` / `kernels/bf16.py`
-  bind the two dtypes with identical public interfaces; `kernels/__init__.py`
+  definitions live in `kernel/{gemm,lerp,gates,dplr}.py`, each exposing
+  `build(DTYPE)`; `kernel/_base.py` is just the assembler
+  (`build_kernels(DTYPE) -> Kernels`); `kernel/fp16.py` / `kernel/bf16.py`
+  bind the two dtypes with identical public interfaces; `kernel/__init__.py`
   re-exports the fp16 bindings by default. Add a new kernel in its function
   file and expose it through BOTH bindings, never one dtype file only.
-  Custom ops (`operators`) route by input tensor dtype via `_kernels_for`.
+  Custom ops (`operator`) route by input tensor dtype via `_kernels_for`.
 - **Tilelang DSL files are a Python project standard: no `from __future__ import
   annotations`.** tilelang's eager builder evaluates annotation expressions at
   build time, and a stringified annotation only resolves module globals +
@@ -228,7 +234,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   without the graph it is launch-bound. The graph closes most of that gap;
   further gains need fusing the eager prefill ops (TMIX/CMIX GEMMs and gates
   are the launch-heavy part; `fused_dplr_T` is already single-kernel).
-- **Turing sm_75 fp16 GEMM is T-specialized.** `kernels/gemm.py` compiles a
+- **Turing sm_75 fp16 GEMM is T-specialized.** `kernel/gemm.py` compiles a
   per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
   MX450) for fp16 on sm_75, because a dynamic-T version cannot reach that
   config's speed there (~12x slower). Lengths are restricted to `1..16` exact
@@ -262,7 +268,8 @@ done yet. When working on the related area, remind the user whether to proceed.
   settling the default. Requires the RTX 3060 box (not this MX450 laptop).
 
 - **DONE — model code moved out of `src/rwkv_tl/`.** The library ships only
-  kernels + operators + state/sampling/weight/tokenizer; model implementations
+  kernels + operators + state/sampling/weight/tokenizer (in `rwkv_tl.kernel` /
+  `rwkv_tl.operator`); model implementations
   live in `demo/` (one class per device/kernel strategy):
   `demo.rwkv7_fp16.RWKV7FP16` (tilelang fp16, sm_80+), `demo.rwkv7_bf16.RWKV7BF16`
   (tilelang bf16), `demo.rwkv7_torch.RWKV7Torch` (pure torch reference).

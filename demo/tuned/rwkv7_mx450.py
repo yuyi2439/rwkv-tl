@@ -28,7 +28,7 @@ from torch import Tensor
 
 from demo._rwkv7_base import RELUSQ
 from demo.rwkv7_fp16 import RWKV7FP16
-from rwkv_tl.kernels import fused_dplr_T, fused_rkv_gemm
+from rwkv_tl.kernel import fused_dplr_T, fused_rkv_gemm
 
 __all__ = ["RWKV7MX450"]
 

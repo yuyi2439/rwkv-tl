@@ -70,7 +70,7 @@ def _register(
 
 def _kernels_for(x: Tensor):
     """Pick the fp16/bf16 kernel namespace matching an input tensor's dtype."""
-    from ..kernels import bf16, fp16
+    from ..kernel import bf16, fp16
 
     return bf16 if x.dtype == torch.bfloat16 else fp16
 
@@ -87,7 +87,7 @@ def _ensure_ops_registered() -> None:
     def _lerp6_copy_cuda(
         x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy
     ) -> tuple[Tensor, ...]:
-        from ..kernels import bf16, fp16
+        from ..kernel import bf16, fp16
 
         k = bf16 if x.dtype == torch.bfloat16 else fp16
         return k.fused_lerp6_copy(x, prev, x_r, x_w, x_k, x_v, x_a, x_g, x_copy)

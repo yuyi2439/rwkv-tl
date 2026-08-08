@@ -120,7 +120,7 @@ warmup=10, iters=20，正确性门控全过。`tl-rtx3060`/`tl-mx450` 为 CUDA-G
 > T=8 20.5 vs tl-fp16 45.1ms，T=128 39.8 vs tl-fp16 92.2ms——bf16 的 tilelang kernel 在 Turing 走
 > fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。
 >
-> **sm_75 fp16 GEMM（m16n8k8）已实现**：`rwkv_tl.kernels.gemm` 为 sm_75 的 fp16 加了
+> **sm_75 fp16 GEMM（m16n8k8）已实现**：`rwkv_tl.kernel.gemm` 为 sm_75 的 fp16 加了
 > T 特化 tilelang kernel（16×32×32/3 级流水，MX450 autotune），按允许长度集
 > （1..16 精确 + 32..16384 幂）二分选择最小覆盖长度、pad 输入后切回。实测比病态
 > cuBLAS fp16 bmm 快 4-6x（T=32 0.24 vs 0.79ms，T=128 0.83 vs 1.58ms），但**每个

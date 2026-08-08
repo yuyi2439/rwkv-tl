@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from rwkv_tl.kernels import fused_lerp6
+from rwkv_tl.kernel import fused_lerp6
 
 N_EMBD = 768
 SEED_BASE = 42

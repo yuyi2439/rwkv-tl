@@ -5,10 +5,10 @@ A short guide for human contributors. For agent-specific operating rules, see
 
 ## Repository layout
 
-- `src/rwkv_tl/` — the published library. Kernel code lives in `src/rwkv_tl/kernels/`
+- `src/rwkv_tl/` — the published library. Kernel code lives in `src/rwkv_tl/kernel/`
   (one file per concern: `lerp.py`, `gates.py`, `dplr.py`, `gemm.py`, ...), with a
-  unified export in `kernels/__init__.py`. Custom-op wrappers live in
-  `src/rwkv_tl/operators/`.
+  unified export in `kernel/__init__.py`. Custom-op wrappers live in
+  `src/rwkv_tl/operator/`.
 - `demo/` — example model code and tuned per-GPU implementations. Not part of the
   published library.
 - `script/` — benchmark and profiling scripts.
