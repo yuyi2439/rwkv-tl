@@ -7,6 +7,43 @@ from .lerp import fused_lerp1_macro
 from .ln import ln_macro
 
 
+def fused_cmix_prologue_macro(LEN, C: int, DTYPE: str):
+    # TODO: tune this
+    THREADS = 256
+
+    assert C % THREADS == 0
+
+    # LEN = T.dynamic("LEN")
+    ln = ln_macro(LEN, C, DTYPE)
+    fused_lerp1 = fused_lerp1_macro(LEN, C, DTYPE)
+
+    @T.macro
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_k: T.Tensor((C,), DTYPE),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        out: T.Tensor((LEN, C), DTYPE),
+    ):
+        """2 kernels."""
+        x_ln = T.alloc_global((LEN, C), DTYPE)
+
+        with T.Kernel(LEN, threads=THREADS) as n:
+            # ln pre
+            ln(n, x0, ln_preW, ln_preB, out=x_ln)
+
+            # lerp & write out
+            fused_lerp1(n, x_ln, prev_x, x_k, out=out)
+
+        # copy back to prev_x
+        with T.Kernel(1, threads=THREADS):
+            T.copy(x_ln[LEN - 1, :], prev_x)
+
+    return _impl
+
+
 def fused_multi_cmix_main_macro(LEN, C: int, DTYPE: str, LEN_block: int):
     """Fused cmix main: x0 + relusq(x @ kWt) @ vWt.
 
@@ -42,6 +79,7 @@ def fused_multi_cmix_main_macro(LEN, C: int, DTYPE: str, LEN_block: int):
         *,
         out: T.Tensor((LEN, C), DTYPE),
     ):
+        """2 kernels."""
         assert LEN % LEN_block == 0  # pyright: ignore[reportOperatorIssue]
         h = T.alloc_global((LEN, HID), DTYPE)
 
@@ -95,42 +133,9 @@ def fused_multi_cmix_main_macro(LEN, C: int, DTYPE: str, LEN_block: int):
     return _impl
 
 
-def fused_cmix_prologue_macro(LEN, C: int, DTYPE: str):
-    # TODO: tune this
-    THREADS = 256
-
-    assert C % THREADS == 0
-
-    # LEN = T.dynamic("LEN")
-    ln = ln_macro(LEN, C, DTYPE, THREADS)
-    fused_lerp1 = fused_lerp1_macro(LEN, C, DTYPE, THREADS)
-
-    @T.macro
-    def _impl(
-        x0: T.Tensor((LEN, C), DTYPE),
-        ln_preW: T.Tensor((C,), DTYPE),
-        ln_preB: T.Tensor((C,), DTYPE),
-        x_k: T.Tensor((C,), DTYPE),
-        *,
-        prev_x: T.Tensor((C,), DTYPE),
-        out: T.Tensor((LEN, C), DTYPE),
-    ):
-        # ln pre
-        x_ln = T.alloc_global((LEN, C), DTYPE)
-        ln(x0, ln_preW, ln_preB, out=x_ln)
-
-        # lerp & write out
-        fused_lerp1(x_ln, prev_x, x_k, out=out)
-
-        # copy back to prev_x
-        with T.Kernel(1, threads=THREADS):
-            T.copy(x_ln[LEN - 1, :], prev_x)
-
-    return _impl
-
-
 @tilelang.jit
 def fused_multi_cmix(C: int, DTYPE: str, LEN_block: int):
+    HID = 4 * C
 
     LEN = T.dynamic("LEN")
     prologue = fused_cmix_prologue_macro(LEN, C, DTYPE)
@@ -142,13 +147,13 @@ def fused_multi_cmix(C: int, DTYPE: str, LEN_block: int):
         ln_preW: T.Tensor((C,), DTYPE),
         ln_preB: T.Tensor((C,), DTYPE),
         x_k: T.Tensor((C,), DTYPE),
-        kWt: T.Tensor((C, 4 * C), DTYPE),
-        vWt: T.Tensor((4 * C, C), DTYPE),
+        kWt: T.Tensor((C, HID), DTYPE),
+        vWt: T.Tensor((HID, C), DTYPE),
         *,
         prev_x: T.Tensor((C,), DTYPE),
         out: T.Tensor((LEN, C), DTYPE),
     ):
-        # ln pre + lerp
+        """4 kernels."""
         x = T.alloc_global((LEN, C), DTYPE)
         prologue(x0, ln_preW, ln_preB, x_k, prev_x=prev_x, out=x)
 
