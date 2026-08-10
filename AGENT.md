@@ -215,13 +215,19 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   `docs/validation_rtx3060.md`.
 - **Decode regressed with the neo-kernel path (a8e2ef7).** Measured on RTX 3060
   / 0.1B: `tl-fp16` decode went 2.36ms (legacy per-op kernels + graph) to
-  eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Single
-  fused kernels are fast (`tmix_decode` 0.13ms, `cmix_decode` 0.12ms), so the
-  cost is in the decode chain: suspected (a) `CUDAGraph.decode`'s per-token
-  State copy-in/out (12 layers x 3 fields = ~36 tiny `copy_` launches) plus the
-  `.item()` sync, (b) `tmix_decode` still launching several kernels per layer.
-  On 1.5B the gap widens (18.93 vs faster3a 7.91ms). See
-  `docs/benchmarks/rtx3060.md` "neo kernels 基线" and TODO #1.
+  eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Root cause
+  (2026-08-10 profiling): `tmix_decode` launches ~11 sequential kernels per
+  layer (prologue + r/k/v GEMVs + rank gates + L2norm + DPLR + GN + oWt GEMV +
+  residual). The three r/k/v GEMVs are 60-73% of decode GPU time and inflate
+  2.4-3.8x over their microbenchmark time (55/71/149us vs 17/19/63us at
+  C=768/1024/2048) because each reads the previous kernel's freshly-written
+  global buffer with no overlap, plus low occupancy (24-64 blocks of 32
+  threads) and launch gaps. faster3a fuses r/k/v into one `row1_exact4` kernel
+  at 14.8us each. The GEMV kernel itself is NOT slow (microbench ties
+  cuBLAS). The `head @ ln_out` cuBLAS GEMV ([65536,C]) adds 0.3-0.8ms.
+  Additionally `CUDAGraph.decode`'s per-token State copy-in/out (~36 tiny
+  `copy_`) makes graph slower than eager. See `docs/benchmarks/rtx3060.md`
+  "neo kernels 基线" analysis and TODO #1.
 - The pure-torch baseline was improved by batched prefill work.
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.

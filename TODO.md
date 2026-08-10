@@ -17,11 +17,15 @@ graph_decoder 的 1.55ms GPU kernel time 里 GEMV 计算是主要成本，手写
 
 **观察（2026-08-10）**：neo kernels 启用后（a8e2ef7）decode 反而变慢——0.1B
 tl-fp16 从旧基线 2.36ms（逐 op kernel + graph）涨到 graph 4.15ms / eager 3.44ms。
-单 kernel 不慢（`tmix_decode` 0.13ms / `cmix_decode` 0.12ms @ 0.1B），但整链慢，
-且 graph 比 eager 更慢。疑点：(a) `CUDAGraph` decode 每 token 的 State copy-in/out
-（12 层 × 3 字段 ≈ 36 次小 `copy_`）+ `.item()` 同步；(b) `tmix_decode` 每层仍多
-kernel。1.5B 上 decode 18.93ms vs faster3a 7.91ms（慢 2.4x）。这是 decode 优化的
-当前直接基线，见 docs/benchmarks/rtx3060.md「neo kernels 基线」。
+profiler 定位根因：`tmix_decode` 单层 ~11 个顺序 kernel，r/k/v 三个 GEMV 占 decode
+GPU 时间 60-73%，且链中每个膨胀 2.4-3.8x（55/71/149us vs 微基准 17/19/63us @
+C=768/1024/2048）——因每个读前一 kernel 刚写的 global、无 overlap、occupancy 低
+（24-64 个 32-thread block）。**GEMV 单 kernel 本身不慢**（微基准与 cuBLAS 持平），
+faster3a 用 `row1_exact4` 把 r/k/v 融合成 14.8us/kernel。修复方向：把 r/k/v 三个 GEMV
+合并成一个 batched GEMV kernel、减少单层 kernel 数、HEAD 专精（现在 `[65536,C]`
+cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State copy-in/out
+（36 次小 copy_）+ `.item()` 同步，另查。1.5B decode 18.93ms vs faster3a 7.91ms。
+详见 docs/benchmarks/rtx3060.md「neo kernels 基线」。
 
 ### #2 batch decode（B>1）
 
@@ -36,6 +40,13 @@ kernel。1.5B 上 decode 18.93ms vs faster3a 7.91ms（慢 2.4x）。这是 decod
 T=128 prefill 落后 faster3a 2.5x，根因是 faster3a 的 wkv_seq kernel 用 chunk 并行 +
 cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不够。T-bucketing
 （按 T 分桶捕获 graph）只省 launch 开销，不解决计算效率问题，仅作过渡。
+
+**量化（2026-08-10）**：1.5B prefill 的 TMIX 仍走旧逐 op 路径，单层 T=64 拆解：
+`fused_dplr_T` 296us（faster3a `wkv_fp16_seq_v2` 仅 47us，**慢 6.3x**——grid `(H,N)`
+=2048 blocks × 32 threads 串行整个 T，occupancy 低、无 chunk 并行）、`fused_rkv_gemm`
+189us（旧 tilelang，faster3a 用 cuBLAS 大 tile）、torch 6-shift lerp + gates ~90us
+（Python 逐 op）。合计 ~530us/层 × 24 = 12.7ms + CMIX。1.5B T=128 落后 faster3a
+1.33x 大部分来自 TMIX 未融合 + DPLR 慢。
 
 真正解法是 chunk-based 并行 prefill：把 T 维切成 chunk（如 16/32），chunk 内并行
 计算 GEMM，chunk 间串行递推 state。参考 FlashRWKV `chunk_rwkv7` 和 FLA 的实现。

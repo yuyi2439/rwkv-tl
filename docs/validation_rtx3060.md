@@ -33,6 +33,23 @@
 新 `tmix_decode` 的 bf16 路径 bug，非硬件限制（fp16 全套 25 passed）。fp16 不受影响。
 排查方向：`tmix_decode`/`gemv_macro` 的 bf16 dtype remap。
 
+## 落后原因分析（2026-08-10）
+
+对 tl-fp16 落后 faster3a 的所有 case（排除真 batch 16x16）做 profiler 拆解，
+结论：**decode (1x1) 与 1.5B 大 T prefill 两类落后，根因不同**。
+
+1. **decode (1x1)**：`tmix_decode` 单层 ~11 个顺序 kernel，r/k/v 三个 GEMV 占 decode
+   GPU 时间 60-73%（0.1B 69%/0.4B 73%/1.5B 72%），且链中每个膨胀 2.4-3.8x
+   （55/71/149us vs 微基准 17/19/63us @ C=768/1024/2048）——因每个读前一 kernel
+   刚写的 global、无 overlap、occupancy 低。**GEMV 单 kernel 不慢**（微基准与 cuBLAS
+   持平），faster3a 用 `row1_exact4` 融合 r/k/v 到 14.8us 每个。次要：`head@ln_out`
+   cuBLAS GEMV `[65536,C]` 0.3-0.8ms；graph decode 比 eager 慢（State copy-in/out）。
+2. **1.5B 大 T prefill (T≥64)**：TMIX 未融合（仍旧逐 op 路径），`fused_dplr_T`
+   296us/层 vs faster3a 47us（慢 6.3x，无 chunk 并行），`fused_rkv_gemm` 189us vs
+   cuBLAS 大 tile，6-shift lerp + gates 仍 Python 逐 op。
+
+详见 [benchmarks/rtx3060.md](benchmarks/rtx3060.md)「neo kernels 基线 → 落后原因分析」。
+
 ## neo CMIX kernel + recompute 策略验证（2026-08-10）
 
 ### 版本与环境
