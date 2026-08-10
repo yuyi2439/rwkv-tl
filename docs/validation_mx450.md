@@ -8,7 +8,7 @@
 
 | 项目 | 值 |
 |---|---|
-| 代码版本 | 分支 `neo-kernel`，commit `e13a95b` 基础上补全 `kernel/neo/cmix.py` |
+| 代码版本 | 分支 `neo-kernel`，commit `e13a95b` 基础上补全 `kernel/cmix.py` |
 | GPU | NVIDIA GeForce MX450 (sm_75, 2GB) |
 | CUDA / PyTorch | CUDA 13.3 |
 | TileLang | 0.1.13 |
@@ -16,16 +16,16 @@
 
 ### 本次补全的内容
 
-`kernel/neo/cmix.py` 之前未完成的部分：
+`kernel/cmix.py` 之前未完成的部分：
 
 1. **decode 残差 epilogue 未接线**：`_add_residual` 引用了不存在的全局 `residual`；
    `gemv_macro` 的 epilogue 文档签名是 `(acc, index, residual)` 但只传 2 参。
-   修复：`gemv_macro` 新增可选 `residual` 张量参数（`kernel/neo/gemv.py`），
+   修复：`gemv_macro` 新增可选 `residual` 张量参数（`kernel/gemv.py`），
    down GEMV 以 `residual=x0` 调用（`cmix_decode_main_macro`）。
 2. **decode prologue 张量形状不匹配**：`cmix_prologue_macro` 声明 `x0: [LEN, C]`，
    但 `cmix_decode` 传 1D `[C]` 单 token。修复：按 `LEN == 1` 区分 1D/2D 分支。
 3. **token-shift 语义回归**：重构把 shift 源从 `x_ln[n-1]`（前一 token 的 LN 输出，
-   与 eager `make_CMIX_batch` 一致）改成了 `x0[n-1]`（原始 token），数值错误放大
+   与 CMIX token-shift 语义一致）改成了 `x0[n-1]`（原始 token），数值错误放大
    到 ~1.75。修复为读 `x_ln[n-1]`。
 4. **跨 block 竞争**：原实现 LN 与 lerp 同 kernel，block n 读 `x_ln[n-1]`
    （由 block n-1 写入）。修复：multi 路径拆成 LN kernel → lerp kernel 两段，
@@ -44,7 +44,7 @@
 | `test_cmix_prefill[42-256-64]` | LEN=256, block=64 | max_abs ~0.0020 |
 
 参考为 eager CMIX 链（LN_pre → shift lerp → relu²(x@kWt)@vWt + x0），
-shift 源与 `_rwkv7_base.make_CMIX_batch` 一致；`prev_x` 状态更新误差 ≤ 0.00003。
+shift 源与 CMIX token-shift 语义一致；`prev_x` 状态更新误差 ≤ 0.00003。
 
 另验证 C=1024（0.4B 形状）：decode / multi（LEN=128）均通过，max_abs < 0.0024。
 `gemv` 独立 kernel 回归通过。
@@ -60,3 +60,55 @@ RWKV_CHECKPOINT_PATH=~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth .venv/bin/python
 ```
 
 注意：MX450 (sm_75) 无 bf16 tensor core，bf16 路径需在 sm_80+（RTX 3060）上另行验证。
+
+## neo TMIX decode kernel（2026-08-10）
+
+### 本次新增的内容
+
+`kernel/tmix.py` 实现单 token TMIX 全链 `tmix_decode`（LN_pre → 6 路
+token-shift → r/k/v 投影 → 4 路低秩 gate → L2-norm + DPLR 递归 → GroupNorm +
+r·k·r_k 残差 → g 门控输出投影 + x0 残差），参考 `rwkv7_torch.time_mix`，
+逻辑复制自 `kernel/{dplr,gates}.py`（不引用外部老 kernel）。
+
+结构（prologue + main 两个 macro，共 11 个 kernel）：
+- `tmix_decode_prologue_macro`：LN_pre + 6 shift + `prev_x` 原地更新（1 kernel）
+- `tmix_decode_main_macro`：rkv 3 个 GEMV + packed rank GEMV + gate math +
+  L2-norm + DPLR + GroupNorm + out GEMV
+
+LN_pre 计算提取到 `kernel/ln.py`（`ln_pre_row_macro`），cmix/tmix 共用。
+
+状态接口：`prev_x`（shift 源）与 `rnn`（DPLR，fp32）原地更新；`v_first`
+（v 残差门状态）跨 token 传递，首个 token 传 `first=1` 跳过 v 门并初始化
+`v_first`（与 `rwkv7_torch.time_mix` 语义一致）。
+
+### 测试结果：2/2 新增测试通过，全套 26/26 通过
+
+`test/test_neo_tmix.py`（真实 0.1B checkpoint，C=768 H=12 低秩门 rank
+32/64/64/128，参考为 `rwkv7_torch.time_mix`）：
+
+| 测试 | 结果 |
+|---|---|
+| `test_tmix_decode[42]` | 4 步链 out max_abs ≤ 0.02, rnn ≤ 0.014 |
+| `test_tmix_decode[43]` | 4 步链 out max_abs ≤ 0.02, rnn ≤ 0.014 |
+
+`prev_x` 状态逐位一致；`v_first` 跨 token 传递正确。
+
+运行命令：
+
+```bash
+RWKV_CHECKPOINT_PATH=~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth .venv/bin/python -m pytest test/test_neo_tmix.py -v
+```
+
+### 性能：tmix_decode vs rwkv7_torch.time_mix（MX450, 0.1B 单层）
+
+单 token decode 单层 TMIX，CUDA events + median（1000 iters），3 次独立运行：
+
+| 实现 | 耗时 | 
+|---|---|
+| `rwkv7_torch.time_mix`（torch 参考） | 0.42-0.49 ms |
+| neo `tmix_decode`（融合） | 0.13-0.19 ms |
+| 加速比 | **2.5-3.4x** |
+
+收益来源：一次 host 调用顺序 launch 全部 kernel（省 Python dispatch 与中间
+`[C]`/rank 张量的分配/释放），以及 prologue 把 LN+6-shift 融成 1 个 kernel。
+MX450 热节流导致各次运行波动，但加速比稳定在 ~2.5x 以上。

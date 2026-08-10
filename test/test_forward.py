@@ -16,8 +16,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from demo.rwkv7_bf16 import RWKV7BF16
-from demo.rwkv7_fp16 import RWKV7FP16 as RWKV7
+from demo.rwkv7_tl import RWKV7TL as RWKV7
 from demo.rwkv7_torch import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
@@ -102,10 +101,17 @@ def test_decode_matches_prefill(models) -> None:
 
 
 def test_bf16_consistent(ckpt_path: str) -> None:
-    """The bf16 model must match the pure-torch reference on bf16 weights."""
+    """The bf16 model must match the pure-torch reference on bf16 weights.
+
+    Skipped on sm_75 (MX450): no native bf16 tensor cores; validate on sm_80+.
+    """
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability()
+        if (major, _) < (8, 0):
+            pytest.skip("bf16 needs sm_80+ (no bf16 tensor cores on this GPU)")
     with torch.device("cuda"):
         w = RWKV7Weight(ckpt_path, dtype=torch.bfloat16)
-        tl = RWKV7BF16(w, is_torch_compile=False)
+        tl = RWKV7(w, is_torch_compile=False)
         ref = RWKV7Torch(w, is_torch_compile=False)
     _assert_consistent(
         _run_decode(tl, TOKENS, torch.bfloat16),

@@ -1,6 +1,6 @@
 # RWKV7MX450 特调分析
 
-对应文件: [demo/tuned/rwkv7_mx450.py](../../demo/tuned/rwkv7_mx450.py)
+对应文件: [demo/rwkv7_tl.py](../../demo/rwkv7_tl.py)
 
 ## 定位
 

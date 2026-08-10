@@ -6,11 +6,11 @@ A short guide for human contributors. For agent-specific operating rules, see
 ## Repository layout
 
 - `src/rwkv_tl/` — the published library. Kernel code lives in `src/rwkv_tl/kernel/`
-  (one file per concern: `lerp.py`, `gates.py`, `dplr.py`, `gemm.py`, ...), with a
-  unified export in `kernel/__init__.py`. Custom-op wrappers live in
-  `src/rwkv_tl/operator/`.
-- `demo/` — example model code and tuned per-GPU implementations. Not part of the
-  published library.
+  as dtype-parameterized factories (`cmix.py`, `tmix.py`, `gemv.py`, `ln.py`),
+  exported from `kernel/__init__.py`. The legacy per-op kernels used by the
+  TMIX prefill transition live in `kernel/old/`.
+- `demo/` — example model code (`rwkv7_tl.py` fused model, `rwkv7_torch.py`
+  pure-torch reference). Not part of the published library.
 - `script/` — benchmark and profiling scripts.
 - `test/` — test cases. `script/` is for runnable scripts, not tests.
 - `docs/` — benchmark reports and per-GPU validation notes (Chinese).
@@ -24,12 +24,12 @@ covers some pattern this project relies on:
 
 - `examples/gemm/` — `T.gemm`, autotune, persistent kernels, intrinsics. The
   `example_gemm_intrinsics.py` and `example_gemm_advanced_autotune.py` files are
-  the most useful references for the `fused_rkv_gemm` TensorCore path.
-- `examples/gemv/` — GEMV tiling, relevant for decode-path kernels.
-- `examples/elementwise/` — fusion patterns used by `lerp.py`, `gates.py`.
+  the most useful references for the fused prefill GEMM paths.
+- `examples/gemv/` — GEMV tiling, relevant for decode-path kernels (`gemv.py`).
+- `examples/elementwise/` — fusion patterns used by the cmix/tmix prologues.
 - `examples/reduction/` and the `warp_reduce` / `pipeline` examples — needed for
-  the DPLR state-reduction and warp-level reductions in `dplr.py`.
-- `examples/dynamic_shape/` — `T.dynamic` for sequence-length parameterization (our `T_LEN` / `M_T`);
+  the DPLR state-reduction and warp-level reductions in `tmix.py`.
+- `examples/dynamic_shape/` — `T.dynamic` for sequence-length parameterization (our `LEN` / `T_LEN`);
 
 Prefer copying a working example structure (block dims, `T.alloc_fragment`
 usage, `T.gemm` invocation, reduction idiom) over inventing a new pattern. When in

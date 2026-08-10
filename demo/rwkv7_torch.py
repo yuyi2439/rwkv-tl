@@ -1,7 +1,7 @@
 """Pure PyTorch RWKV7 reference implementation (no fused custom kernels).
 
 A readable, kernel-free baseline that mirrors the ``decode``/``prefill``/
-``forward``/``generate`` API of ``demo.rwkv7_fp16.RWKV7FP16``. Slower than the
+``forward``/``generate`` API of ``demo.rwkv7_tl.RWKV7TL``. Slower than the
 tilelang path but serves as the numerical reference for correctness tests
 and benchmarking.
 

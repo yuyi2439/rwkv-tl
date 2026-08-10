@@ -115,8 +115,8 @@ warmup=10, iters=20，正确性门控全过。`tl-fp16`/`tl-bf16`/`pure-torch` �
 > **fp16 迁移对 sm_75 的影响**：c2c4283 起 prefill 的批量 GEMM 从 bf16（cuBLAS magma
 > fp32 模拟）改为 fp16。Turing 的 cuBLAS fp16 tensor-core 内核对 `[T,C]@[C,C]`（T=32..128）
 > 病态慢（fp16 bmm ~1.3ms vs fp32 ~0.16ms，4-8x），导致 MX450 prefill 较旧记录 ~1.9x 变慢
-> （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`demo.rwkv7_fp16.RWKV7FP16`（全 fp16，sm_80+）
-> 与 `demo.rwkv7_bf16.RWKV7BF16`、`demo.tuned.rwkv7_mx450.RWKV7MX450`（sm_75：decode 同 fp16，batch GEMM 走 fp32 快路径），
+> （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`demo.rwkv7_tl.RWKV7TL`（fused tilelang，全 fp16/bf16）
+> （单模型类，per-device tuned 变体已并入）。
 > `demo.make_rwkv7` 按 arch 自动选择。**2026-08-04 实测 tl-bf16 是 MX450 prefill 最快的变体**：
 > T=8 20.5 vs tl-fp16 45.1ms，T=128 39.8 vs tl-fp16 92.2ms——bf16 的 tilelang kernel 在 Turing 走
 > fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。

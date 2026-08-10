@@ -8,9 +8,9 @@ replay. The wrapped model stays stateless -- any ``State`` works.
 
 Usage::
 
-    model = CUDAGraph(RWKV7MX450(w))        # wrap an existing instance
+    model = CUDAGraph(RWKV7TL(w))        # wrap an existing instance
     # ... or ...
-    model = make_rwkv7(device, backend="tuned")   # returns a wrapped class
+    model = make_rwkv7(device, backend="auto")   # returns a wrapped class
 
 Capture is lazy (on first call) and per exact prefill length ``T`` up to
 ``prefill_graph_max_t`` (larger ``T`` runs eager: launch overhead amortizes and

@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from rwkv_tl.kernel.neo.cmix import cmix_decode, cmix_prefill
+from rwkv_tl.kernel.cmix import cmix_decode, cmix_prefill
 
 N_EMBD = 768
 SEED_BASE = 42
@@ -35,7 +35,7 @@ def _cmix_ref(
     kWt: torch.Tensor,
     vWt: torch.Tensor,
 ) -> torch.Tensor:
-    """Eager reference matching `_rwkv7_base.make_CMIX_batch`.
+    """Eager reference matching the CMIX token-shift semantics.
 
     Token-shift source is the previous token's LN output (`x_ln[n-1]`), with
     `prev` supplying the shift for the first token.

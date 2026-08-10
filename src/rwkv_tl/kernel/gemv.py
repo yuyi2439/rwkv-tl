@@ -3,7 +3,7 @@
 import tilelang
 import tilelang.language as T
 
-from .._common import WARP
+from ._common import WARP
 
 
 def gemv_macro(M: int, K: int, DTYPE: str, THREADS: int = WARP, epilogue=None):

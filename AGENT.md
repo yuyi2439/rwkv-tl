@@ -77,14 +77,18 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   Application scripts (`script/rwkv_chat.py`, `script/profile_prefill.py`, ...)
   build models via `demo.make_rwkv7(w, backend="auto")` and operate on the
   ABC; do not hard-code a specific model class into an application script.
-- **Kernels are split by function AND bound by IO dtype.** The kernel
-  definitions live in `kernel/{gemm,lerp,gates,dplr}.py`, each exposing
-  `build(DTYPE)`; `kernel/_base.py` is just the assembler
-  (`build_kernels(DTYPE) -> Kernels`); `kernel/fp16.py` / `kernel/bf16.py`
-  bind the two dtypes with identical public interfaces; `kernel/__init__.py`
-  re-exports the fp16 bindings by default. Add a new kernel in its function
-  file and expose it through BOTH bindings, never one dtype file only.
-  Custom ops (`operator`) route by input tensor dtype via `_kernels_for`.
+- **Kernels are dtype-parameterized factories, not dtype-split bindings.** The
+  fused kernel set lives in `kernel/{cmix,tmix,gemv,ln}.py`; each factory takes
+  `(C, DTYPE, ...)` and returns a `@tilelang.jit` kernel
+  (`cmix_decode(C, DTYPE)`, `cmix_prefill(C, DTYPE, LEN_block)`,
+  `tmix_decode(C, DTYPE, H, Rv, Rw, Ra, Rg)`, `gemv_macro(...)`,
+  `ln_pre_row_macro(...)`), re-exported from `kernel/__init__.py`. The legacy
+  per-op kernels (`fused_lerp6`, `fused_dplr_T`, ...) live in `kernel/old/`
+  (bound by `build_kernels(DTYPE)`); TMIX prefill still uses them until a fused
+  `tmix_prefill` exists. The old `kernel/{gemm,lerp,gates,dplr}.py` split and
+  the `fp16`/`bf16` dtype-bound namespaces and `operator/` custom ops are
+  **gone** -- do not reintroduce them. No fp32 weight copies anywhere
+  (a future quantization path must not multiply weight memory).
 - **Tilelang DSL files are a Python project standard: no `from __future__ import
   annotations`.** tilelang's eager builder evaluates annotation expressions at
   build time, and a stringified annotation only resolves module globals +
@@ -103,46 +107,27 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   (default `torch.float16`, converts the bf16 checkpoint once at load; pass
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
   the model dtype. DPLR RNN state is always fp32 in both variants.
-- **`demo.make_rwkv7` backends**: `"auto"` (`RWKV7FP16` on CUDA sm < 80,
-  `RWKV7BF16` otherwise -- including sm >= 80 and non-CUDA devices), `"fp16"`,
-  `"bf16"`, `"mx450"`, `"rtx3060"`, `"tuned"`, `"torch"`. `use_graph=True`
-  (default) makes `make_rwkv7` return a class pre-wrapped in `CUDAGraph` for
-  every CUDA backend, so `decode` and per-T `prefill` run from captured CUDA
-  Graphs. `RWKV7Torch` updates its state in place, so it captures too; pass
+- **`demo.make_rwkv7` backends**: `"auto"` (and `"fp16"`/`"bf16"`/`"tl"`/
+  `"tuned"`/`"mx450"`/`"rtx3060"`) all select `RWKV7TL`; `"torch"` selects
+  `RWKV7Torch`. The per-device tuned variants were folded into `RWKV7TL` once
+  the fp32-GEMM cuBLAS workaround was dropped. `use_graph=True` (default) makes
+  `make_rwkv7` return a class pre-wrapped in `CUDAGraph` for every CUDA
+  backend, so `decode` and per-T `prefill` run from captured CUDA Graphs.
+  `RWKV7Torch` updates its state in place, so it captures too; pass
   `use_graph=False` to keep a truly eager class (e.g. the torch reference
   used for correctness gating).
-- **`demo.cuda_graph.CUDAGraph` is THE CUDA-Graph mechanism** (merges the old
-  `demo/graph_decode.py` `GraphDecoder` + `demo/prefill_graph.py` `PrefillGraph`).
-  Wrap any `RWKV7Model` instance: `model = CUDAGraph(RWKV7MX450(w))`, or via
+- **`demo.cuda_graph.CUDAGraph` is THE CUDA-Graph mechanism.** Wrap any
+  `RWKV7Model` instance: `model = CUDAGraph(RWKV7TL(w))`, or via
   `wrap_model(model)`, or `make_rwkv7(..., use_graph=True)` (returns a
   pre-wrapped class). It lazily captures the wrapped model's OWN `decode`
   (T=1) and `prefill` per exact T (T<=`prefill_graph_max_t`, default 64) by
   calling them against a fixed-address shadow `State`, then copies the caller's
   `State` in/out around each replay. Larger T, non-CUDA models, and any capture
   failure fall back to the wrapped model's eager path.
-- **Device-tuned variants live in `demo/tuned/` and are EAGER.** The only
-  remaining dedicated variant is `RWKV7MX450` (Turing sm_75: fp32 batch
-  GEMMs). `RWKV7RTX3060` was deleted: its only code was `state["x"].copy_()`
-  closures, now moved into the base -- the base fp16 is graph-capturable, so
-  on Ampere+ `tuned`/`rtx3060` select `RWKV7FP16` wrapped in `CUDAGraph`.
-  The wrapper is applied from the outside.
-  `backend="tuned"` picks one by CUDA device name and falls back to `"auto"`.
-  The fallback must be a real `try/except` (selector failure -> `None` -> `"auto"`),
-  not `try/finally` -- `finally` does NOT swallow exceptions, it only assigns
-  `backend`, and the traceback still propagates. Non-CUDA devices are guarded in
-  `make_tuned_model` (returns `None` before touching `torch.cuda`).
-  Measured on RTX 3060 / 0.1B: the graph-wrapped fp16 (`tl-rtx3060`) leads
-  faster3a_2607 at every T
-  <= 64 (2.30ms 1x1, 2.90ms 1x8, 3.19ms 1x32, 3.81ms 1x64); T=128 stays eager
-  and trails faster3a (~20 vs 7.8ms) -- large-T prefill is the common
-  tilelang-path bottleneck, out of scope here. With the prefill graph cap now
-  1024 (was 64), the current 0.1B numbers are in the baseline section of
-  `docs/benchmarks/rtx3060.md` (T=128 tl-fp16 5.15ms, 16x16 9.22ms).
 - **CUDA-Graph prefill requires in-place `state["x"]`.** The batch closures
   must `state["x"].copy_(x[-1])`, NOT rebind `state["x"] = x[-1]`, or a
   captured graph silently corrupts state across replays (measured rnn max_abs
-  1.4 vs 0.0). The fp16 base (`_rwkv7_base.py`) rebinds, so the tuned variants
-  override `make_TMIX_batch`/`make_CMIX_batch` to use `copy_`. `CUDAGraph`
+  1.4 vs 0.0). `rwkv7_tl.time_mix*`/`channel_mix*` use `copy_`. `CUDAGraph`
   detects a rebinding model (state tensor `data_ptr`s move during warmup) and
   transparently falls back to eager for the affected op.
 - **Models are stateless; `State` is passed explicitly.** `State` and model are
@@ -159,7 +144,10 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
 Implement and validate faster RWKV7 inference paths in this repo. Keep the implementation correct and verify it with the real benchmark and test scripts.
 
 **Long-term direction: rwkv-tl must support TRAINING.** All new operators/optimizations must keep autograd compatibility in mind:
-- The registered custom ops (`torch.ops.rwkv_tl.*`) exist precisely to enable future `register_autograd` backward definitions (the standard PyTorch op dispatch path).
+- The fused kernels (`cmix_decode`, `tmix_decode`, ...) are plain tilelang
+  kernels called from `demo.rwkv7_tl`; training support will need explicit
+  backward definitions (a future `torch.library` registration path), not
+  autograd through the raw kernel calls.
 - CUDA Graph (`CUDAGraph` in `demo/cuda_graph.py`) is INFERENCE-ONLY by design: it captures the forward launch sequence and does not rebuild an autograd graph (replay does not record gradients, fixed buffers conflict with autograd's dynamic graph). Do not route anything training-relevant through it. `make_rwkv7(..., use_graph=True)` (default) integrates it as the `decode`/`prefill` path via a stateless copy-in/out around a fixed shadow state.
 - A fully-fused single kernel is NOT inherently inference-only (unlike CUDA Graph) -- any custom CUDA kernel, fused or not, needs an explicit backward to support training. But fusing a whole layer makes training hard: you must hand-write the layer's backward (including the serial DPLR recurrence, which reverses in time and needs every intermediate state saved) and manually stage/save the per-op intermediates that autograd would otherwise keep. That is far more work and error-prone than the per-op custom-op path, where each op registers its own backward and intermediates stay in the autograd graph automatically. So: prefer per-op custom ops for training; do not build a whole-layer fused kernel for the training path.
 - Measured on RTX 3060 / 0.1B: CUDA-Graph decode (via `CUDAGraph`) is already 1.63 ms/token with launch gaps squeezed to ~0.08 ms (GPU kernel time ~1.55 ms). Fusing all decode layers into one kernel would gain <0.1 ms over that and (as above) hurt training. The remaining real cost is the ~1.5 ms of GEMV compute itself.
@@ -223,8 +211,8 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.
 - DPLR A term must be the L2-normalized key (kk/||kk||), not raw kk. Passing raw kk silently corrupts the state update and destabilizes the recurrence (decode/prefill diverged ~14 in logits and argmax flipped). `fused_l2norm_neg_kk_a` returns `(kk_norm, B)` for this reason.
-- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). `torch.compile(fullgraph=True)` requires the decode path to be a single graph, so `make_TMIX`/`make_CMIX` dispatch through the registered custom ops (`torch.ops.rwkv_tl.*`) whenever `is_torch_compile=True`; eager instances (is_torch_compile=False) keep raw kernels. The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
-- Custom-op dispatch overhead is ~0.3-2 ms per call (measured `fused_lerp6_rkv_copy` at 2.2 ms/call on MX450). Using them unconditionally slowed eager decode ~10x (113 ms/token vs 66 ms/token). `make_TMIX`/`make_CMIX` take a `use_custom_ops` flag: they dispatch through `torch.ops.rwkv_tl.*` ONLY when torch.compile is enabled (`use_custom_ops = is_torch_compile`), and call the raw tilelang kernels when eager. Never hard-code custom ops into the eager path.
+- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
+- The old `operator/` custom-op layer (`torch.ops.rwkv_tl.*`) is **deleted** (it wrapped the legacy per-op kernels). torch.compile of the fused decode path is not yet validated; if it graph-breaks, revisit after the fused kernels gain explicit autograd/`torch.library` support.
 - **Non-contiguous cuBLAS operands are ~2.7x slower on Turing.** A transposed
   weight view (`W.T`, strides `(1, N)`) passed straight to `matmul`/`bmm` runs
   far slower than the contiguous copy (measured `[128,768]@[768,3072]` fp32:
@@ -258,27 +246,35 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   without the graph it is launch-bound. The graph closes most of that gap;
   further gains need fusing the eager prefill ops (TMIX/CMIX GEMMs and gates
   are the launch-heavy part; `fused_dplr_T` is already single-kernel).
-- **Turing sm_75 fp16 GEMM is T-specialized.** `kernel/gemm.py` compiles a
+- **Turing sm_75 fp16 GEMM is T-specialized.** The legacy `kernel/old/gemm.py`
+  `fused_rkv_gemm` (used by the TMIX prefill transition) compiles a
   per-length tilelang kernel (native m16n8k8 MMA, 16x32x32/3-stage, autotuned on
   MX450) for fp16 on sm_75, because a dynamic-T version cannot reach that
   config's speed there (~12x slower). Lengths are restricted to `1..16` exact
-  plus powers of two `32..16384`; `fused_rkv_gemm` binary-searches the smallest
-  covering length, pads the input, runs, and slices back (measured fastest on
-  MX450 -- kernel time scales ~linearly, larger kernels only add pad waste).
+  plus powers of two `32..16384`; it binary-searches the smallest covering
+  length, pads the input, runs, and slices back (measured fastest on MX450).
   Each distinct (C, length) compiles once lazily (~8 s on MX450) and is cached
   by tilelang, so arbitrary prompt lengths pay a one-time compile. bf16 has no
   sm_75 MMA atom -> stays on cuBLAS bmm (fast fp32 emulation there); sm_80+
-  keeps the dynamic-T kernel. The dtype check in `fused_rkv_gemm` protects
-  RWKV7MX450's fp32-input bmm path.
+  keeps the dynamic-T kernel.
 - **`generate(stop=...)` matches exact token-id sequences.** This is fragile for substring stops like `"\n\nUser:"`: the model can emit that text with a different tokenization than `tokenizer.encode` (measured: model emits `[..., 28329("…。\n"), 11("\n"), 24281("User"), 59(":")]` vs `encode("\n\nUser:") == [261, 24281, 59]`), so the tail never equals the stop sequence and generation leaks the next turn. Do NOT rely on substring-text stops. Once RWKV checkpoints ship a dedicated conversation-stop token id, use THAT as the stop -- token-exact matching is then correct. (Text-based matching was considered and intentionally not implemented; the dedicated stop token supersedes it.)
 - Default inference is **fp16** (checkpoints are bf16, converted once at
   `RWKV7Weight` load when `dtype=torch.float16`, the default). The bf16 path
-  (`RWKV7BF16` + `RWKV7Weight(..., dtype=torch.bfloat16)`) keeps the raw
-  checkpoint dtype and is a reference/experimental variant. The compile
-  decision is purely `is_torch_compile`.
+  (`RWKV7TL` on `RWKV7Weight(..., dtype=torch.bfloat16)`) keeps the raw
+  checkpoint dtype and is a reference/experimental variant (sm_80+ only; the
+  fused kernels need bf16 tensor cores). The compile decision is purely
+  `is_torch_compile`.
 - `RWKV7Weight(model_path, device=None)` loads directly to the target device via `torch.load(..., map_location=device)` -- the repo checkpoints are saved on cuda, so without `device` the tensors land on cuda regardless of context. The benchmark loads ONE fresh `RWKV7Weight` per target and frees it (`del` + `gc.collect()` + `empty_cache()`) before the next target, so only one weight copy is resident at a time (MX450 has 2GB VRAM); the correctness reference shares the target's weight object.
-- Kernels are compiled PER-MODEL with static H/C (model constants baked at compile time; only T_LEN stays dynamic): each kernel file exposes `@functools.cache` factories (`_dplr_kernel(H)`, `_lerp6_kernel(C)`, ...) and the wrappers dispatch by input shape. Only compile-time model constants go static; per-call sizes (token count) stay dynamic.
-- Compute is **fp16 IO + fp32 accumulation**, DPLR state is **fp32** (matching Albatross): RNN state `[H,N,N]` is fp32 (not fp16-rounded each step), IO (r/w/k/v) stays fp16. Weights are converted bf16->fp16 once at `RWKV7Weight` load. `_dplr_kernel`/`_dplr_T_kernel` read/write fp32 S; pure_torch reference matches.
+- Fused kernels are compiled PER-SHAPE via `@tilelang.jit` / `@functools.cache`
+  factories (`_cmix_decode_kernel(C, DTYPE)`, `_tmix_decode_kernel(C, DTYPE,
+  H, Rv, Rw, Ra, Rg)`, ...); model constants (C, H, gate ranks) are baked at
+  compile time, only sequence length stays dynamic (`LEN`/`T_LEN`). Weights
+  stay at the model IO dtype -- **no fp32 weight copies anywhere**.
+- Compute is **fp16 IO + fp32 accumulation**, DPLR state is **fp32** (matching
+  Albatross): RNN state `[H,N,N]` is fp32 (not fp16-rounded each step), IO
+  (r/w/k/v) stays fp16. Weights are converted bf16->fp16 once at
+  `RWKV7Weight` load. `tmix_decode`'s DPLR reads/writes fp32 S; the pure-torch
+  reference matches.
 - Prefill DPLR is a **single-shot kernel** (`fused_dplr_T` / `_dplr_T_kernel`): one launch processes the whole [T,H,N] sequence, serial state recurrence inside each (h,v_n) block. Verified: y outputs bit-match the reference through long T.
 
 ## Planned architecture direction
@@ -291,21 +287,18 @@ done yet. When working on the related area, remind the user whether to proceed.
   graph-wrapped via `make_rwkv7(use_graph=True)`) on the RTX 3060 before
   settling the default. Requires the RTX 3060 box (not this MX450 laptop).
 
-- **DONE — model code moved out of `src/rwkv_tl/`.** The library ships only
-  kernels + operators + state/sampling/weight/tokenizer (in `rwkv_tl.kernel` /
-  `rwkv_tl.operator`); model implementations
-  live in `demo/` (one class per device/kernel strategy):
-  `demo.rwkv7_fp16.RWKV7FP16` (tilelang fp16, sm_80+), `demo.rwkv7_bf16.RWKV7BF16`
-  (tilelang bf16), `demo.rwkv7_torch.RWKV7Torch` (pure torch reference).
-  Device-tuned variants live in `demo/tuned/`:
-  `demo.tuned.rwkv7_mx450.RWKV7MX450`
-  (sm_75: fp32 batch GEMMs + T<=16 tilelang fp16 rkv; eager, graph-safe).
-  `RWKV7RTX3060` was deleted (its `copy_` closures moved into the base).
-  `demo.cuda_graph.CUDAGraph` (merges the old `GraphDecoder`/`PrefillGraph`)
+- **DONE — model code lives in `demo/`, functional style.** The library ships
+  only kernels + state/sampling/weight/tokenizer (in `rwkv_tl.kernel` /
+  `rwkv_tl.state` / ...); model implementations live in `demo/`:
+  `demo.rwkv7_tl.RWKV7TL` (fused tilelang kernels, fp16/bf16) and
+  `demo.rwkv7_torch.RWKV7Torch` (pure torch reference). The model is
+  functional (like `rwkv7_torch`): module-level `time_mix` / `channel_mix` /
+  `time_mix_batch` / `channel_mix_batch` take the weight + input + state dict,
+  and `RWKV7TL.decode`/`prefill` loop the blocks. `demo.cuda_graph.CUDAGraph`
   wraps any `RWKV7Model` instance and provides CUDA-Graph decode + per-T
-  prefill.
-  `demo.make_rwkv7(device, backend=...)` returns a model *class* and picks by
-  CUDA device name (`"tuned"`, default) or arch (`"auto"`).
+  prefill. `demo.make_rwkv7(device, backend=...)` returns a model class; all
+  tilelang backends resolve to `RWKV7TL` (the per-device `tuned` variants were
+  deleted with the fp32-GEMM workaround).
 - **Adopt a stateless operator API.** Future kernel/operator APIs should take
   `initial_state` and return `final_state` explicitly instead of mutating an
   in-place `state` dict. This is clearer, autograd-friendly, and matches the
