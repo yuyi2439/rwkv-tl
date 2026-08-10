@@ -207,6 +207,21 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 
 ## Known issues and notes
 
+- **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
+  errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
+  Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060
+  (sm_86), so it is a bug in the new `tmix_decode` bf16 path, not a hardware
+  limit. fp16 is unaffected (full suite minus bf16 passes). See
+  `docs/validation_rtx3060.md`.
+- **Decode regressed with the neo-kernel path (a8e2ef7).** Measured on RTX 3060
+  / 0.1B: `tl-fp16` decode went 2.36ms (legacy per-op kernels + graph) to
+  eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Single
+  fused kernels are fast (`tmix_decode` 0.13ms, `cmix_decode` 0.12ms), so the
+  cost is in the decode chain: suspected (a) `CUDAGraph.decode`'s per-token
+  State copy-in/out (12 layers x 3 fields = ~36 tiny `copy_` launches) plus the
+  `.item()` sync, (b) `tmix_decode` still launching several kernels per layer.
+  On 1.5B the gap widens (18.93 vs faster3a 7.91ms). See
+  `docs/benchmarks/rtx3060.md` "neo kernels 基线" and TODO #1.
 - The pure-torch baseline was improved by batched prefill work.
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.

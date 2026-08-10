@@ -3,6 +3,36 @@
 > 本文档记录当前版本在 RTX 3060 上的验证测试结果。使用中文撰写。
 > MX450 (sm_75) 的验证记录见 [validation_mx450.md](validation_mx450.md)。
 
+## 三模型 fp16 vs faster3a 基准（2026-08-10，a8e2ef7）
+
+### 版本与环境
+
+| 项目 | 值 |
+|---|---|
+| 代码版本 | 分支 `neo-kernel`，commit `a8e2ef7`（use neo kernels） |
+| GPU | NVIDIA GeForce RTX 3060 (sm_86, 12GB) |
+| TileLang | 0.1.13 |
+| 测试日期 | 2026-08-10 |
+
+三个模型（0.1B g1d / 0.4B g1d / 1.5B g1i）分别跑 `tl-fp16`（本项目，graph 包装）
+与 `faster3a_2607`（Albatross，无 graph），独立进程串行，warmup=10, iters=30。
+结果见 [benchmarks/rtx3060.md](benchmarks/rtx3060.md)「neo kernels 基线」章节。
+
+要点：
+- prefill T=8/32/64 三模型均快 faster3a 1.6-2.4x。
+- decode 1x1 回归：0.1B tl-fp16 graph 4.15ms > eager 3.44ms，1.5B 18.93ms vs faster3a
+  7.91ms（慢 2.4x）。单 kernel 不慢（tmix_decode 0.13ms / cmix_decode 0.12ms @ 0.1B），
+  疑为 CUDAGraph decode 的 State copy-in/out（36 次小 copy_）+ `.item()` 同步主导。
+- 1.5B (g1i) 加载 + 正确性 + 完整 benchmark 均通过（TODO #4 完成）。
+
+### bf16 回归（a8e2ef7 新引入，未修）
+
+`test_forward.py::test_bf16_consistent` **失败**：`tmix_decode` 的 bf16 编译报
+`Cannot find var remap for xr`（`unsupported_dtype_legalize.cc:713`）。与 AGENT.md
+记录的 MX450 sm_75 bf16 错误同型，但**这次发生在 RTX 3060 (sm_86)**——是 a8e2ef7
+新 `tmix_decode` 的 bf16 路径 bug，非硬件限制（fp16 全套 25 passed）。fp16 不受影响。
+排查方向：`tmix_decode`/`gemv_macro` 的 bf16 dtype remap。
+
 ## neo CMIX kernel + recompute 策略验证（2026-08-10）
 
 ### 版本与环境

@@ -15,6 +15,14 @@ decode 是 `[C]×[C,C]`（M=1），TensorCore m16n8k16 对 M=1 利用率仅 1/16
 graph_decoder 的 1.55ms GPU kernel time 里 GEMV 计算是主要成本，手写预计快 30-50%。
 这是当前 decode 路径收益最大的单项优化。
 
+**观察（2026-08-10）**：neo kernels 启用后（a8e2ef7）decode 反而变慢——0.1B
+tl-fp16 从旧基线 2.36ms（逐 op kernel + graph）涨到 graph 4.15ms / eager 3.44ms。
+单 kernel 不慢（`tmix_decode` 0.13ms / `cmix_decode` 0.12ms @ 0.1B），但整链慢，
+且 graph 比 eager 更慢。疑点：(a) `CUDAGraph` decode 每 token 的 State copy-in/out
+（12 层 × 3 字段 ≈ 36 次小 `copy_`）+ `.item()` 同步；(b) `tmix_decode` 每层仍多
+kernel。1.5B 上 decode 18.93ms vs faster3a 7.91ms（慢 2.4x）。这是 decode 优化的
+当前直接基线，见 docs/benchmarks/rtx3060.md「neo kernels 基线」。
+
 ### #2 batch decode（B>1）
 
 目前 decode 只支持 B=1。RNN 架构无 KV cache 内存爆炸，对 batching 有天然优势。
@@ -43,7 +51,9 @@ DPLR N 维并行度变化。7.2B 需等量化支持后再测（bf16 ~14.4GB）�
 
 **进度（2026-08-08）**：`rwkv7-g1i-1.5b-20260805-ctx16384.pth`（C=2048, H=32, N=64,
 L=24）已在本机 3060 加载成功（g1i 权重键结构与 g1d 一致，`RWKV7Weight` 零改动），
-decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。完整 benchmark 待补。
+decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。
+**进度（2026-08-10）**：完整 benchmark 已补测（neo kernels 基线，a8e2ef7）：1.5B
+prefill T=8/32 快 faster3a ~2x，但 decode 1x1（18.93ms）与 T≥64 prefill 落后。
 详见 docs/benchmarks/rtx3060.md。
 
 ## P2 — 训练路径

@@ -76,6 +76,12 @@ warmup=10, iters=20，正确性门控全过。`tl-fp16`/`tl-bf16`/`pure-torch` �
 （decode + per-T prefill graph，`prefill_graph_max_t=1024`）。faster3a_2607 无 graph。
 数据采集：2026-08-08，neo-kernel 分支（fused_rank_gemv/fused_gates 融合 + graph cap 1024）。
 
+> **注（2026-08-10）**：下表 tl-fp16 数字采集于旧路径（逐 op kernel，commit 5d4da6b）。
+> commit a8e2ef7 启用 neo kernels（`RWKV7TL` + `tmix_decode`/`cmix_decode`/`cmix_prefill`）
+> 后的三个模型（0.1B/0.4B/1.5B）对比见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)
+> 「neo kernels 基线」。核心变化：prefill T≥8 仍快 faster3a ~2x，但 decode 1x1 回归
+> （0.1B 2.36 → 4.30ms；1.5B 慢 faster3a 2.4x），详见该文档。
+
 | 实现 | B×T | p50 (ms) | tok/s |
 |---|---|---|---|
 | faster3a_2607 | 1×1 | 5.94 | 168.26 |
@@ -231,6 +237,9 @@ warmup=10, iters=20，正确性门控全过（`tl-fp16` 对 pure-torch 门控）
 ## 简要解释
 
 ### CUDA (RTX 3060, sm_86, 目标卡)
+
+> 以下解释对应上表旧路径（5d4da6b）数据。neo kernels（a8e2ef7）后的三模型对比
+> 见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)「neo kernels 基线」。
 
 - **tl-fp16 全面领先**（除 16x16 真 batch 外）：T=1..128 均快于 faster3a_2607
   （1×1 2.36 vs 5.94ms，1×8 2.92 vs 7.97ms，1×32 3.35 vs 9.55ms，1×64 3.81 vs 9.92ms，
