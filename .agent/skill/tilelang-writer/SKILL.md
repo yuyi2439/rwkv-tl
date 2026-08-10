@@ -42,6 +42,11 @@ out = fused_ln(768, "float16")(x, w, b)   # 3 inputs; out auto-allocated
   `# pyright: reportInvalidTypeForm=false` at the top of that file. Only apply
   it when the warnings actually appear; it is a tooling workaround, not a
   mandatory header.
+- **Suggestion (not a requirement): pyright/pylance `reportCallIssue` on
+  `T.float32(...)`/`T.float16(...)`.** The installed tilelang's scalar-type
+  helpers have no parameters in their type signatures, so pylance flags every
+  `T.float32(0.0)` call. Fix: append `# pyright: ignore[reportCallIssue]` on
+  that line.
 
 ## 2. One prim_func = one host wrapper + N kernels
 
@@ -177,6 +182,52 @@ On AMD, tilelang's `warp_reduce_sum` keeps **32-lane logical-warp semantics** on
 both CDNA (wave64) and RDNA (wave32). Do NOT set `WARP` to the hardware
 wavefront (64): the reduce would then cover only lanes 0-31 and silently drop
 half the reduction. `SERIAL = DIM // WARP` stays 2 on every backend.
+
+## 5c. GEMV: layout and lane-per-output idiom
+
+Decode-path GEMVs (`out[m] = sum_k x[k] * W[k, m]`, i.e. `x @ W`) work with
+the weight in the project's stored `*t` `[in, out]` `[K, M]` layout directly —
+no transposed `[M, K]` copy needed (this repo never stores two weight
+orientations). Use lane-per-output (one lane owns one output, serial over K),
+which reads the `[K, M]` rows coalesced:
+
+```python
+acc = T.alloc_fragment((WARP,), "float32")
+T.clear(acc)
+for k in T.serial(K):
+    for i in T.Parallel(WARP):
+        acc[i] += T.cast(x[k], "float32") * T.cast(W[k, bx * WARP + i], "float32")
+for i in T.Parallel(WARP):
+    out[bx * WARP + i] = T.cast(acc[i], DTYPE)
+```
+
+- **The fragment must be `(WARP,)` + `T.Parallel(WARP)`, NOT a `(1,)`
+  fragment indexed by lane.** A `(1,)` fragment is treated as replicated across
+  threads, so the store is emitted only from thread 0 and silently drops 31/32
+  of the outputs. `(WARP,)` + `T.Parallel` distributes element `i` to thread
+  `i`, and the generated code stores `out[bx*32+threadIdx.x]` per-lane
+  correctly. (`T.alloc_var(...)` `+=` also fails in the eager builder:
+  `'BufferLoad' object is not subscriptable`.)
+- **`[M, K]` layout is NOT a requirement.** A warp-per-output kernel that reads
+  the `[K, M]` *columns* (fixed m, varying k) is strided and ~10x slow, which
+  misleads into wanting a transposed weight. The lane-per-output row-read above
+  fixes it without changing the layout.
+- **No warp reduce needed**: each lane's accumulator is its own output. The
+  warp-per-output + `warp_reduce_sum` structure is only needed when the K-dim
+  must be shared across a warp (e.g. per-output-row over a `[M, K]` weight).
+- **Vectorizing per-lane over VEC consecutive outputs** helps tall shapes
+  (e.g. `M=1024, K=4096` ~2.9x) but hurts small-M (fewer blocks -> low
+  occupancy); tune per shape. The small-M occupancy gap is closed by
+  multi-row-per-block (multiple warps per block), not by vectorization.
+- **THREADS-per-block is a free parameter here** (each thread owns one output,
+  `M % THREADS == 0`), but measured on MX450 WARP=32 is best or tied for every
+  decode shape: bigger blocks cut launch overhead yet shrink the block count
+  below one per SM on a small GPU, and this memory-bound kernel loses more to
+  occupancy than it gains. Re-tune per GPU. This does NOT transfer to other
+  kernel structures: a `T.gemm` kernel's THREADS is a warp partition for the
+  MMA tile and measured best at 64-256 (32 = one warp underutilizes the tile,
+  ~2x slower), and elementwise per-row kernels (1 block per row) had no
+  consistent THREADS winner across LEN. Tune each structure separately.
 
 ## 6. T.dynamic + T.macro: the object-identity pitfall
 

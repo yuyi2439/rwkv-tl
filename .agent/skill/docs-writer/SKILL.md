@@ -22,13 +22,16 @@ Decide placement first; a finding lives in exactly one place.
 |---|---|
 | TileLang / kernel-writing knowledge (how to use `T.gemm`, `T.dynamic`, `T.macro`, tiling, pitfalls) | skill, e.g. `.agent/skill/tilelang-writer` |
 | Repo-specific conventions (project layout, `make_rwkv7` backends, CUDA-graph mechanism, state design, kernel dtype binding) | `AGENT.md` "Project structure and standards" |
+| Repo code/documentation standards — how *this repo* writes and documents its code (docstring `Args:` conventions, where parameter/layout requirements go, internal tuning vars as comments, naming rules) | `AGENT.md` "Project structure and standards" |
+| Requirements about how documentation and skills are written (docstring conventions, skill-writing rules, this file's own rules) | this skill, `.agent/skill/docs-writer` |
 | Python-language facts that are project standards (e.g. tilelang DSL files must not use `from __future__ import annotations`) | `AGENT.md` "Project structure and standards" |
 | Benchmark results and experiment findings | `docs/` (Chinese, report-like) |
 | Facts you can point out without study (e.g. Python `^` is XOR, not power) | nowhere — skip |
 
 Test: if a TileLang kernel-writer would need this to write a kernel, it is a
-skill item. If it constrains how *this repo* is organized, it is an AGENT.md
-item. If it is general Python/tool trivia anyone would notice, it is nothing.
+skill item. If it constrains how *this repo* is organized, or how its code is
+written or documented, it is an AGENT.md item. If it is general Python/tool
+trivia anyone would notice, it is nothing.
 
 ## 2. What NOT to write
 
@@ -57,6 +60,14 @@ item. If it is general Python/tool trivia anyone would notice, it is nothing.
 - Body: step-by-step instructions, reusable code snippets, best practices, and
   common pitfalls with the **exact error messages** (so agents can grep-match
   a failure to a fix). English only.
+- **Skills are portable and self-contained: they must not reference anything
+  outside the skill** — no `AGENT.md`/`CONTRIBUTING.md`/`docs/` links, no
+  pointing at another skill's content, no "this is an AGENT.md item" notes
+  (even negative mentions). A skill stands alone and must be usable in any
+  project. If a rule is actually a repo standard, it belongs in `AGENT.md`,
+  and the skill stays silent about it. When you need to move content out of a
+  skill into AGENT.md, delete it from the skill completely — do not leave a
+  pointer.
 - **Scope the content to the subject.** A tilelang skill contains only tilelang
   knowledge — no general Python trivia (that belongs nowhere, or in AGENT.md as
   a project standard if it is one).

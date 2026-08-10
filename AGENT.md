@@ -91,6 +91,14 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   direct nonlocals, so a closure `DTYPE`/`C` param fails with `NameError`. The
   pre-dtype-split files used literal `"float16"`/`"bfloat16"` strings and could
   keep the import; `build(DTYPE)` files cannot.
+- **Docstring conventions for `src/rwkv_tl/` code.** Parameter requirements go
+  in the `Args:` section of the docstring of the function that takes that
+  parameter (e.g. a macro factory's `M`/`K` divisibility constraints go in its
+  own docstring, not a free-standing "Requires: ..." paragraph). Tensor layout
+  requirements (e.g. `W` must be `[M, K]`) go in the macro `_impl`'s docstring
+  next to that tensor's `Args:` entry, so editors surface them where the
+  parameter is declared. Function-internal tuning knobs (block sizes, `VEC`,
+  `STAGES`) are inline comments, not docstring material.
 - **Dtype plumbing.** `RWKV7Weight(path, dtype=...)` controls weight precision
   (default `torch.float16`, converts the bf16 checkpoint once at load; pass
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
@@ -181,6 +189,10 @@ ACTIVE optimization target (`tl-mx450`), not just historical: it is a Turing
 card with pathological fp16 cuBLAS GEMMs and severe thermal throttling under
 sustained load (latencies inflate up to ~50%, p90 >> p10) -- treat single-session
 relative comparisons as reliable, absolute numbers as noisy.
+**MX450 (sm_75) has no bf16 tensor cores: do NOT test or benchmark bf16 here**
+(tilelang bf16 kernels can fail to compile/lower on this device, e.g.
+"Cannot find var remap for <buffer>" in `StorageLegalizer`). bf16 paths must be
+validated on sm_80+ (RTX 3060 box); MX450 work is fp16-only.
 
 ## Performance work
 
