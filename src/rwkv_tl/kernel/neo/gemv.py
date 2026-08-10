@@ -68,6 +68,7 @@ def gemv(M: int, K: int, DTYPE: str, THREADS: int = WARP):
     def _impl(
         x: T.Tensor((K,), DTYPE),
         W: T.Tensor((K, M), DTYPE),
+        *,
         out: T.Tensor((M,), DTYPE),
     ):
         with T.Kernel(M // THREADS, threads=THREADS) as bx:

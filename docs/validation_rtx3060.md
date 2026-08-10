@@ -26,7 +26,7 @@ eager CMIX 链 max_abs < 0.002）。
 
 ### recompute 开/关对比（cmix_prologue_prefill）
 
-`cmix_prologue_prefill_macro` 的 token-shift 源策略由 `recompute` 参数选择：
+`cmix_prefill_prologue_macro` 的 token-shift 源策略由 `recompute` 参数选择：
 - **recompute=True（默认）**：2 kernel，block 内重算 `LN_pre(x0[n-1])`（只读不可变
   `x0`），LN+lerp 融进 1 kernel；代价是 LN 计算量翻倍、省 1 次 launch。
 - **recompute=False**：3 kernel（全量 LN → lerp 读 `x_ln[n-1]` → 拷回 `prev_x`）。

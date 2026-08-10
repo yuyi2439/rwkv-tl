@@ -21,7 +21,7 @@
 1. **decode 残差 epilogue 未接线**：`_add_residual` 引用了不存在的全局 `residual`；
    `gemv_macro` 的 epilogue 文档签名是 `(acc, index, residual)` 但只传 2 参。
    修复：`gemv_macro` 新增可选 `residual` 张量参数（`kernel/neo/gemv.py`），
-   down GEMV 以 `residual=x0` 调用（`cmix_main_decode_macro`）。
+   down GEMV 以 `residual=x0` 调用（`cmix_decode_main_macro`）。
 2. **decode prologue 张量形状不匹配**：`cmix_prologue_macro` 声明 `x0: [LEN, C]`，
    但 `cmix_decode` 传 1D `[C]` 单 token。修复：按 `LEN == 1` 区分 1D/2D 分支。
 3. **token-shift 语义回归**：重构把 shift 源从 `x_ln[n-1]`（前一 token 的 LN 输出，

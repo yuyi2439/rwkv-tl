@@ -78,7 +78,7 @@ def ln_pre_row_macro(LEN, C: int, DTYPE: str):
 ##### decode
 
 
-def cmix_prologue_decode_macro(C: int, DTYPE: str, THREADS: int = 256):
+def cmix_decode_prologue_macro(C: int, DTYPE: str, THREADS: int = 256):
     """Decode cmix prologue: ``x = LN_pre(x0) + x_k * (prev_x - LN_pre(x0))``.
 
     Fuses the whole prologue into ONE kernel (decode is the hot path; every
@@ -156,10 +156,10 @@ def cmix_prologue_decode_macro(C: int, DTYPE: str, THREADS: int = 256):
     return _impl
 
 
-def cmix_main_decode_macro(C: int, DTYPE: str, THREADS: int = WARP):
+def cmix_decode_main_macro(C: int, DTYPE: str, THREADS: int = WARP):
     """Fused single-token cmix main: ``out = x0 + relusq(x @ kWt) @ vWt``.
 
-    Decode version of ``cmix_main_prefill_macro``: x is one token ``[C]``
+    Decode version of ``cmix_prefill_main_macro``: x is one token ``[C]``
     instead of ``[LEN, C]``, so the two GEMMs collapse to two GEMVs. Both are
     ``gemv_macro`` calls with the epilogue fused in: ``relusq`` on the up pass
     and the ``x0`` residual add on the down pass.
@@ -215,8 +215,8 @@ def cmix_decode(C: int, DTYPE: str):
             kernels; must divide ``C`` and ``4*C``.
     """
     HID = 4 * C
-    prologue = cmix_prologue_decode_macro(C, DTYPE)
-    main = cmix_main_decode_macro(C, DTYPE)
+    prologue = cmix_decode_prologue_macro(C, DTYPE)
+    main = cmix_decode_main_macro(C, DTYPE)
 
     @T.prim_func
     def _impl(
@@ -243,7 +243,7 @@ def cmix_decode(C: int, DTYPE: str):
 ##### prefill
 
 
-def cmix_prologue_prefill_macro(
+def cmix_prefill_prologue_macro(
     LEN, C: int, DTYPE: str, THREADS: int = 256, recompute: bool = True
 ):
     """Prefill cmix prologue: ``x = LN_pre(x0) + x_k * (prev - LN_pre(x0))``.
@@ -393,7 +393,7 @@ def cmix_prologue_prefill_macro(
     return _impl
 
 
-def cmix_main_prefill_macro(
+def cmix_prefill_main_macro(
     LEN, C: int, DTYPE: str, LEN_block: int, THREADS: int = 128
 ):
     """Fused cmix main: ``out = x0 + relusq(x @ kWt) @ vWt``.
@@ -407,7 +407,7 @@ def cmix_main_prefill_macro(
     """
     assert LEN_block % 16 == 0
     HID = 4 * C
-    bytes = T.dtype(DTYPE).bytes  # pyright: ignore[reportCallIssue]
+    dtype_bytes = T.dtype(DTYPE).bytes  # pyright: ignore[reportCallIssue]
 
     # TODO: tune these and THREADS parameter
     _BK = 32
@@ -415,7 +415,7 @@ def cmix_main_prefill_macro(
     HID_block = 128
 
     # shared ≤ 48KB  (note: `^` is XOR, use `**` for power)
-    assert (LEN_block * _BK + _BK * HID_block) * STAGES * bytes <= 48 * 2**10
+    assert (LEN_block * _BK + _BK * HID_block) * STAGES * dtype_bytes <= 48 * 2**10 # pyright: ignore[reportOperatorIssue]
 
     # # Look at https://github.com/tile-ai/tilelang/issues/2916
     # LEN = T.dynamic("LEN")
@@ -490,8 +490,8 @@ def cmix_prefill(C: int, DTYPE: str, LEN_block: int):
     HID = 4 * C
 
     LEN = T.dynamic("LEN")
-    prologue = cmix_prologue_prefill_macro(LEN, C, DTYPE)
-    main = cmix_main_prefill_macro(LEN, C, DTYPE, LEN_block)
+    prologue = cmix_prefill_prologue_macro(LEN, C, DTYPE)
+    main = cmix_prefill_main_macro(LEN, C, DTYPE, LEN_block)
 
     @T.prim_func
     def _impl(
