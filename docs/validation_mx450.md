@@ -112,3 +112,21 @@ RWKV_CHECKPOINT_PATH=~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth .venv/bin/python
 收益来源：一次 host 调用顺序 launch 全部 kernel（省 Python dispatch 与中间
 `[C]`/rank 张量的分配/释放），以及 prologue 把 LN+6-shift 融成 1 个 kernel。
 MX450 热节流导致各次运行波动，但加速比稳定在 ~2.5x 以上。
+
+## 与 Albatross (faster3a_2607) 对比（2026-08-10, MX450 0.1B, eager）
+
+`script/benchmark_rwkv7.py`，eager（无 CUDA Graph），warmup=20 iters=100，
+对比 `tl-fp16`（重构后 RWKV7TL）vs faster3a_2607：
+
+| Case | faster3a_2607 | tl-fp16 | 加速比 |
+|---|---|---|---|
+| 1x1 decode | 15.28 ms | 9.12 ms | 1.68x |
+| 1x8 | 24.63 ms | 19.65 ms | 1.25x |
+| 1x32 | 43.88 ms | 23.34 ms | 1.88x |
+| 1x128 | 87.80 ms | 56.69 ms | 1.55x |
+| 1x256 | 169.48 ms | 120.66 ms | 1.40x |
+| 1x512 | 258.93 ms | 236.69 ms | 1.09x |
+
+结论：decode 与小-中 prefill 领先 1.25-1.88x（融合 kernel 一次 host 调用 +
+省中间张量分配）；大 T 趋平（GEMM 计算主导）。均为 eager 数值，未叠 CUDA
+Graph（Graph 会进一步拉开 decode 差距）。
