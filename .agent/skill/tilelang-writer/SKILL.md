@@ -302,7 +302,7 @@ with T.Kernel(LEN, threads=THREADS) as n:
   down+residual epilogue). A *single* one-kernel up+relu2+down+residual forces a
   1D grid (hidden `[BM,4C]` exceeds shared, every block re-reads all weights)
   and is ~20x slower — keep it only as a reference.
-- **Whole-chain fusion pays at small/medium T**: `fused_multi_cmix` (LN_pre +
+- **Whole-chain fusion pays at small/medium T**: `cmix_prefill` (LN_pre +
   internal token-shift lerp + state copy + up + relu2 + down + residual in one
   prim_func = 5 kernels / 1 host call) beats the eager python-mediated CMIX
   ~1.4-2x at T=32..128, ~parity at T=256. Gains come from fewer kernels /

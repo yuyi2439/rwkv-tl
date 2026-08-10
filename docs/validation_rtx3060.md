@@ -1,0 +1,56 @@
+# RTX 3060 验证测试记录
+
+> 本文档记录当前版本在 RTX 3060 上的验证测试结果。使用中文撰写。
+> MX450 (sm_75) 的验证记录见 [validation_mx450.md](validation_mx450.md)。
+
+## neo CMIX kernel + recompute 策略验证（2026-08-10）
+
+### 版本与环境
+
+| 项目 | 值 |
+|---|---|
+| 代码版本 | 分支 `neo-kernel`，commit `cc09d44`（neo cmix kernels 补全） |
+| GPU | NVIDIA GeForce RTX 3060 (sm_86, 12GB) |
+| TileLang | 0.1.13 |
+| PyTorch | 2.13.0+cu130 |
+| 测试日期 | 2026-08-10 |
+
+### 完整测试套件
+
+`RWKV_CHECKPOINT_PATH=...0.1b.pth .venv/bin/python -m pytest test/` → **24 passed, 1 skipped**。
+（本轮在重建的 `.venv` 上执行：conda 路径 miniconda3 → `.miniconda3` 重命名导致链接断裂，
+`uv sync` 后以 python3.14 重建，全套仍通过。）
+
+`test/test_neo_cmix.py` 5 项在 3060 上全部通过（C=768 fp16，decode 与 prefill 相对
+eager CMIX 链 max_abs < 0.002）。
+
+### recompute 开/关对比（cmix_prologue_prefill）
+
+`cmix_prologue_prefill_macro` 的 token-shift 源策略由 `recompute` 参数选择：
+- **recompute=True（默认）**：2 kernel，block 内重算 `LN_pre(x0[n-1])`（只读不可变
+  `x0`），LN+lerp 融进 1 kernel；代价是 LN 计算量翻倍、省 1 次 launch。
+- **recompute=False**：3 kernel（全量 LN → lerp 读 `x_ln[n-1]` → 拷回 `prev_x`）。
+
+3060 本机实测（C=768 fp16，整链 `cmix_prefill`，5 次独立 run 取中位数）：
+
+| LEN | recompute=True | recompute=False | 加速比 | 胜者 |
+|---|---:|---:|---:|---|
+| 32 | 0.142 ms | 0.147 ms | 1.04x | True |
+| 64 | 0.140 ms | 0.148 ms | 1.06x | True |
+| 128 | 0.142 ms | 0.222 ms | 1.57x | True |
+| 256 | 0.155 ms | 0.166 ms | 1.08x | True |
+| 512 | 0.252 ms | 0.251 ms | 1.00x | 持平 |
+
+- **recompute=True 在 sm_86 上全面胜出或持平**，与 MX450 (sm_75) 的 14-32% 结论一致；
+  T=512 打平（大 T 时 GEMM 占主导，prologue 差异被摊薄）。默认值正确，无需按硬件分支。
+- 正确性：两种实现整链输出 max_abs 0.002（fp16 ULP 级），`prev_x` 状态完全一致，
+  数值等价。
+
+运行命令：
+
+```bash
+.venv/bin/python -m pytest test/test_neo_cmix.py -v
+RWKV_CHECKPOINT_PATH=...0.1b.pth .venv/bin/python -m pytest test/
+# recompute 对比
+.venv/bin/python /tmp/opencode/rwkv-tl-bench/bench_recompute2.py
+```
