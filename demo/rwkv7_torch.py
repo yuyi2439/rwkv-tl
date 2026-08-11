@@ -75,12 +75,12 @@ def time_mix(
     x = weight.ln_pre(x0)
     prev = state["x"]
 
-    xr = _lerp(x, prev, weight.x_r)
-    xw = _lerp(x, prev, weight.x_w)
-    xk = _lerp(x, prev, weight.x_k)
-    xv = _lerp(x, prev, weight.x_v)
-    xa = _lerp(x, prev, weight.x_a)
-    xg = _lerp(x, prev, weight.x_g)
+    xr = _lerp(x, prev, weight.x_rkvwag[0])
+    xk = _lerp(x, prev, weight.x_rkvwag[1])
+    xv = _lerp(x, prev, weight.x_rkvwag[2])
+    xw = _lerp(x, prev, weight.x_rkvwag[3])
+    xa = _lerp(x, prev, weight.x_rkvwag[4])
+    xg = _lerp(x, prev, weight.x_rkvwag[5])
     # copy after reading prev: state["x"] aliases prev, so an
     # earlier in-place copy_ here would corrupt prev before use.
     state["x"].copy_(x)
@@ -143,12 +143,12 @@ def time_mix_batch(
     T_len = x0.shape[0]
     x = weight.ln_pre(x0)
     prev = torch.cat([state["x"].unsqueeze(0), x[:-1]], dim=0)
-    xr = _lerp(x, prev, weight.x_r)
-    xw = _lerp(x, prev, weight.x_w)
-    xk = _lerp(x, prev, weight.x_k)
-    xv = _lerp(x, prev, weight.x_v)
-    xa = _lerp(x, prev, weight.x_a)
-    xg = _lerp(x, prev, weight.x_g)
+    xr = _lerp(x, prev, weight.x_rkvwag[0])
+    xk = _lerp(x, prev, weight.x_rkvwag[1])
+    xv = _lerp(x, prev, weight.x_rkvwag[2])
+    xw = _lerp(x, prev, weight.x_rkvwag[3])
+    xa = _lerp(x, prev, weight.x_rkvwag[4])
+    xg = _lerp(x, prev, weight.x_rkvwag[5])
     state["x"].copy_(x[-1])
 
     r, k, v = torch.bmm(torch.stack([xr, xk, xv], 0), weight.rkvWt).unbind(0)

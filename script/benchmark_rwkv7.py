@@ -7,13 +7,8 @@ functions) so every target goes through the same entry point:
 - faster3a_2607: Albatross CUDA implementation (external module).
 - tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
 - tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
-- tl-tuned: per-device tuned variant (``backend="tuned"``).
 - pure-torch: pure PyTorch baseline (``backend="torch"``; graph-wrapped on
   CUDA by default, eager reference available via ``use_graph=False``).
-
-Reserved but not yet implemented targets:
-- fla
-- FlashRWKV
 
 Args via argparse:
     --project-checkpoint: model checkpoint path
@@ -50,23 +45,17 @@ from rwkv_tl.weight import RWKV7Weight
 BACKEND_FOR_TARGET = {
     "tl-fp16": "fp16",
     "tl-bf16": "bf16",
-    "tl-mx450": "mx450",
-    "tl-rtx3060": "rtx3060",
-    "tl-tuned": "tuned",
     "pure-torch": "torch",
 }
 
 DTYPE_FOR_TARGET = {
     "tl-fp16": torch.float16,
     "tl-bf16": torch.bfloat16,
-    "tl-mx450": torch.float16,
-    "tl-rtx3060": torch.float16,
-    "tl-tuned": torch.float16,
     "pure-torch": torch.float16,
 }
 
 # Project targets gated against a matching-dtype pure-torch reference.
-GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450", "tl-rtx3060", "tl-tuned"}
+GATED_TARGETS = {"tl-fp16", "tl-bf16"}
 
 
 def percentile(values, q):
@@ -201,12 +190,7 @@ def parse_targets(text: str) -> list[str]:
         "faster3a_2607",
         "tl-fp16",
         "tl-bf16",
-        "tl-mx450",
-        "tl-rtx3060",
-        "tl-tuned",
         "pure-torch",
-        "fla",
-        "FlashRWKV",
     }
     unknown = [target for target in targets if target not in allowed]
     if unknown:
@@ -353,7 +337,6 @@ def run_benchmark(args):
     """根据 --targets 与 --device 运行选定实现的计时。
 
     faster3a_2607 始终 CUDA；项目 target 运行在 --device。
-    fla / FlashRWKV 先保留为占位 target，后续再接入。
 
     Args:
         args: argparse 解析结果。
@@ -416,17 +399,6 @@ def run_benchmark(args):
                 model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
                 gate_dtype = dtype
-                if target == "tl-tuned":
-                    # The tuned selector is device-name based; surface which
-                    # variant was picked so a run is reproducible on paper.
-                    print(
-                        f"MODEL label={target} class={model_cls.__name__}",
-                        flush=True,
-                    )
-            elif target in {"fla", "FlashRWKV"}:
-                raise NotImplementedError(
-                    f"target '{target}' is reserved but not implemented yet"
-                )
             else:
                 raise ValueError(f"unknown target: {target}")
 
@@ -510,8 +482,7 @@ def main():
         default="faster3a_2607,tl-fp16,pure-torch",
         help=(
             "Comma/space separated targets: faster3a_2607, tl-fp16, tl-bf16, "
-            "tl-tuned, pure-torch, fla, FlashRWKV. Defaults to the implemented "
-            "targets."
+            "pure-torch. Defaults to the implemented targets."
         ),
     )
     parser.add_argument(

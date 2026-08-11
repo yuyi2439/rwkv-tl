@@ -4,27 +4,14 @@ import tilelang
 import tilelang.language as T
 
 from ._common import WARP
-from .gemv import gemv_macro
-from .ln import _LN_EPS, ln_pre_row_macro
+from .gemv import gemv_main_macro
+from .ln import _LN_EPS, ln_per_row_macro
 
 
-def _relusq(v, _idx):
+def _relusq(v):
     """fp32 relu then square (cmix hidden activation)."""
     vv = T.max(v, T.float32(0.0))  # pyright: ignore[reportCallIssue]
     return vv * vv  # pyright: ignore[reportOperatorIssue]
-
-
-def _make_add_residual(x0):
-    """Down-pass epilogue factory: ``out = acc + x0``.
-
-    ``gemv_macro``'s epilogue takes ``(acc, idx)`` only; the residual tensor is
-    captured here by closure so the GEMV kernel stays residual-agnostic.
-    """
-
-    def _add_residual(v, idx):
-        return v + T.cast(x0[idx], "float32")
-
-    return _add_residual
 
 
 ##### decode
@@ -112,9 +99,9 @@ def cmix_decode_main_macro(C: int, DTYPE: str, THREADS: int = WARP):
     """Fused single-token cmix main: ``out = x0 + relusq(x @ kWt) @ vWt``.
 
     Decode version of ``cmix_prefill_main_macro``: x is one token ``[C]``
-    instead of ``[LEN, C]``, so the two GEMMs collapse to two GEMVs. Both are
-    ``gemv_macro`` calls with the epilogue fused in: ``relusq`` on the up pass
-    and the ``x0`` residual add on the down pass.
+    instead of ``[LEN, C]``, so the two GEMMs collapse to two GEMVs. Both use
+    ``gemv_main_macro`` with the epilogue fused into the store: ``relusq`` on
+    the up pass and the ``x0`` residual add on the down pass.
 
     Args:
         C: Channel width.
@@ -125,6 +112,9 @@ def cmix_decode_main_macro(C: int, DTYPE: str, THREADS: int = WARP):
     HID = 4 * C
     assert C % THREADS == 0
     assert HID % THREADS == 0
+
+    up = gemv_main_macro(HID, C, DTYPE, THREADS)
+    down = gemv_main_macro(C, HID, DTYPE, THREADS)
 
     @T.macro
     def _impl(
@@ -139,14 +129,17 @@ def cmix_decode_main_macro(C: int, DTYPE: str, THREADS: int = WARP):
         h = T.alloc_global((HID,), DTYPE)
 
         # h = relusq(x @ kWt)
-        up = gemv_macro(HID, C, DTYPE, THREADS, epilogue=_relusq)
         with T.Kernel(HID // THREADS, threads=THREADS) as bx:
-            up(bx, x, kWt, out=h)
+            acc = up(bx, x, kWt)
+            for i in T.Parallel(THREADS):
+                h[bx * THREADS + i] = T.cast(_relusq(acc[i]), DTYPE)
 
         # out = x0 + h @ vWt
-        down = gemv_macro(C, HID, DTYPE, THREADS, epilogue=_make_add_residual(x0))
         with T.Kernel(C // THREADS, threads=THREADS) as bx:
-            down(bx, h, vWt, out=out)
+            acc = down(bx, h, vWt)
+            for i in T.Parallel(THREADS):
+                idx = bx * THREADS + i
+                out[idx] = T.cast(acc[i] + T.cast(x0[idx], "float32"), DTYPE)
 
     return _impl
 
@@ -157,8 +150,7 @@ def cmix_decode(C: int, DTYPE: str):
 
     ``cmix_prefill`` with LEN pinned to 1. The prologue runs on the single
     ``[C]`` token in one block (so the LN->lerp read-after-write is race-free
-    without a separate kernel), and the two GEMMs collapse to two
-    ``gemv_macro`` GEMVs.
+    without a separate kernel), and the two GEMMs collapse to two GEMVs.
 
     Args:
         C: Channel width.
@@ -207,8 +199,7 @@ def cmix_prefill_prologue_macro(
       locally inside each block (only reads the immutable ``x0``, no cross-block
       dependency, so LN+lerp fuse into one kernel) and only the last block's LN
       row is kept for the ``prev_x`` copy. Saves one launch at the cost of
-      doubling the LN work; measured 14-32% faster on MX450 at T=32..256, so
-      it is the default.
+      doubling the LN work (the default).
     - ``recompute=False`` (3 kernels): LN over all tokens in kernel 1, then the
       token-shift lerp in kernel 2 reading ``x_ln[n-1]`` (written by block
       ``n-1`` in kernel 1 -- safe because kernel 1 completed before kernel 2
@@ -227,7 +218,7 @@ def cmix_prefill_prologue_macro(
     # TODO: tune the THREADS parameter
     assert C % THREADS == 0
 
-    ln = ln_pre_row_macro(LEN, C, DTYPE)
+    ln = ln_per_row_macro(LEN, C, DTYPE)
 
     @T.macro
     def _impl(

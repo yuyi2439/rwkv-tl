@@ -3,9 +3,8 @@
 Before the fused ``kernel.tmix_decode`` / ``kernel.cmix_prefill`` set covered
 the whole model, inference ran per-op tilelang kernels bound by dtype
 (``fp16``/``bf16`` namespaces over ``_base.build_kernels``). The TMIX prefill
-path (``fused_dplr_T`` single-shot recurrence) still uses them; the tuned
-MX450 variant also builds on this namespace. New code should prefer the
-fused factories in ``rwkv_tl.kernel``.
+path (``fused_dplr_T`` single-shot recurrence) still uses them. New code
+should prefer the fused factories in ``rwkv_tl.kernel``.
 """
 
 from __future__ import annotations

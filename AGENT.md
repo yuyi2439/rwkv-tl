@@ -10,11 +10,23 @@ This file is the operating guide for future agents. Follow these rules strictly.
 (Doc-writing style rules -- what to write, what to skip, conventions -- live in
 the `docs-writer` skill; read it before updating this file.)
 
+- **Verify before writing — and re-verify after big changes.** Any rule that
+  asserts something about the current code (a symbol, a default value, a file
+  path, an API split) must be checked against the source before it is written
+  -- grep/read the code, then write. Do not state how something "used to" work
+  or how it "should" work; stale or invented details (e.g. naming a removed
+  parameter) mislead readers and are worse than omitting the detail. After a
+  large external/pulled refactor, go further and check this file's claims
+  line-by-line against the code before trusting the commit message -- behavior
+  and descriptions silently diverge in the same commit (e.g. `make_rwkv7`
+  `"auto"` mapping changed while AGENT.md still described the old one). Diff
+  the actual branches, not the narrative.
 - Update it when a new constraint, bug, environment limitation, or workflow rule is discovered.
 - Do not leave important findings only in chat history; record them here when they affect future work.
+- **Proactively record project standards the user states.** When the user states content that is a project standard (a convention, a rule, a design preference for this repo), update AGENT.md in the same session — do not leave it only in chat history or ask for confirmation.
+- **Self-improve skills on user feedback.** When the user raises a question or issue about behavior governed by a skill (`.agent/skill/<name>/SKILL.md`), update that skill so it prevents the problem next time.
 - When a new benchmark or experiment note is added, make sure the relevant link and summary are also reflected here.
-- **After a large external/pulled refactor, verify the code against this file's claims line-by-line before trusting the commit message.** Code behavior and AGENT.md/README descriptions can silently diverge in the same commit (e.g. `make_rwkv7` `"auto"` mapping changed while AGENT.md still described the old one). Diff the actual branches, not the narrative.
-- **Before cross-linking per-GPU docs, confirm the machines actually match.** A claim like "see validation_rtx3060.md (same machine)" was wrong -- MX450 (laptop, 2GB) and RTX 3060 (desktop, 12GB) are different machines. Verify hardware before asserting a shared test record.
+- **Before cross-linking per-GPU docs, confirm the machines actually match.** A claim like "see the RTX 3060 record (same machine)" was wrong -- MX450 (laptop, 2GB) and RTX 3060 (desktop, 12GB) are different machines. Verify hardware before asserting a shared test record.
 
 ## Management rules for benchmark_rwkv7.md
 
@@ -29,14 +41,19 @@ This file is the canonical benchmark report for this repository. Follow these ru
 
 ## Management rules for test validation records
 
-- Test results (which model versions passed the test suite, environment, commit) go in a per-GPU validation file under `docs/` (e.g. `docs/validation_<gpu>.md`). Keep it in Chinese and report-like.
+- Validation is automated: run `pytest test/` against the checkpoint to verify
+  correctness. Do not maintain a hand-written per-GPU validation document under
+  `docs/` -- test outcomes that matter are captured by the test suite itself
+  (the old `docs/validation_*.md` files were removed for this reason).
+- Keep correctness gate notes (which model versions / GPUs pass) in this file
+  or the benchmark report when relevant, not in a dedicated validation doc.
 
 This is a practical compromise: the benchmark report should stay easy to skim, while the deeper notes can live in the docs and agent guide.
 
 ## User preferences and project standards (remember these)
 
-- Docs and reports under `docs/` and the benchmark report must be written in Chinese. Source code comments/docstrings stay in English.
-- Test results must be saved to a file under `docs/`. Do not leave test outcomes only in chat history.
+- Docs and reports under `docs/` and the benchmark report must be written in Chinese. Source code comments/docstrings stay in English, and `src/rwkv_tl` docstrings stay short.
+- Correctness validation is automated via `pytest test/` (no hand-written validation doc); record test outcomes only when they change a decision or are a notable gate, not as a routine log.
 - When a new benchmark/test run is completed, record the results in the docs before moving on.
 - **A refactor (module rename/move, path changes) must update every affected
   reference in code docstrings and project docs (AGENT.md, CONTRIBUTING.md,
@@ -79,16 +96,23 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   ABC; do not hard-code a specific model class into an application script.
 - **Kernels are dtype-parameterized factories, not dtype-split bindings.** The
   fused kernel set lives in `kernel/{cmix,tmix,gemv,ln}.py`; each factory takes
-  `(C, DTYPE, ...)` and returns a `@tilelang.jit` kernel
-  (`cmix_decode(C, DTYPE)`, `cmix_prefill(C, DTYPE, LEN_block)`,
-  `tmix_decode(C, DTYPE, H, Rv, Rw, Ra, Rg)`, `gemv_macro(...)`,
-  `ln_pre_row_macro(...)`), re-exported from `kernel/__init__.py`. The legacy
+  `(C, DTYPE, ...)` and returns a `@tilelang.jit` kernel (`cmix_decode(C,
+  DTYPE)`, `cmix_prefill(C, DTYPE, LEN_block)`, `tmix_decode(C, DTYPE, H, Rv,
+  Rw, Ra, Rg)`, `gemv(M, K, DTYPE)`), re-exported from `kernel/__init__.py`.
+  The shared building-block macros (`gemv_macro`, `gemv_main_macro`,
+  `gemv_batch_macro`, `ln_prologue_macro`, `ln_per_row_macro`) are also
+  factory-returned and re-exported. The legacy
   per-op kernels (`fused_lerp6`, `fused_dplr_T`, ...) live in `kernel/old/`
   (bound by `build_kernels(DTYPE)`); TMIX prefill still uses them until a fused
-  `tmix_prefill` exists. The old `kernel/{gemm,lerp,gates,dplr}.py` split and
-  the `fp16`/`bf16` dtype-bound namespaces and `operator/` custom ops are
-  **gone** -- do not reintroduce them. No fp32 weight copies anywhere
-  (a future quantization path must not multiply weight memory).
+  `tmix_prefill` exists. The old split layout (`kernel/{gemm,lerp,gates,dplr}.py`
+  each holding dtype-split `fp16`/`bf16` namespaces, plus the `operator/` custom
+  ops) was folded into `kernel/old/` and must not be reintroduced. No fp32
+  weight copies anywhere (a future quantization path must not multiply weight
+  memory).
+- **GEMV: `gemv_main_macro` computes the fp32 `acc` fragment and returns it;
+  `gemv_macro` stores that `acc` to `out` as-is.** To fuse a post-processing
+  step (e.g. `relusq`, a residual add) into a GEMV store, use
+  `gemv_main_macro` and process `acc` before storing.
 - **Tilelang DSL files are a Python project standard: no `from __future__ import
   annotations`.** tilelang's eager builder evaluates annotation expressions at
   build time, and a stringified annotation only resolves module globals +
@@ -103,6 +127,13 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   next to that tensor's `Args:` entry, so editors surface them where the
   parameter is declared. Function-internal tuning knobs (block sizes, `VEC`,
   `STAGES`) are inline comments, not docstring material.
+- **`src/rwkv_tl` is a published library: docstrings/comments must not mention
+  specific hardware names (e.g. `MX450`), other projects it was compared
+  against (e.g. `Albatross`), or benchmark/test-environment results.** Such
+  measurements belong in `docs/`, not in shipped code. Also do not restate in
+  an `Args:` entry what the signature already shows (e.g. `out: T.Tensor((M,),
+  DTYPE)` needs no `out: Output vector [M]` line); only add layout or semantic
+  notes the signature cannot convey.
 - **Dtype plumbing.** `RWKV7Weight(path, dtype=...)` controls weight precision
   (default `torch.float16`, converts the bf16 checkpoint once at load; pass
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
@@ -120,7 +151,7 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   `RWKV7Model` instance: `model = CUDAGraph(RWKV7TL(w))`, or via
   `wrap_model(model)`, or `make_rwkv7(..., use_graph=True)` (returns a
   pre-wrapped class). It lazily captures the wrapped model's OWN `decode`
-  (T=1) and `prefill` per exact T (T<=`prefill_graph_max_t`, default 64) by
+  (T=1) and `prefill` per exact T (T<=`prefill_graph_max_t`, default 1024) by
   calling them against a fixed-address shadow `State`, then copies the caller's
   `State` in/out around each replay. Larger T, non-CUDA models, and any capture
   failure fall back to the wrapped model's eager path.
@@ -158,7 +189,6 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 - Verify TileLang and PyTorch APIs before using them.
 - Prefer existing project code over new helpers.
 - Do not swallow exceptions. Only catch errors when recovery is meaningful.
-- Keep new docstrings in src/rwkv_tl short and in English.
 - Do not create extra files unless they are clearly necessary.
 
 ## Skills
@@ -211,8 +241,8 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
   Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060
   (sm_86), so it is a bug in the new `tmix_decode` bf16 path, not a hardware
-  limit. fp16 is unaffected (full suite minus bf16 passes). See
-  `docs/validation_rtx3060.md`.
+  limit. fp16 is unaffected (full suite minus bf16 passes). Reproduced by
+  `test_forward.py::test_bf16_consistent`.
 - **Decode regressed with the neo-kernel path (a8e2ef7).** Measured on RTX 3060
   / 0.1B: `tl-fp16` decode went 2.36ms (legacy per-op kernels + graph) to
   eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Root cause
@@ -227,7 +257,9 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   cuBLAS). The `head @ ln_out` cuBLAS GEMV ([65536,C]) adds 0.3-0.8ms.
   Additionally `CUDAGraph.decode`'s per-token State copy-in/out (~36 tiny
   `copy_`) makes graph slower than eager. See `docs/benchmarks/rtx3060.md`
-  "neo kernels 基线" analysis and TODO #1.
+  "neo kernels 基线" analysis and TODO #1. **Partially fixed: the r/k/v
+  projections are now one batched GEMV (see `gemv_batch_macro` and the
+  stacked `rkvWt`); on MX450/0.4B decode 1x1 beats faster3a (~1.24x).**
 - The pure-torch baseline was improved by batched prefill work.
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.
@@ -297,6 +329,8 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   `RWKV7Weight` load. `tmix_decode`'s DPLR reads/writes fp32 S; the pure-torch
   reference matches.
 - Prefill DPLR is a **single-shot kernel** (`fused_dplr_T` / `_dplr_T_kernel`): one launch processes the whole [T,H,N] sequence, serial state recurrence inside each (h,v_n) block. Verified: y outputs bit-match the reference through long T.
+- **`v_first` is the "value residual": layer 0's v, passed LAYER-to-layer, NOT persisted across tokens** (2026-08-11). Official RWKV7 (RWKV-LM `rwkv_v7_demo.py`): `if layer_id == 0: v_first = v` else `v = v + (v_first - v) * sigmoid(v0 + xv@v1@v2)`. It is a per-forward temporary (layer 0 seeds it, later layers gate toward layer-0's same-row v); `State` does NOT store it. A wrong earlier reading treated it as "sequence-first-token v" persisted in `State` -- that made decode/prefill diverge (~7 logits in `test_decode_matches_prefill`) because the batched `_tmix_prefill_front` stored only row t=0 in a `[C]` buffer while decode used the current token. Fix: `_tmix_prefill_front` now takes `v_first: [LEN, C]` (layer-0's whole-batch v) and `first != 0` gates the whole batch; `decode`/`prefill` reset `v_first = None` at the start of each forward and pass it layer-to-layer. Keeping `v_first` out of `State` also means CUDA-Graph capture has no `None`-to-tensor rebind (decode/prefill graph both capture cleanly).
+- **Batched prefill kernels are numerically equivalent to per-token decode** (`_tmix_prefill_front`/`_back`, `cmix_prefill`): `time_mix_batch`/`channel_mix_batch` use them; verified ~0.004-0.008 max-abs vs the per-token path on fp16 (batched prologue shifts via `x_ln[t-1]` vs decode's stored `prev_x`, plus per-row GEMV ordering).
 
 ## Planned architecture direction
 

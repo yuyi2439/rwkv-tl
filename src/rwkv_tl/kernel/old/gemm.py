@@ -16,7 +16,7 @@ launch. Dispatch by device and GPU arch:
 FFN / output-projection matmuls (``ffn_h``/``ffn_v``/``out_mm``) have the same
 sm_75 story: cuBLAS fp16 there is pathological (``volta_s884gemm_fp16_*``), so
 fp16 routes them through the general tilelang m16n8k8 kernel with
-shape-tuned block configs (autotuned on MX450); bf16 keeps plain matmul
+shape-tuned block configs; bf16 keeps plain matmul
 (cuBLAS fp32 emulation) and Ampere+ keeps cuBLAS fp16.
 
 ``build(DTYPE)`` returns a namespace with the kernels bound to one element type.
@@ -40,7 +40,7 @@ from torch import Tensor
 
 # Allowed T-specialized kernel lengths for the Turing sm_75 fp16 GEMM: exact
 # 1..16 plus powers of two through 1,048,576. tilelang compiles each (C, T_len)
-# lazily and caches it. Measured on MX450, the smallest covering kernel >= the
+# lazily and caches it. The smallest covering kernel >= the
 # actual T is always the fastest (kernel time scales ~linearly with T_len, so a
 # larger kernel only adds pad waste), so inputs are padded up to the smallest
 # allowed length >= T and the extra rows sliced off.
@@ -135,7 +135,7 @@ def build(DTYPE: str) -> SimpleNamespace:
 
         m16n8k8 is the native Turing fp16 MMA atom. Specializing T_len (instead
         of a dynamic dimension) lets tilelang hoist loop bounds and pipeline
-        aggressively -- the 16x32x32/3-stage config autotuned on MX450 runs
+        aggressively -- the 16x32x32/3-stage config runs
         ~4-7x faster than the pathological cuBLAS fp16 kernels and beats fp32
         at small T. Compiled once per (C, T) and cached by tilelang.
         """
@@ -181,8 +181,7 @@ def build(DTYPE: str) -> SimpleNamespace:
         Routes the FFN / output-projection matmuls away from the pathological
         cuBLAS fp16 kernels on Turing (``volta_s884gemm_fp16_*``), which for the
         small prefill shapes are ~4-8x slower than fp32 / bf16. The
-        ``(block_n, block_k, num_stages)`` triplets were autotuned on MX450 for
-        the ``[T, C] @ [C, 4C]`` (ffn_h: 64, 32, 3) and ``[T, 4C] @ [4C, C]``
+        ``(block_n, block_k, num_stages)`` triplets were tuned for the ``[T, C] @ [C, 4C]`` (ffn_h: 64, 32, 3) and ``[T, 4C] @ [4C, C]``
         (ffn_v: 128, 64, 3) shapes; a naive 16x32x32 config is ~2-4x slower.
         Compiled once per (K, N) and cached by tilelang.
         """
@@ -225,8 +224,8 @@ def build(DTYPE: str) -> SimpleNamespace:
         if xr.device.type != "cuda":
             return _torch_bmm_rkv(xr, xk, xv, Wb)
         # tilelang kernels are bound to one element type; the bmm path also
-        # serves other input dtypes (e.g. RWKV7MX450 passes fp32 activations
-        # for the fast fp32 cuBLAS bmm on Turing).
+        # serves other input dtypes (e.g. fp32 activations for the fast fp32
+        # cuBLAS bmm on Turing).
         if not _gpu_supports_tl_gemm(DTYPE) or xr.dtype != torch_dtype:
             return _torch_bmm_rkv(xr, xk, xv, Wb)
         try:
@@ -236,8 +235,7 @@ def build(DTYPE: str) -> SimpleNamespace:
                 # cached per (C, T_len) by tilelang). A dynamic-T version cannot
                 # reach the tuned config's speed on sm_75, so we pay one compile
                 # per distinct length. Inputs are padded up to the smallest
-                # allowed length >= T (binary search) and sliced back -- measured
-                # fastest on MX450.
+                # allowed length >= T (binary search) and sliced back.
                 T_len = xr.shape[0]
                 if T_len > ALLOWED_T_LEN[-1]:
                     warnings.warn(

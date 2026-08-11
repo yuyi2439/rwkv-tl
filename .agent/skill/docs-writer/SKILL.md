@@ -33,6 +33,14 @@ skill item. If it constrains how *this repo* is organized, or how its code is
 written or documented, it is an AGENT.md item. If it is general Python/tool
 trivia anyone would notice, it is nothing.
 
+Key disambiguation: **a rule about this repo's own API design is a repo
+standard, not a skill item.** Even when it concerns kernel code (e.g. the
+`gemv_main_macro` compute / `gemv_macro` store split, or how fused kernels are
+organized), if the API/factory is defined by this repo and would not exist in
+another project, it goes in AGENT.md "Project structure and standards". A skill
+only carries knowledge that applies to writing TileLang kernels in *any*
+project using tilelang itself — never repo-specific symbols or conventions.
+
 ## 2. What NOT to write
 
 - **Do not document facts you can point out directly without study.** Only
@@ -97,11 +105,14 @@ trivia anyone would notice, it is nothing.
 ## 5. Workflow
 
 1. On a new finding/convention, place it per section 1 (one place only).
-2. If it is a skill item, add it to the matching skill's SKILL.md; if an
+2. **Verify code facts before writing them.** Any documented symbol, default
+   value, path, or API split must be grep/read-checked against the source
+   first; do not write from memory or describe how things "used to" work.
+3. If it is a skill item, add it to the matching skill's SKILL.md; if an
    AGENT.md item, add to the relevant section.
-3. When creating a NEW skill: create the SKILL.md, add a reference in AGENT.md,
+4. When creating a NEW skill: create the SKILL.md, add a reference in AGENT.md,
    and MOVE the now-skill-covered content from AGENT.md into the skill (no
    duplication).
-4. Follow AGENT.md's git rules: never `git add`/`commit`/`push` without
+5. Follow AGENT.md's git rules: never `git add`/`commit`/`push` without
    explicit user approval; state-changing git operations are always scoped to
    the single approved action.

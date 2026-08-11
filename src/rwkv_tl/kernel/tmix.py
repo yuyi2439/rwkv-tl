@@ -6,13 +6,106 @@ import tilelang
 import tilelang.language as T
 
 from ._common import HEAD_DIM, SERIAL, WARP
-from .gemv import gemv_macro
+from .gemv import gemv_batch_macro, gemv_batch_T_macro, gemv_macro
+from .ln import ln_prologue_macro
 
 N = HEAD_DIM
 _SQRT_E = math.sqrt(math.e)  # exp decay gate constant
 
 
+def _gate_gemv_macro(R: int, C: int, DTYPE: str):
+    """One low-rank first-step GEMV row: ``out[j] = sum_c W[j, c] * x[c]``.
+
+    A warp per block reduces over ``C`` into one rank-row output (the
+    ``[R, C]`` weight's rows each map to one ``out[j]``). One instance per
+    gate (v/w/a/g) is bound to that gate's rank and its own weight/input/
+    output; the rank-GEMV kernel launches all four in one 2D grid
+    ``(rank row, gate)``.
+
+    Args:
+        R: Gate rank (row count of ``W`` / length of ``out``).
+        C: Channel width.
+        DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
+    """
+
+    @T.macro
+    def _impl(
+        j,
+        n,
+        x: T.Tensor((C,), DTYPE),
+        W: T.Tensor((R, C), DTYPE),
+        *,
+        out: T.Tensor((R,), DTYPE),
+    ):
+        """Args:
+            j: Rank-row index (blockIdx.x); must be ``< R``.
+            n: Thread index within the warp.
+            x: This gate's shifted activation ``[C]`` (e.g. ``xv``).
+            W: This gate's rank-in weight ``[R, C]`` (e.g. ``v1t``).
+            out: This gate's rank-out result ``[R]`` (e.g. ``vr``).
+        """
+        acc = T.alloc_fragment((1,), "float32")
+        acc[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+        for c in T.serial(C // WARP):
+            c_idx = n * (C // WARP) + c
+            acc[0] += T.cast(W[j, c_idx], "float32") * T.cast(x[c_idx], "float32")
+        total = T.warp_reduce_sum(acc[0])
+        if n == 0:
+            out[j] = T.cast(total, DTYPE)
+
+    return _impl
+
+
 ##### decode
+
+
+def _tmix_shift6_macro(C: int, DTYPE: str):
+    """Six token-shift lerps of one LN'd row: ``x_out = ln_val + w*(shift - ln_val)``.
+
+    Consumes one row's LN output (``ln_val``, e.g. from ``ln_prologue_macro``)
+    and the shift source (``shift``: previous token's LN output, or ``prev_x``
+    for the first token), writing the six shifted activations to the stacked
+    ``xrkv [3, C]`` (r/k/v) and ``xw``/``xa``/``xg`` ``[C]``. ``xv`` equals
+    ``xrkv[2]`` and is written as its own ``[C]`` buffer for the low-rank gate
+    kernel.
+
+    Args:
+        C: Channel width.
+        DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
+    """
+
+    @T.macro
+    def _impl(
+        ln_val: T.Tensor((C,), "float32"),
+        shift: T.Tensor((C,), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
+        *,
+        xrkv: T.Tensor((3, C), DTYPE),
+        xv: T.Tensor((C,), DTYPE),
+        xw: T.Tensor((C,), DTYPE),
+        xa: T.Tensor((C,), DTYPE),
+        xg: T.Tensor((C,), DTYPE),
+    ):
+        """Args:
+            ln_val: Current row's LN_pre output ``[C]`` (fp32, before the
+                DTYPE store).
+            shift: Shift source ``[C]`` (prev token's LN output / ``prev_x``).
+            x_rkvwag: Six token-shift weights stacked ``[6, C]`` (r/k/v/w/a/g).
+            xrkv: Stacked r/k/v lerps ``[3, C]``.
+            xv/xw/xa/xg: Low-rank gate inputs ``[C]``.
+        """
+        for i in T.Parallel(C):
+            lv = ln_val[i]
+            diff = T.cast(shift[i], "float32") - lv
+            xrkv[0, i] = T.cast(lv + T.cast(x_rkvwag[0, i], "float32") * diff, DTYPE)
+            xrkv[1, i] = T.cast(lv + T.cast(x_rkvwag[1, i], "float32") * diff, DTYPE)
+            xrkv[2, i] = T.cast(lv + T.cast(x_rkvwag[2, i], "float32") * diff, DTYPE)
+            xv[i] = xrkv[2, i]
+            xw[i] = T.cast(lv + T.cast(x_rkvwag[3, i], "float32") * diff, DTYPE)
+            xa[i] = T.cast(lv + T.cast(x_rkvwag[4, i], "float32") * diff, DTYPE)
+            xg[i] = T.cast(lv + T.cast(x_rkvwag[5, i], "float32") * diff, DTYPE)
+
+    return _impl
 
 
 def tmix_decode_prologue_macro(C: int, DTYPE: str, THREADS: int = 256):
@@ -22,7 +115,11 @@ def tmix_decode_prologue_macro(C: int, DTYPE: str, THREADS: int = 256):
     six token-shift lerps (xr/xw/xk/xv/xa/xg) consume it directly, and
     ``prev_x`` is overwritten in place with the raw LN output -- each thread
     reads and writes the same ``prev_x[i]`` element, so there is no
-    cross-thread race.
+    cross-thread race. The six lerp weights arrive stacked as ``x_rkvwag``
+    ``[6, C]`` (rows r/k/v/w/a/g). The r/k/v lerps are packed into one stacked
+    ``xrkv`` ``[3, C]`` buffer (rows r/k/v) matching the stacked ``rkvWt``
+    weight; the four low-rank gate inputs (``xv``/``xw``/``xa``/``xg``) are
+    written as separate ``[C]`` buffers.
 
     Args:
         C: Channel width.
@@ -33,58 +130,36 @@ def tmix_decode_prologue_macro(C: int, DTYPE: str, THREADS: int = 256):
     # TODO: tune the THREADS parameter
     assert C % THREADS == 0
 
+    ln = ln_prologue_macro(C, DTYPE)
+    shift6 = _tmix_shift6_macro(C, DTYPE)
+
     @T.macro
     def _impl(
         x0: T.Tensor((C,), DTYPE),
         ln_preW: T.Tensor((C,), DTYPE),
         ln_preB: T.Tensor((C,), DTYPE),
-        x_r: T.Tensor((C,), DTYPE),
-        x_w: T.Tensor((C,), DTYPE),
-        x_k: T.Tensor((C,), DTYPE),
-        x_v: T.Tensor((C,), DTYPE),
-        x_a: T.Tensor((C,), DTYPE),
-        x_g: T.Tensor((C,), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
         *,
         prev_x: T.Tensor((C,), DTYPE),
-        xr: T.Tensor((C,), DTYPE),
-        xw: T.Tensor((C,), DTYPE),
-        xk: T.Tensor((C,), DTYPE),
+        xrkv: T.Tensor((3, C), DTYPE),
         xv: T.Tensor((C,), DTYPE),
+        xw: T.Tensor((C,), DTYPE),
         xa: T.Tensor((C,), DTYPE),
         xg: T.Tensor((C,), DTYPE),
     ):
         """1 kernel."""
         with T.Kernel(1, threads=THREADS):
-            s = T.alloc_fragment((1,), "float32")
-            x_frag = T.alloc_fragment((C,), "float32")
-            sq_frag = T.alloc_fragment((C,), "float32")
-
-            T.copy(x0, x_frag)
-
-            T.reduce_sum(x_frag, s, dim=-1, clear=True)
-            mean = s[0] / T.float32(C)  # pyright: ignore[reportCallIssue]
-
-            for i in T.Parallel(C):
-                x_frag[i] = x_frag[i] - mean
-                sq_frag[i] = x_frag[i] * x_frag[i]
-
-            T.reduce_sum(sq_frag, s, dim=-1, clear=True)
-            rstd = T.rsqrt(  # pyright: ignore[reportCallIssue]
-                s[0] / T.float32(C) + T.float32(1e-5)  # pyright: ignore[reportCallIssue]
-            )
-
+            x_frag, rstd = ln(x0)
+            ln_frag = T.alloc_fragment((C,), "float32")
             for i in T.Parallel(C):
                 ln_val = x_frag[i] * rstd * T.cast(ln_preW[i], "float32") + T.cast(
                     ln_preB[i], "float32"
                 )
-                diff = T.cast(prev_x[i], "float32") - ln_val
-                prev_x[i] = T.cast(ln_val, DTYPE)
-                xr[i] = T.cast(ln_val + T.cast(x_r[i], "float32") * diff, DTYPE)
-                xw[i] = T.cast(ln_val + T.cast(x_w[i], "float32") * diff, DTYPE)
-                xk[i] = T.cast(ln_val + T.cast(x_k[i], "float32") * diff, DTYPE)
-                xv[i] = T.cast(ln_val + T.cast(x_v[i], "float32") * diff, DTYPE)
-                xa[i] = T.cast(ln_val + T.cast(x_a[i], "float32") * diff, DTYPE)
-                xg[i] = T.cast(ln_val + T.cast(x_g[i], "float32") * diff, DTYPE)
+                ln_frag[i] = ln_val
+            shift6(ln_frag, prev_x, x_rkvwag, xrkv=xrkv, xv=xv, xw=xw, xa=xa, xg=xg)
+            # store the LN row to prev_x AFTER the shift consumed it
+            for i in T.Parallel(C):
+                prev_x[i] = T.cast(ln_frag[i], DTYPE)
 
     return _impl
 
@@ -111,27 +186,24 @@ def tmix_decode_main_macro(
         DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
         H: Head count (``C // N``).
         Rv/Rw/Ra/Rg: Rank of each low-rank gate.
-        THREADS: threads per block for the GEMV/elementwise kernels; must
-            divide ``C``, ``H*N`` and each rank.
+        THREADS: threads per block for the rkv/oWt GEMVs; must divide ``C``.
     """
+    assert THREADS % WARP == 0
     assert C % THREADS == 0
     assert H * N == C
-    assert Rv % THREADS == 0 and Rw % THREADS == 0
-    assert Ra % THREADS == 0 and Rg % THREADS == 0
+    assert Rv % WARP == 0 and Rw % WARP == 0
+    assert Ra % WARP == 0 and Rg % WARP == 0
 
-    gv = gemv_macro(C, C, DTYPE, THREADS)  # [K, M] = [C, C]: x @ rkvWt[b]
+    gv = gemv_batch_macro(C, C, 3, DTYPE, THREADS)  # [3, K, M] = [3, C, C]: xrkv @ rkvWt
 
     @T.macro
     def _impl(
-        xr: T.Tensor((C,), DTYPE),
-        xk: T.Tensor((C,), DTYPE),
+        xrkv: T.Tensor((3, C), DTYPE),
         xv: T.Tensor((C,), DTYPE),
         xw: T.Tensor((C,), DTYPE),
         xa: T.Tensor((C,), DTYPE),
         xg: T.Tensor((C,), DTYPE),
-        rWt: T.Tensor((C, C), DTYPE),
-        kWt: T.Tensor((C, C), DTYPE),
-        vWt: T.Tensor((C, C), DTYPE),
+        rkvWt: T.Tensor((3, C, C), DTYPE),
         v1t: T.Tensor((Rv, C), DTYPE),
         w1t: T.Tensor((Rw, C), DTYPE),
         a1t: T.Tensor((Ra, C), DTYPE),
@@ -164,9 +236,7 @@ def tmix_decode_main_macro(
             prior value yet).
         out: output ``[C]`` = ``x0 + relusq... `` (full TMIX result).
         """
-        r = T.alloc_global((C,), DTYPE)
-        k = T.alloc_global((C,), DTYPE)
-        v = T.alloc_global((C,), DTYPE)
+        rkv = T.alloc_global((3, C), DTYPE)
         vr = T.alloc_global((Rv,), DTYPE)
         wr = T.alloc_global((Rw,), DTYPE)
         ar = T.alloc_global((Ra,), DTYPE)
@@ -180,54 +250,31 @@ def tmix_decode_main_macro(
         g = T.alloc_global((C,), DTYPE)
         gy = T.alloc_global((C,), DTYPE)
 
-        # kernel: r = xr @ rWt; k = xk @ kWt; v = xv @ vWt
-        with T.Kernel(C // THREADS, threads=THREADS) as bx:
-            gv(bx, xr, rWt, out=r)
-        with T.Kernel(C // THREADS, threads=THREADS) as bx:
-            gv(bx, xk, kWt, out=k)
-        with T.Kernel(C // THREADS, threads=THREADS) as bx:
-            gv(bx, xv, vWt, out=v)
+        # kernel: rkv = xrkv @ rkvWt (one batched GEMV over the 3 projections)
+        with T.Kernel(C // THREADS, 3, threads=THREADS) as (bx, bz):
+            gv(bx, bz, xrkv, rkvWt, out=rkv)
 
-        # kernel: packed first-step rank GEMVs (one warp per rank row)
-        with T.Kernel(Rv + Rw + Ra + Rg, threads=WARP) as (j,):
+        # kernel: first-step rank GEMVs; 2D grid (rank row, gate) -- each
+        # gate's block reads its own weight/input directly via its own macro
+        # instance, no flat row-segment offsets.
+        v_gate = _gate_gemv_macro(Rv, C, DTYPE)
+        w_gate = _gate_gemv_macro(Rw, C, DTYPE)
+        a_gate = _gate_gemv_macro(Ra, C, DTYPE)
+        g_gate = _gate_gemv_macro(Rg, C, DTYPE)
+        with T.Kernel(max(Rv, Rw, Ra, Rg), 4, threads=WARP) as (j, bz):
             n = T.get_thread_binding(0)
-            acc = T.alloc_fragment((1,), "float32")
-            acc[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            for c in T.serial(C // WARP):
-                c_idx = n * (C // WARP) + c
-                xsel = T.if_then_else(
-                    j < Rv,
-                    xv[c_idx],
-                    T.if_then_else(
-                        j < Rv + Rw,
-                        xw[c_idx],
-                        T.if_then_else(j < Rv + Rw + Ra, xa[c_idx], xg[c_idx]),
-                    ),
-                )
-                wsel = T.if_then_else(
-                    j < Rv,
-                    v1t[j, c_idx],
-                    T.if_then_else(
-                        j < Rv + Rw,
-                        w1t[j - Rv, c_idx],
-                        T.if_then_else(
-                            j < Rv + Rw + Ra,
-                            a1t[j - Rv - Rw, c_idx],
-                            g1t[j - Rv - Rw - Ra, c_idx],
-                        ),
-                    ),
-                )
-                acc[0] += T.cast(wsel, "float32") * T.cast(xsel, "float32")
-            total = T.warp_reduce_sum(acc[0])
-            if n == 0:
+            if bz == 0:
                 if j < Rv:
-                    vr[j] = T.cast(total, DTYPE)
-                elif j < Rv + Rw:
-                    wr[j - Rv] = T.cast(total, DTYPE)
-                elif j < Rv + Rw + Ra:
-                    ar[j - Rv - Rw] = T.cast(total, DTYPE)
-                else:
-                    gr[j - Rv - Rw - Ra] = T.cast(total, DTYPE)
+                    v_gate(j, n, xv, v1t, out=vr)
+            elif bz == 1:
+                if j < Rw:
+                    w_gate(j, n, xw, w1t, out=wr)
+            elif bz == 2:
+                if j < Ra:
+                    a_gate(j, n, xa, a1t, out=ar)
+            else:
+                if j < Rg:
+                    g_gate(j, n, xg, g1t, out=gr)
 
         # kernel: rank-out second steps + v/w/a/kk/k/g gate math
         with T.Kernel(C, threads=WARP) as i:
@@ -261,13 +308,13 @@ def tmix_decode_main_macro(
             a12 = T.warp_reduce_sum(pa[0])
             g12 = T.warp_reduce_sum(pg[0])
             if n == 0:
-                v_cur = T.cast(v[i], "float32")
+                v_cur = T.cast(rkv[2, i], "float32")
                 vf = T.if_then_else(first != 0, v_cur, T.cast(v_first[i], "float32"))
                 sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12)
                 v_out = v_cur + sig_v * (vf - v_cur)
                 # v gate state: first token stores v, later tokens keep v_first
                 v_first[i] = T.cast(vf, DTYPE)
-                v[i] = T.cast(v_out, DTYPE)
+                rkv[2, i] = T.cast(v_out, DTYPE)
                 w[i] = T.cast(
                     T.exp(
                         -T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
@@ -276,13 +323,10 @@ def tmix_decode_main_macro(
                 )
                 a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
                 a[i] = T.cast(a_val, DTYPE)
-                kk[i] = T.cast(
-                    T.cast(k[i], "float32") * T.cast(k_k[i], "float32"), DTYPE
-                )
-                k[i] = T.cast(
-                    T.cast(k[i], "float32")
-                    + T.cast(k_a[i], "float32")
-                    * (T.cast(k[i], "float32") * a_val - T.cast(k[i], "float32")),
+                k_cur = T.cast(rkv[1, i], "float32")
+                kk[i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
+                rkv[1, i] = T.cast(
+                    k_cur + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
                     DTYPE,
                 )
                 # g gate: g = g2t @ sigmoid(gr), stored for the output projection
@@ -319,7 +363,7 @@ def tmix_decode_main_macro(
                     kk_norm[h * N + a_idx], "float32"
                 )
             sa = T.warp_reduce_sum(p_sa[0])
-            v_val = T.cast(v[h * N + v_n], "float32")
+            v_val = T.cast(rkv[2, h * N + v_n], "float32")
             p_y = T.alloc_fragment((1,), "float32")
             p_y[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
             for j in T.serial(SERIAL):
@@ -327,10 +371,10 @@ def tmix_decode_main_macro(
                 s_new = (
                     rnn[h, v_n, k_idx] * T.cast(w[h * N + k_idx], "float32")
                     + sa * T.cast(B[h * N + k_idx], "float32")
-                    + v_val * T.cast(k[h * N + k_idx], "float32")
+                    + v_val * T.cast(rkv[1, h * N + k_idx], "float32")
                 )
                 rnn[h, v_n, k_idx] = s_new
-                p_y[0] += s_new * T.cast(r[h * N + k_idx], "float32")
+                p_y[0] += s_new * T.cast(rkv[0, h * N + k_idx], "float32")
             y_val = T.warp_reduce_sum(p_y[0])
             if n == 0:
                 y[h * N + v_n] = T.cast(y_val, DTYPE)
@@ -346,8 +390,8 @@ def tmix_decode_main_macro(
                 idx = n * SERIAL + j
                 p_sum[0] += T.cast(y[h * N + idx], "float32")
                 p_rkrk[0] += (
-                    T.cast(r[h * N + idx], "float32")
-                    * T.cast(k[h * N + idx], "float32")
+                    T.cast(rkv[0, h * N + idx], "float32")
+                    * T.cast(rkv[1, h * N + idx], "float32")
                     * T.cast(r_k[h, idx], "float32")
                 )
             total_sum = T.warp_reduce_sum(p_sum[0])
@@ -368,7 +412,7 @@ def tmix_decode_main_macro(
                 y_aff = y_norm * T.cast(ln_xW[flat], "float32") + T.cast(
                     ln_xB[flat], "float32"
                 )
-                residual = total_rkrk * T.cast(v[flat], "float32")
+                residual = total_rkrk * T.cast(rkv[2, flat], "float32")
                 gy[flat] = T.cast(
                     (y_aff + residual) * T.cast(g[flat], "float32"), DTYPE
                 )
@@ -390,7 +434,7 @@ def tmix_decode_main_macro(
     return _impl
 
 
-@tilelang.jit(out_idx=[33])
+@tilelang.jit(out_idx=[26])
 def tmix_decode(
     C: int,
     DTYPE: str,
@@ -413,15 +457,8 @@ def tmix_decode(
         x0: T.Tensor((C,), DTYPE),
         ln_preW: T.Tensor((C,), DTYPE),
         ln_preB: T.Tensor((C,), DTYPE),
-        x_r: T.Tensor((C,), DTYPE),
-        x_w: T.Tensor((C,), DTYPE),
-        x_k: T.Tensor((C,), DTYPE),
-        x_v: T.Tensor((C,), DTYPE),
-        x_a: T.Tensor((C,), DTYPE),
-        x_g: T.Tensor((C,), DTYPE),
-        rWt: T.Tensor((C, C), DTYPE),
-        kWt: T.Tensor((C, C), DTYPE),
-        vWt: T.Tensor((C, C), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
+        rkvWt: T.Tensor((3, C, C), DTYPE),
         v1t: T.Tensor((Rv, C), DTYPE),
         w1t: T.Tensor((Rw, C), DTYPE),
         a1t: T.Tensor((Ra, C), DTYPE),
@@ -446,10 +483,9 @@ def tmix_decode(
         first: T.int32,
         out: T.Tensor((C,), DTYPE),
     ):
-        xr = T.alloc_global((C,), DTYPE)
-        xw = T.alloc_global((C,), DTYPE)
-        xk = T.alloc_global((C,), DTYPE)
+        xrkv = T.alloc_global((3, C), DTYPE)
         xv = T.alloc_global((C,), DTYPE)
+        xw = T.alloc_global((C,), DTYPE)
         xa = T.alloc_global((C,), DTYPE)
         xg = T.alloc_global((C,), DTYPE)
 
@@ -457,31 +493,22 @@ def tmix_decode(
             x0,
             ln_preW,
             ln_preB,
-            x_r,
-            x_w,
-            x_k,
-            x_v,
-            x_a,
-            x_g,
+            x_rkvwag,
             prev_x=prev_x,
-            xr=xr,
-            xw=xw,
-            xk=xk,
+            xrkv=xrkv,
             xv=xv,
+            xw=xw,
             xa=xa,
             xg=xg,
         )
 
         main(
-            xr,
-            xk,
+            xrkv,
             xv,
             xw,
             xa,
             xg,
-            rWt,
-            kWt,
-            vWt,
+            rkvWt,
             v1t,
             w1t,
             a1t,
@@ -503,6 +530,616 @@ def tmix_decode(
             rnn=rnn,
             v_first=v_first,
             first=first,
+            out=out,
+        )
+
+    return _impl
+
+
+##### prefill
+
+
+def tmix_prefill_prologue_macro(LEN: int, C: int, DTYPE: str, THREADS: int = 256):
+    """TMIX prefill prologue: LN_pre + 6 token-shift lerps over a sequence.
+
+    Two kernels: kernel 1 computes every row's LN_pre output into ``x_ln``
+    (``[LEN, C]``); kernel 2 applies the six token-shift lerps (weights stacked
+    in ``x_rkvwag [6, C]``) using ``x_ln[t-1]`` as the shift source for
+    ``t > 0`` and ``prev_x`` for ``t == 0`` -- the same stored-shift semantics
+    as the reference, avoiding per-block recompute drift. ``prev_x`` is updated
+    to the last row's LN output. The r/k/v lerps go to ``xrkv [3, LEN, C]``;
+    the gate inputs ``xv``/``xw``/``xa``/``xg`` to ``[LEN, C]``.
+
+    Args:
+        LEN: Sequence length.
+        C: Channel width.
+        DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
+        THREADS: threads per block; must divide ``C``.
+    """
+    assert C % THREADS == 0
+
+    ln = ln_prologue_macro(C, DTYPE)
+
+    @T.macro
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        x_ln: T.Tensor((LEN, C), DTYPE),
+        xrkv: T.Tensor((LEN, 3, C), DTYPE),
+        xv: T.Tensor((LEN, C), DTYPE),
+        xw: T.Tensor((LEN, C), DTYPE),
+        xa: T.Tensor((LEN, C), DTYPE),
+        xg: T.Tensor((LEN, C), DTYPE),
+    ):
+        """2 kernels."""
+        # kernel 1: LN_pre over all rows -> x_ln
+        with T.Kernel(LEN, threads=THREADS) as t:
+            x_frag, rstd = ln(x0[t, :])
+            for i in T.Parallel(C):
+                ln_val = x_frag[i] * rstd * T.cast(ln_preW[i], "float32") + T.cast(
+                    ln_preB[i], "float32"
+                )
+                x_ln[t, i] = T.cast(ln_val, DTYPE)
+
+        # kernel 2: six token-shift lerps; shift = prev_x (t=0) else x_ln[t-1]
+        with T.Kernel(LEN, threads=THREADS) as t:
+            if t == 0:
+                for i in T.Parallel(C):
+                    lv = T.cast(x_ln[t, i], "float32")
+                    diff = T.cast(prev_x[i], "float32") - lv
+                    xrkv[t, 0, i] = T.cast(
+                        lv + T.cast(x_rkvwag[0, i], "float32") * diff, DTYPE
+                    )
+                    xrkv[t, 1, i] = T.cast(
+                        lv + T.cast(x_rkvwag[1, i], "float32") * diff, DTYPE
+                    )
+                    xrkv[t, 2, i] = T.cast(
+                        lv + T.cast(x_rkvwag[2, i], "float32") * diff, DTYPE
+                    )
+                    xv[t, i] = xrkv[t, 2, i]
+                    xw[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[3, i], "float32") * diff, DTYPE
+                    )
+                    xa[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[4, i], "float32") * diff, DTYPE
+                    )
+                    xg[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[5, i], "float32") * diff, DTYPE
+                    )
+            else:
+                for i in T.Parallel(C):
+                    lv = T.cast(x_ln[t, i], "float32")
+                    diff = T.cast(x_ln[t - 1, i], "float32") - lv
+                    xrkv[t, 0, i] = T.cast(
+                        lv + T.cast(x_rkvwag[0, i], "float32") * diff, DTYPE
+                    )
+                    xrkv[t, 1, i] = T.cast(
+                        lv + T.cast(x_rkvwag[1, i], "float32") * diff, DTYPE
+                    )
+                    xrkv[t, 2, i] = T.cast(
+                        lv + T.cast(x_rkvwag[2, i], "float32") * diff, DTYPE
+                    )
+                    xv[t, i] = xrkv[t, 2, i]
+                    xw[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[3, i], "float32") * diff, DTYPE
+                    )
+                    xa[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[4, i], "float32") * diff, DTYPE
+                    )
+                    xg[t, i] = T.cast(
+                        lv + T.cast(x_rkvwag[5, i], "float32") * diff, DTYPE
+                    )
+            if t == LEN - 1:
+                for i in T.Parallel(C):
+                    prev_x[i] = x_ln[t, i]
+
+    return _impl
+
+
+def _tmix_prefill_front_macro(
+    LEN: int,
+    C: int,
+    DTYPE: str,
+    H: int,
+    Rv: int,
+    Rw: int,
+    Ra: int,
+    Rg: int,
+    THREADS: int = WARP,
+):
+    """TMIX prefill front: prologue + rkv GEMM + low-rank gates + L2-norm.
+
+    Produces the per-row quantities the serial DPLR needs: ``rkv [3, LEN, C]``,
+    ``w``/``a`` ``[LEN, C]``, ``kk_norm``/``B`` ``[LEN, C]``, and ``g``
+    ``[LEN, C]``. Updates ``v_first`` in place.
+    """
+    assert C % THREADS == 0
+    assert H * N == C
+    assert C % WARP == 0
+    assert Rv % WARP == 0 and Rw % WARP == 0
+    assert Ra % WARP == 0 and Rg % WARP == 0
+
+
+    prologue = tmix_prefill_prologue_macro(LEN, C, DTYPE)
+
+    @T.macro
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
+        rkvWt: T.Tensor((3, C, C), DTYPE),
+        v1t: T.Tensor((Rv, C), DTYPE),
+        w1t: T.Tensor((Rw, C), DTYPE),
+        a1t: T.Tensor((Ra, C), DTYPE),
+        g1t: T.Tensor((Rg, C), DTYPE),
+        v2t: T.Tensor((C, Rv), DTYPE),
+        w2t: T.Tensor((C, Rw), DTYPE),
+        a2t: T.Tensor((C, Ra), DTYPE),
+        g2t: T.Tensor((C, Rg), DTYPE),
+        v0: T.Tensor((C,), DTYPE),
+        w0: T.Tensor((C,), DTYPE),
+        a0: T.Tensor((C,), DTYPE),
+        k_k: T.Tensor((C,), DTYPE),
+        k_a: T.Tensor((C,), DTYPE),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        v_first: T.Tensor((LEN, C), DTYPE),
+        first: T.int32,
+        x_ln: T.Tensor((LEN, C), DTYPE),
+        xrkv: T.Tensor((LEN, 3, C), DTYPE),
+        xv: T.Tensor((LEN, C), DTYPE),
+        xw: T.Tensor((LEN, C), DTYPE),
+        xa: T.Tensor((LEN, C), DTYPE),
+        xg: T.Tensor((LEN, C), DTYPE),
+        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        w: T.Tensor((LEN, C), DTYPE),
+        a: T.Tensor((LEN, C), DTYPE),
+        kk_norm: T.Tensor((LEN, C), DTYPE),
+        B: T.Tensor((LEN, C), DTYPE),
+        g: T.Tensor((LEN, C), DTYPE),
+    ):
+        """5 + 3 kernels."""
+        vr = T.alloc_global((LEN, Rv), DTYPE)
+        wr = T.alloc_global((LEN, Rw), DTYPE)
+        ar = T.alloc_global((LEN, Ra), DTYPE)
+        gr = T.alloc_global((LEN, Rg), DTYPE)
+        kk = T.alloc_global((LEN, C), DTYPE)
+
+        prologue(
+            x0,
+            ln_preW,
+            ln_preB,
+            x_rkvwag,
+            prev_x=prev_x,
+            x_ln=x_ln,
+            xrkv=xrkv,
+            xv=xv,
+            xw=xw,
+            xa=xa,
+            xg=xg,
+        )
+
+        # kernel: rkv = xrkv @ rkvWt  (per-row batched GEMV, fp32 accumulate)
+        gv = gemv_batch_T_macro(LEN, C, C, 3, DTYPE, THREADS)
+        with T.Kernel(C // THREADS, 3, LEN, threads=THREADS) as (bx, bz, bt):
+            gv(bx, bz, bt, xrkv, rkvWt, out=rkv)
+
+        # kernel: first-step rank GEMVs; flat grid (t, rank row, gate)
+        Rmax = max(Rv, Rw, Ra, Rg)
+        with T.Kernel(LEN * Rmax * 4, threads=WARP) as flat:
+            n = T.get_thread_binding(0)
+            t = flat // (Rmax * 4)
+            rem = flat % (Rmax * 4)
+            j = rem // 4
+            bz = rem % 4
+            acc = T.alloc_fragment((1,), "float32")
+            acc[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            if bz == 0:
+                if j < Rv:
+                    for c in T.serial(C // WARP):
+                        c_idx = n * (C // WARP) + c
+                        acc[0] += T.cast(v1t[j, c_idx], "float32") * T.cast(
+                            xv[t, c_idx], "float32"
+                        )
+            elif bz == 1:
+                if j < Rw:
+                    for c in T.serial(C // WARP):
+                        c_idx = n * (C // WARP) + c
+                        acc[0] += T.cast(w1t[j, c_idx], "float32") * T.cast(
+                            xw[t, c_idx], "float32"
+                        )
+            elif bz == 2:
+                if j < Ra:
+                    for c in T.serial(C // WARP):
+                        c_idx = n * (C // WARP) + c
+                        acc[0] += T.cast(a1t[j, c_idx], "float32") * T.cast(
+                            xa[t, c_idx], "float32"
+                        )
+            else:
+                if j < Rg:
+                    for c in T.serial(C // WARP):
+                        c_idx = n * (C // WARP) + c
+                        acc[0] += T.cast(g1t[j, c_idx], "float32") * T.cast(
+                            xg[t, c_idx], "float32"
+                        )
+            total = T.warp_reduce_sum(acc[0])
+            if n == 0:
+                if bz == 0:
+                    if j < Rv:
+                        vr[t, j] = T.cast(total, DTYPE)
+                elif bz == 1:
+                    if j < Rw:
+                        wr[t, j] = T.cast(total, DTYPE)
+                elif bz == 2:
+                    if j < Ra:
+                        ar[t, j] = T.cast(total, DTYPE)
+                else:
+                    if j < Rg:
+                        gr[t, j] = T.cast(total, DTYPE)
+
+        # kernel: rank-out second steps + v/w/a/kk/k/g gate math; flat (t, i)
+        with T.Kernel(LEN * C, threads=WARP) as flat:
+            n = T.get_thread_binding(0)
+            t = flat // C
+            i = flat % C
+            pv = T.alloc_fragment((1,), "float32")
+            pw = T.alloc_fragment((1,), "float32")
+            pa = T.alloc_fragment((1,), "float32")
+            pg = T.alloc_fragment((1,), "float32")
+            pv[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            pw[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            pa[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            pg[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            for j in T.serial(Rv // WARP):
+                j_idx = n * (Rv // WARP) + j
+                pv[0] += T.cast(v2t[i, j_idx], "float32") * T.cast(
+                    vr[t, j_idx], "float32"
+                )
+            for j in T.serial(Rw // WARP):
+                j_idx = n * (Rw // WARP) + j
+                pw[0] += T.cast(w2t[i, j_idx], "float32") * T.tanh(
+                    T.cast(wr[t, j_idx], "float32")
+                )
+            for j in T.serial(Ra // WARP):
+                j_idx = n * (Ra // WARP) + j
+                pa[0] += T.cast(a2t[i, j_idx], "float32") * T.cast(
+                    ar[t, j_idx], "float32"
+                )
+            for j in T.serial(Rg // WARP):
+                j_idx = n * (Rg // WARP) + j
+                pg[0] += T.cast(g2t[i, j_idx], "float32") * T.sigmoid(
+                    T.cast(gr[t, j_idx], "float32")
+                )
+            v12 = T.warp_reduce_sum(pv[0])
+            w12 = T.warp_reduce_sum(pw[0])
+            a12 = T.warp_reduce_sum(pa[0])
+            g12 = T.warp_reduce_sum(pg[0])
+            if n == 0:
+                v_cur = T.cast(rkv[t, 2, i], "float32")
+                # v_first is the value residual from layer 0: layer 0
+                # (``first != 0``) keeps v and stores its whole [T, C] v;
+                # later layers gate each row toward layer-0's same-row v.
+                vf = T.if_then_else(
+                    first != 0, v_cur, T.cast(v_first[t, i], "float32")
+                )
+                sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12)
+                v_out = v_cur + sig_v * (vf - v_cur)
+                v_first[t, i] = T.cast(vf, DTYPE)
+                rkv[t, 2, i] = T.cast(v_out, DTYPE)
+                w[t, i] = T.cast(
+                    T.exp(
+                        -T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
+                    ),
+                    DTYPE,
+                )
+                a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
+                a[t, i] = T.cast(a_val, DTYPE)
+                k_cur = T.cast(rkv[t, 1, i], "float32")
+                kk[t, i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
+                rkv[t, 1, i] = T.cast(
+                    k_cur
+                    + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
+                    DTYPE,
+                )
+                g[t, i] = T.cast(g12, DTYPE)
+
+        # kernel: fused L2-norm(kk) + neg*multiply -> kk_norm, B; flat (t, h)
+        with T.Kernel(LEN * H, threads=WARP) as flat:
+            n = T.get_thread_binding(0)
+            t = flat // H
+            h = flat % H
+            p_sq = T.alloc_fragment((1,), "float32")
+            p_sq[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            for j in T.serial(SERIAL):
+                idx = n * SERIAL + j
+                kk_val = T.cast(kk[t, h * N + idx], "float32")
+                p_sq[0] += kk_val * kk_val
+            total_sq = T.warp_reduce_sum(p_sq[0])
+            den = T.max(T.sqrt(total_sq), T.float32(1e-12))  # pyright: ignore[reportCallIssue]
+            for j in T.serial(SERIAL):
+                idx = n * SERIAL + j
+                flat_c = h * N + idx
+                kk_norm[t, flat_c] = T.cast(
+                    T.cast(kk[t, flat_c], "float32") / den, DTYPE
+                )
+                B[t, flat_c] = T.cast(
+                    -(T.cast(kk_norm[t, flat_c], "float32") * T.cast(a[t, flat_c], "float32")),
+                    DTYPE,
+                )
+
+    return _impl
+
+
+@tilelang.jit(out_idx=[21, 22, 23, 24, 25, 26])
+def _tmix_prefill_front(
+    LEN: int,
+    C: int,
+    DTYPE: str,
+    H: int,
+    Rv: int,
+    Rw: int,
+    Ra: int,
+    Rg: int,
+):
+    """Prefill front jit: returns (rkv, w, a, kk_norm, B, g) + updates state."""
+    front = _tmix_prefill_front_macro(
+        LEN, C, DTYPE, H, Rv, Rw, Ra, Rg
+    )
+
+    @T.prim_func
+    def _impl(
+        x0: T.Tensor((LEN, C), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_rkvwag: T.Tensor((6, C), DTYPE),
+        rkvWt: T.Tensor((3, C, C), DTYPE),
+        v1t: T.Tensor((Rv, C), DTYPE),
+        w1t: T.Tensor((Rw, C), DTYPE),
+        a1t: T.Tensor((Ra, C), DTYPE),
+        g1t: T.Tensor((Rg, C), DTYPE),
+        v2t: T.Tensor((C, Rv), DTYPE),
+        w2t: T.Tensor((C, Rw), DTYPE),
+        a2t: T.Tensor((C, Ra), DTYPE),
+        g2t: T.Tensor((C, Rg), DTYPE),
+        v0: T.Tensor((C,), DTYPE),
+        w0: T.Tensor((C,), DTYPE),
+        a0: T.Tensor((C,), DTYPE),
+        k_k: T.Tensor((C,), DTYPE),
+        k_a: T.Tensor((C,), DTYPE),
+        prev_x: T.Tensor((C,), DTYPE),
+        v_first: T.Tensor((LEN, C), DTYPE),
+        first: T.int32,
+        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        w: T.Tensor((LEN, C), DTYPE),
+        a: T.Tensor((LEN, C), DTYPE),
+        kk_norm: T.Tensor((LEN, C), DTYPE),
+        B: T.Tensor((LEN, C), DTYPE),
+        g: T.Tensor((LEN, C), DTYPE),
+    ):
+        x_ln = T.alloc_global((LEN, C), DTYPE)
+        xrkv = T.alloc_global((LEN, 3, C), DTYPE)
+        xv = T.alloc_global((LEN, C), DTYPE)
+        xw = T.alloc_global((LEN, C), DTYPE)
+        xa = T.alloc_global((LEN, C), DTYPE)
+        xg = T.alloc_global((LEN, C), DTYPE)
+
+        front(
+            x0,
+            ln_preW,
+            ln_preB,
+            x_rkvwag,
+            rkvWt,
+            v1t,
+            w1t,
+            a1t,
+            g1t,
+            v2t,
+            w2t,
+            a2t,
+            g2t,
+            v0,
+            w0,
+            a0,
+            k_k,
+            k_a,
+            prev_x=prev_x,
+            v_first=v_first,
+            first=first,
+            x_ln=x_ln,
+            xrkv=xrkv,
+            xv=xv,
+            xw=xw,
+            xa=xa,
+            xg=xg,
+            rkv=rkv,
+            w=w,
+            a=a,
+            kk_norm=kk_norm,
+            B=B,
+            g=g,
+        )
+
+    return _impl
+
+
+def tmix_prefill_back_macro(
+    LEN: int,
+    C: int,
+    DTYPE: str,
+    H: int,
+    Rv: int,
+    Rw: int,
+    Ra: int,
+    Rg: int,
+    THREADS: int = WARP,
+):
+    """TMIX prefill back: serial DPLR + GroupNorm + output projection.
+
+    All kernels here traverse T via the same serial-loop role so the shared
+    global buffers (``y``, ``gy``) keep one consistent T-axis role.
+    """
+    assert C % THREADS == 0
+    assert H * N == C
+    assert C % WARP == 0
+    assert Rv % WARP == 0 and Rw % WARP == 0
+    assert Ra % WARP == 0 and Rg % WARP == 0
+
+    @T.macro
+    def _impl(
+        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        w: T.Tensor((LEN, C), DTYPE),
+        kk_norm: T.Tensor((LEN, C), DTYPE),
+        B: T.Tensor((LEN, C), DTYPE),
+        a: T.Tensor((LEN, C), DTYPE),
+        g: T.Tensor((LEN, C), DTYPE),
+        r_k: T.Tensor((H, N), DTYPE),
+        ln_xW: T.Tensor((C,), DTYPE),
+        ln_xB: T.Tensor((C,), DTYPE),
+        oWt: T.Tensor((C, C), DTYPE),
+        x0: T.Tensor((LEN, C), DTYPE),
+        *,
+        rnn: T.Tensor((H, N, N), "float32"),
+        out: T.Tensor((LEN, C), DTYPE),
+    ):
+        """3 kernels."""
+        y = T.alloc_global((LEN, C), DTYPE)
+        gy = T.alloc_global((LEN, C), DTYPE)
+
+        # kernel: DPLR state update (one block per (h, v_n); serial over t)
+        with T.Kernel(H, N, threads=WARP) as (h, v_n):
+            n = T.get_thread_binding(0)
+            p_sa = T.alloc_fragment((1,), "float32")
+            p_y = T.alloc_fragment((1,), "float32")
+            for t in T.serial(LEN):
+                p_sa[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+                for j in T.serial(SERIAL):
+                    a_idx = n * SERIAL + j
+                    p_sa[0] += rnn[h, v_n, a_idx] * T.cast(
+                        kk_norm[t, h * N + a_idx], "float32"
+                    )
+                sa = T.warp_reduce_sum(p_sa[0])
+                v_val = T.cast(rkv[t, 2, h * N + v_n], "float32")
+                p_y[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+                for j in T.serial(SERIAL):
+                    k_idx = n * SERIAL + j
+                    s_new = (
+                        rnn[h, v_n, k_idx] * T.cast(w[t, h * N + k_idx], "float32")
+                        + sa * T.cast(B[t, h * N + k_idx], "float32")
+                        + v_val * T.cast(rkv[t, 1, h * N + k_idx], "float32")
+                    )
+                    rnn[h, v_n, k_idx] = s_new
+                    p_y[0] += s_new * T.cast(rkv[t, 0, h * N + k_idx], "float32")
+                y_val = T.warp_reduce_sum(p_y[0])
+                if n == 0:
+                    y[t, h * N + v_n] = T.cast(y_val, DTYPE)
+
+        # kernel: GroupNorm + r*k*r_k residual over [H, N]; serial over t
+        with T.Kernel(H, threads=WARP) as h:
+            n = T.get_thread_binding(0)
+            for t in T.serial(LEN):
+                p_sum = T.alloc_fragment((1,), "float32")
+                p_rkrk = T.alloc_fragment((1,), "float32")
+                p_sum[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+                p_rkrk[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+                for j in T.serial(SERIAL):
+                    idx = n * SERIAL + j
+                    p_sum[0] += T.cast(y[t, h * N + idx], "float32")
+                    p_rkrk[0] += (
+                        T.cast(rkv[t, 0, h * N + idx], "float32")
+                        * T.cast(rkv[t, 1, h * N + idx], "float32")
+                        * T.cast(r_k[h, idx], "float32")
+                    )
+                total_sum = T.warp_reduce_sum(p_sum[0])
+                total_rkrk = T.warp_reduce_sum(p_rkrk[0])
+                mean = total_sum / T.float32(N)  # pyright: ignore[reportCallIssue]
+                p_var = T.alloc_fragment((1,), "float32")
+                p_var[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+                for j in T.serial(SERIAL):
+                    idx = n * SERIAL + j
+                    diff = T.cast(y[t, h * N + idx], "float32") - mean
+                    p_var[0] += diff * diff
+                total_var = T.warp_reduce_sum(p_var[0])
+                rstd = T.float32(1.0) / T.sqrt(total_var / T.float32(N) + T.float32(64e-5))  # pyright: ignore[reportCallIssue]
+                for j in T.serial(SERIAL):
+                    idx = n * SERIAL + j
+                    flat_c = h * N + idx
+                    y_norm = (T.cast(y[t, flat_c], "float32") - mean) * rstd
+                    y_aff = y_norm * T.cast(ln_xW[flat_c], "float32") + T.cast(
+                        ln_xB[flat_c], "float32"
+                    )
+                    residual = total_rkrk * T.cast(rkv[t, 2, flat_c], "float32")
+                    gy[t, flat_c] = T.cast(
+                        (y_aff + residual) * T.cast(g[t, flat_c], "float32"), DTYPE
+                    )
+
+        # kernel: out = x0 + gy @ oWt; serial over t
+        with T.Kernel(C // THREADS, threads=THREADS) as bx:
+            for t in T.serial(LEN):
+                acc = T.alloc_fragment((THREADS,), "float32")
+                T.clear(acc)
+                for k in T.serial(C):
+                    for i in T.Parallel(THREADS):
+                        acc[i] += T.cast(gy[t, k], "float32") * T.cast(
+                            oWt[k, bx * THREADS + i], "float32"
+                        )
+                for i in T.Parallel(THREADS):
+                    idx = bx * THREADS + i
+                    if idx < C:
+                        out[t, idx] = T.cast(
+                            acc[i] + T.cast(x0[t, idx], "float32"), DTYPE
+                        )
+
+    return _impl
+
+
+@tilelang.jit(out_idx=[12])
+def _tmix_prefill_back(
+    LEN: int,
+    C: int,
+    DTYPE: str,
+    H: int,
+    Rv: int,
+    Rw: int,
+    Ra: int,
+    Rg: int,
+):
+    """Prefill back jit: DPLR + GN + output projection."""
+    back = tmix_prefill_back_macro(LEN, C, DTYPE, H, Rv, Rw, Ra, Rg)
+
+    @T.prim_func
+    def _impl(
+        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        w: T.Tensor((LEN, C), DTYPE),
+        kk_norm: T.Tensor((LEN, C), DTYPE),
+        B: T.Tensor((LEN, C), DTYPE),
+        a: T.Tensor((LEN, C), DTYPE),
+        g: T.Tensor((LEN, C), DTYPE),
+        r_k: T.Tensor((H, N), DTYPE),
+        ln_xW: T.Tensor((C,), DTYPE),
+        ln_xB: T.Tensor((C,), DTYPE),
+        oWt: T.Tensor((C, C), DTYPE),
+        x0: T.Tensor((LEN, C), DTYPE),
+        rnn: T.Tensor((H, N, N), "float32"),
+        out: T.Tensor((LEN, C), DTYPE),
+    ):
+        back(
+            rkv,
+            w,
+            kk_norm,
+            B,
+            a,
+            g,
+            r_k,
+            ln_xW,
+            ln_xB,
+            oWt,
+            x0,
+            rnn=rnn,
             out=out,
         )
 

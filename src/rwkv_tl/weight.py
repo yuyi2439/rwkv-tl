@@ -33,12 +33,7 @@ class RWKV7ATTWeight:
     ln_pre: LNWeight
     ln_x: LNWeight
 
-    x_r: Tensor
-    x_w: Tensor
-    x_k: Tensor
-    x_v: Tensor
-    x_a: Tensor
-    x_g: Tensor
+    x_rkvwag: Tensor
 
     w0: Tensor
     w1: Tensor
@@ -67,12 +62,17 @@ class RWKV7ATTWeight:
         self.ln_pre = ln_pre
         self.ln_x = LNWeight(W, f"{prefix}.ln_x")
 
-        self.x_r = W[f"{prefix}.x_r"].squeeze()
-        self.x_w = W[f"{prefix}.x_w"].squeeze()
-        self.x_k = W[f"{prefix}.x_k"].squeeze()
-        self.x_v = W[f"{prefix}.x_v"].squeeze()
-        self.x_a = W[f"{prefix}.x_a"].squeeze()
-        self.x_g = W[f"{prefix}.x_g"].squeeze()
+        self.x_rkvwag = torch.stack(
+            (
+                W[f"{prefix}.x_r"].squeeze(),
+                W[f"{prefix}.x_k"].squeeze(),
+                W[f"{prefix}.x_v"].squeeze(),
+                W[f"{prefix}.x_w"].squeeze(),
+                W[f"{prefix}.x_a"].squeeze(),
+                W[f"{prefix}.x_g"].squeeze(),
+            ),
+            dim=0,
+        )
 
         self.w0 = W[f"{prefix}.w0"]
         self.w1 = W[f"{prefix}.w1"]
@@ -159,9 +159,9 @@ class RWKV7Weight:
         dtype: torch.dtype = torch.float16,
     ):
         # Checkpoints are bf16. Default converts to fp16 once at load
-        # (Albatross approach): fp16 tensor cores work on sm_75+, and fp16's
-        # 10-bit mantissa beats bf16's 7-bit. Pass dtype=torch.bfloat16 to
-        # keep the raw checkpoint dtype (no conversion) for the bf16 model.
+        # (fp16 tensor cores work on sm_75+, and fp16's 10-bit mantissa beats
+        # bf16's 7-bit). Pass dtype=torch.bfloat16 to keep the raw checkpoint
+        # dtype (no conversion) for the bf16 model.
         # Accumulation stays fp32 inside every kernel.
         W = torch.load(model_path, map_location=device)
         W = {
@@ -170,8 +170,8 @@ class RWKV7Weight:
         self.head = W["head.weight"]
         self.ln_in = LNWeight(W, "blocks.0.ln0")
         self.ln_out = LNWeight(W, "ln_out")
-        # Normalize the embedding once at load (LN0 fused in, like Albatross),
-        # so models can use it directly without re-normalizing per construction.
+        # Normalize the embedding once at load (LN0 fused in), so models can
+        # use it directly without re-normalizing per construction.
         self.emb = self.ln_in(W["emb.weight"])
 
         self.dtype = dtype
