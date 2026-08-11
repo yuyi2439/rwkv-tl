@@ -6,7 +6,7 @@ import tilelang
 import tilelang.language as T
 
 from ._common import HEAD_DIM, SERIAL, WARP
-from .gemv import gemv_batch_macro, gemv_batch_T_macro, gemv_macro
+from .gemv import gemv_batch_macro, gemv_macro
 from .ln import ln_prologue_macro
 
 N = HEAD_DIM
@@ -569,7 +569,8 @@ def tmix_prefill_prologue_macro(LEN: int, C: int, DTYPE: str, THREADS: int = 256
         *,
         prev_x: T.Tensor((C,), DTYPE),
         x_ln: T.Tensor((LEN, C), DTYPE),
-        xrkv: T.Tensor((LEN, 3, C), DTYPE),
+        xr: T.Tensor((LEN, C), DTYPE),
+        xk: T.Tensor((LEN, C), DTYPE),
         xv: T.Tensor((LEN, C), DTYPE),
         xw: T.Tensor((LEN, C), DTYPE),
         xa: T.Tensor((LEN, C), DTYPE),
@@ -591,16 +592,15 @@ def tmix_prefill_prologue_macro(LEN: int, C: int, DTYPE: str, THREADS: int = 256
                 for i in T.Parallel(C):
                     lv = T.cast(x_ln[t, i], "float32")
                     diff = T.cast(prev_x[i], "float32") - lv
-                    xrkv[t, 0, i] = T.cast(
+                    xr[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[0, i], "float32") * diff, DTYPE
                     )
-                    xrkv[t, 1, i] = T.cast(
+                    xk[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[1, i], "float32") * diff, DTYPE
                     )
-                    xrkv[t, 2, i] = T.cast(
+                    xv[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[2, i], "float32") * diff, DTYPE
                     )
-                    xv[t, i] = xrkv[t, 2, i]
                     xw[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[3, i], "float32") * diff, DTYPE
                     )
@@ -614,16 +614,15 @@ def tmix_prefill_prologue_macro(LEN: int, C: int, DTYPE: str, THREADS: int = 256
                 for i in T.Parallel(C):
                     lv = T.cast(x_ln[t, i], "float32")
                     diff = T.cast(x_ln[t - 1, i], "float32") - lv
-                    xrkv[t, 0, i] = T.cast(
+                    xr[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[0, i], "float32") * diff, DTYPE
                     )
-                    xrkv[t, 1, i] = T.cast(
+                    xk[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[1, i], "float32") * diff, DTYPE
                     )
-                    xrkv[t, 2, i] = T.cast(
+                    xv[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[2, i], "float32") * diff, DTYPE
                     )
-                    xv[t, i] = xrkv[t, 2, i]
                     xw[t, i] = T.cast(
                         lv + T.cast(x_rkvwag[3, i], "float32") * diff, DTYPE
                     )
@@ -691,12 +690,13 @@ def _tmix_prefill_front_macro(
         v_first: T.Tensor((LEN, C), DTYPE),
         first: T.int32,
         x_ln: T.Tensor((LEN, C), DTYPE),
-        xrkv: T.Tensor((LEN, 3, C), DTYPE),
+        xr: T.Tensor((LEN, C), DTYPE),
+        xk: T.Tensor((LEN, C), DTYPE),
         xv: T.Tensor((LEN, C), DTYPE),
         xw: T.Tensor((LEN, C), DTYPE),
         xa: T.Tensor((LEN, C), DTYPE),
         xg: T.Tensor((LEN, C), DTYPE),
-        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        rkv: T.Tensor((3, LEN, C), DTYPE),
         w: T.Tensor((LEN, C), DTYPE),
         a: T.Tensor((LEN, C), DTYPE),
         kk_norm: T.Tensor((LEN, C), DTYPE),
@@ -717,17 +717,35 @@ def _tmix_prefill_front_macro(
             x_rkvwag,
             prev_x=prev_x,
             x_ln=x_ln,
-            xrkv=xrkv,
+            xr=xr,
+            xk=xk,
             xv=xv,
             xw=xw,
             xa=xa,
             xg=xg,
         )
 
-        # kernel: rkv = xrkv @ rkvWt  (per-row batched GEMV, fp32 accumulate)
-        gv = gemv_batch_T_macro(LEN, C, C, 3, DTYPE, THREADS)
-        with T.Kernel(C // THREADS, 3, LEN, threads=THREADS) as (bx, bz, bt):
-            gv(bx, bz, bt, xrkv, rkvWt, out=rkv)
+        # kernel: rkv = [xr; xk; xv] @ rkvWt  (batched GEMM over T rows x 3 projections)
+        BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 16, 64, 32, 3
+        with T.Kernel(T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), 3, threads=128) as (
+            bx,
+            by,
+            bz,
+        ):
+            A_sh = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
+            B_sh = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
+            C_frag = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(C_frag)
+            for k_blk in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=NUM_STAGES):
+                if bz == 0:
+                    T.copy(xr[by * BLOCK_M, k_blk * BLOCK_K], A_sh)
+                elif bz == 1:
+                    T.copy(xk[by * BLOCK_M, k_blk * BLOCK_K], A_sh)
+                else:
+                    T.copy(xv[by * BLOCK_M, k_blk * BLOCK_K], A_sh)
+                T.copy(rkvWt[bz, k_blk * BLOCK_K, bx * BLOCK_N], B_sh)
+                T.gemm(A_sh, B_sh, C_frag)
+            T.copy(C_frag, rkv[bz, by * BLOCK_M, bx * BLOCK_N])
 
         # kernel: first-step rank GEMVs; flat grid (t, rank row, gate)
         Rmax = max(Rv, Rw, Ra, Rg)
@@ -820,7 +838,7 @@ def _tmix_prefill_front_macro(
             a12 = T.warp_reduce_sum(pa[0])
             g12 = T.warp_reduce_sum(pg[0])
             if n == 0:
-                v_cur = T.cast(rkv[t, 2, i], "float32")
+                v_cur = T.cast(rkv[2, t, i], "float32")
                 # v_first is the value residual from layer 0: layer 0
                 # (``first != 0``) keeps v and stores its whole [T, C] v;
                 # later layers gate each row toward layer-0's same-row v.
@@ -830,7 +848,7 @@ def _tmix_prefill_front_macro(
                 sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12)
                 v_out = v_cur + sig_v * (vf - v_cur)
                 v_first[t, i] = T.cast(vf, DTYPE)
-                rkv[t, 2, i] = T.cast(v_out, DTYPE)
+                rkv[2, t, i] = T.cast(v_out, DTYPE)
                 w[t, i] = T.cast(
                     T.exp(
                         -T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
@@ -839,9 +857,9 @@ def _tmix_prefill_front_macro(
                 )
                 a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
                 a[t, i] = T.cast(a_val, DTYPE)
-                k_cur = T.cast(rkv[t, 1, i], "float32")
+                k_cur = T.cast(rkv[1, t, i], "float32")
                 kk[t, i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
-                rkv[t, 1, i] = T.cast(
+                rkv[1, t, i] = T.cast(
                     k_cur
                     + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
                     DTYPE,
@@ -914,7 +932,7 @@ def _tmix_prefill_front(
         prev_x: T.Tensor((C,), DTYPE),
         v_first: T.Tensor((LEN, C), DTYPE),
         first: T.int32,
-        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        rkv: T.Tensor((3, LEN, C), DTYPE),
         w: T.Tensor((LEN, C), DTYPE),
         a: T.Tensor((LEN, C), DTYPE),
         kk_norm: T.Tensor((LEN, C), DTYPE),
@@ -922,7 +940,8 @@ def _tmix_prefill_front(
         g: T.Tensor((LEN, C), DTYPE),
     ):
         x_ln = T.alloc_global((LEN, C), DTYPE)
-        xrkv = T.alloc_global((LEN, 3, C), DTYPE)
+        xr = T.alloc_global((LEN, C), DTYPE)
+        xk = T.alloc_global((LEN, C), DTYPE)
         xv = T.alloc_global((LEN, C), DTYPE)
         xw = T.alloc_global((LEN, C), DTYPE)
         xa = T.alloc_global((LEN, C), DTYPE)
@@ -951,7 +970,8 @@ def _tmix_prefill_front(
             v_first=v_first,
             first=first,
             x_ln=x_ln,
-            xrkv=xrkv,
+            xr=xr,
+            xk=xk,
             xv=xv,
             xw=xw,
             xa=xa,
@@ -991,7 +1011,7 @@ def tmix_prefill_back_macro(
 
     @T.macro
     def _impl(
-        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        rkv: T.Tensor((3, LEN, C), DTYPE),
         w: T.Tensor((LEN, C), DTYPE),
         kk_norm: T.Tensor((LEN, C), DTYPE),
         B: T.Tensor((LEN, C), DTYPE),
@@ -1023,17 +1043,17 @@ def tmix_prefill_back_macro(
                         kk_norm[t, h * N + a_idx], "float32"
                     )
                 sa = T.warp_reduce_sum(p_sa[0])
-                v_val = T.cast(rkv[t, 2, h * N + v_n], "float32")
+                v_val = T.cast(rkv[2, t, h * N + v_n], "float32")
                 p_y[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
                 for j in T.serial(SERIAL):
                     k_idx = n * SERIAL + j
                     s_new = (
                         rnn[h, v_n, k_idx] * T.cast(w[t, h * N + k_idx], "float32")
                         + sa * T.cast(B[t, h * N + k_idx], "float32")
-                        + v_val * T.cast(rkv[t, 1, h * N + k_idx], "float32")
+                        + v_val * T.cast(rkv[1, t, h * N + k_idx], "float32")
                     )
                     rnn[h, v_n, k_idx] = s_new
-                    p_y[0] += s_new * T.cast(rkv[t, 0, h * N + k_idx], "float32")
+                    p_y[0] += s_new * T.cast(rkv[0, t, h * N + k_idx], "float32")
                 y_val = T.warp_reduce_sum(p_y[0])
                 if n == 0:
                     y[t, h * N + v_n] = T.cast(y_val, DTYPE)
@@ -1050,8 +1070,8 @@ def tmix_prefill_back_macro(
                     idx = n * SERIAL + j
                     p_sum[0] += T.cast(y[t, h * N + idx], "float32")
                     p_rkrk[0] += (
-                        T.cast(rkv[t, 0, h * N + idx], "float32")
-                        * T.cast(rkv[t, 1, h * N + idx], "float32")
+                        T.cast(rkv[0, t, h * N + idx], "float32")
+                        * T.cast(rkv[1, t, h * N + idx], "float32")
                         * T.cast(r_k[h, idx], "float32")
                     )
                 total_sum = T.warp_reduce_sum(p_sum[0])
@@ -1072,7 +1092,7 @@ def tmix_prefill_back_macro(
                     y_aff = y_norm * T.cast(ln_xW[flat_c], "float32") + T.cast(
                         ln_xB[flat_c], "float32"
                     )
-                    residual = total_rkrk * T.cast(rkv[t, 2, flat_c], "float32")
+                    residual = total_rkrk * T.cast(rkv[2, t, flat_c], "float32")
                     gy[t, flat_c] = T.cast(
                         (y_aff + residual) * T.cast(g[t, flat_c], "float32"), DTYPE
                     )
@@ -1113,7 +1133,7 @@ def _tmix_prefill_back(
 
     @T.prim_func
     def _impl(
-        rkv: T.Tensor((LEN, 3, C), DTYPE),
+        rkv: T.Tensor((3, LEN, C), DTYPE),
         w: T.Tensor((LEN, C), DTYPE),
         kk_norm: T.Tensor((LEN, C), DTYPE),
         B: T.Tensor((LEN, C), DTYPE),
