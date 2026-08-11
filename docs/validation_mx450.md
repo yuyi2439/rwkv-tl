@@ -130,3 +130,29 @@ MX450 热节流导致各次运行波动，但加速比稳定在 ~2.5x 以上。
 结论：decode 与小-中 prefill 领先 1.25-1.88x（融合 kernel 一次 host 调用 +
 省中间张量分配）；大 T 趋平（GEMM 计算主导）。均为 eager 数值，未叠 CUDA
 Graph（Graph 会进一步拉开 decode 差距）。
+
+### 0.4b（C=1024, H=16, L=24）对比（均含 CUDA Graph）
+
+`tl-fp16` 与 faster3a_2607 都经 CUDA Graph 包装（`make_rwkv7(use_graph=True)`
+默认；faster3a 自身默认 graph）。warmup=20 iters=100：
+
+| Case | faster3a_2607 | tl-fp16 | 加速比 |
+|---|---|---|---|
+| 1x1 decode | 18.19 ms | 23.65 ms | 0.77x（落后） |
+| 1x8 | 64.51 ms | 57.32 ms | 1.13x |
+| 1x32 | 166.10 ms | 71.63 ms | 2.32x |
+| 1x128 | 215.33 ms | 212.67 ms | 1.01x |
+| 1x256 | 484.47 ms | 401.62 ms | 1.21x |
+
+结论：
+- **decode 落后（0.77x）**：0.4b 每层 tmix_decode 拆 10 个 kernel，24 层 =
+  ~264 个 kernel 顺序 launch，launch 开销主导；faster3a 用单 fusion CUDA op
+  （`add_layer_norm_tmix_mix6_f16`）融整条 TMIX。下一步应把 tmix_decode 的
+  rkv/rank/gate/LN 进一步融合减少 kernel 数。
+- **prefill 中 T 大幅领先（1x32 快 2.32x）**：fused cmix_prefill + 融合 prologue
+  的 GEMM 路径优于 faster3a 的逐 op 调度。
+- **大 T 趋平**：GEMM 计算主导。
+
+对比 0.1b：decode 领先 1.68x（C=768 小、kernel 少时融合收益 > launch 开销）；
+0.4b C=1024 大时 launch 开销超过融合收益，decode 转负。prefill 优势在两种
+规模都成立。
