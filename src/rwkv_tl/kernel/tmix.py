@@ -822,11 +822,12 @@ def _tmix_prefill_front_macro(
         _rank_out_gemm(rw, a2t, a12, Ra, Rv + Rw, "none")
         _rank_out_gemm(rw, g2t, g12, Rg, Rv + Rw + Ra, "sigmoid")
 
-        # kernel: v/w/a/kk/k/g gate math from v12/w12/a12/g12 + rkv; flat (t, i)
-        with T.Kernel(LEN * C, threads=WARP) as flat:
+        # kernel: v/w/a/kk/k/g gate math from v12/w12/a12/g12 + rkv; one block
+        # per WARP C-elements (lane n -> element base+n), no cross-lane reduce.
+        with T.Kernel(LEN * (C // WARP), threads=WARP) as flat:
             n = T.get_thread_binding(0)
-            t = flat // C
-            i = flat % C
+            t = flat // (C // WARP)
+            i = (flat % (C // WARP)) * WARP + n
             v12_v = T.cast(v12[t, i], "float32")
             w12_v = T.cast(w12[t, i], "float32")
             a12_v = T.cast(a12[t, i], "float32")
