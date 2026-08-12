@@ -656,6 +656,7 @@ def _tmix_prefill_front_macro(
     ``w``/``a`` ``[LEN, C]``, ``kk_norm``/``B`` ``[LEN, C]``, and ``g``
     ``[LEN, C]``. Updates ``v_first`` in place.
     """
+    Rsum = Rv + Rw + Ra + Rg
     assert C % THREADS == 0
     assert H * N == C
     assert C % WARP == 0
@@ -664,6 +665,33 @@ def _tmix_prefill_front_macro(
 
 
     prologue = tmix_prefill_prologue_macro(LEN, C, DTYPE)
+
+    # Shared macro for the 4 first-step rank GEMVs ([LEN, C] @ [C, R]), used
+    # as a @T.macro so each gate expands to its own kernel block. Weights are
+    # stored transposed ``v1t [R, C]``, so B is read transposed into shared.
+    BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 32, 128, 32, 2
+
+    @T.macro
+    def _rank_gemm(xs, Wt, out, R, col0):
+        with T.Kernel(T.ceildiv(R, BLOCK_N), T.ceildiv(LEN, BLOCK_M), threads=128) as (
+            bx,
+            by,
+        ):
+            A_sh = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
+            B_sh = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
+            C_frag = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(C_frag)
+            for kk in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=NUM_STAGES):
+                T.copy(xs[by * BLOCK_M, kk * BLOCK_K], A_sh)
+                for i, j in T.Parallel(BLOCK_K, BLOCK_N):
+                    if bx * BLOCK_N + j < R:
+                        B_sh[i, j] = Wt[bx * BLOCK_N + j, kk * BLOCK_K + i]
+                T.gemm(A_sh, B_sh, C_frag)
+            for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                if bx * BLOCK_N + j < R:
+                    out[by * BLOCK_M + i, col0 + bx * BLOCK_N + j] = T.cast(
+                        C_frag[i, j], DTYPE
+                    )
 
     @T.macro
     def _impl(
@@ -704,10 +732,7 @@ def _tmix_prefill_front_macro(
         g: T.Tensor((LEN, C), DTYPE),
     ):
         """5 + 3 kernels."""
-        vr = T.alloc_global((LEN, Rv), DTYPE)
-        wr = T.alloc_global((LEN, Rw), DTYPE)
-        ar = T.alloc_global((LEN, Ra), DTYPE)
-        gr = T.alloc_global((LEN, Rg), DTYPE)
+        rw = T.alloc_global((LEN, Rsum), DTYPE)
         kk = T.alloc_global((LEN, C), DTYPE)
 
         prologue(
@@ -747,58 +772,14 @@ def _tmix_prefill_front_macro(
                 T.gemm(A_sh, B_sh, C_frag)
             T.copy(C_frag, rkv[bz, by * BLOCK_M, bx * BLOCK_N])
 
-        # kernel: first-step rank GEMVs; flat grid (t, rank row, gate)
-        Rmax = max(Rv, Rw, Ra, Rg)
-        with T.Kernel(LEN * Rmax * 4, threads=WARP) as flat:
-            n = T.get_thread_binding(0)
-            t = flat // (Rmax * 4)
-            rem = flat % (Rmax * 4)
-            j = rem // 4
-            bz = rem % 4
-            acc = T.alloc_fragment((1,), "float32")
-            acc[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            if bz == 0:
-                if j < Rv:
-                    for c in T.serial(C // WARP):
-                        c_idx = n * (C // WARP) + c
-                        acc[0] += T.cast(v1t[j, c_idx], "float32") * T.cast(
-                            xv[t, c_idx], "float32"
-                        )
-            elif bz == 1:
-                if j < Rw:
-                    for c in T.serial(C // WARP):
-                        c_idx = n * (C // WARP) + c
-                        acc[0] += T.cast(w1t[j, c_idx], "float32") * T.cast(
-                            xw[t, c_idx], "float32"
-                        )
-            elif bz == 2:
-                if j < Ra:
-                    for c in T.serial(C // WARP):
-                        c_idx = n * (C // WARP) + c
-                        acc[0] += T.cast(a1t[j, c_idx], "float32") * T.cast(
-                            xa[t, c_idx], "float32"
-                        )
-            else:
-                if j < Rg:
-                    for c in T.serial(C // WARP):
-                        c_idx = n * (C // WARP) + c
-                        acc[0] += T.cast(g1t[j, c_idx], "float32") * T.cast(
-                            xg[t, c_idx], "float32"
-                        )
-            total = T.warp_reduce_sum(acc[0])
-            if n == 0:
-                if bz == 0:
-                    if j < Rv:
-                        vr[t, j] = T.cast(total, DTYPE)
-                elif bz == 1:
-                    if j < Rw:
-                        wr[t, j] = T.cast(total, DTYPE)
-                elif bz == 2:
-                    if j < Ra:
-                        ar[t, j] = T.cast(total, DTYPE)
-                else:
-                    if j < Rg:
-                        gr[t, j] = T.cast(total, DTYPE)
+        # kernel: first-step rank GEMVs as 4 independent packed T.gemm kernels
+        # [LEN, C] @ [C, Rg] per gate, each writing its rw segment. Avoids
+        # per-rank-row flat blocks that explode with larger ranks (1.5B: 5.6ms
+        # flat -> ~0.47ms total GEMM).
+        _rank_gemm(xv, v1t, rw, Rv, 0)
+        _rank_gemm(xw, w1t, rw, Rw, Rv)
+        _rank_gemm(xa, a1t, rw, Ra, Rv + Rw)
+        _rank_gemm(xg, g1t, rw, Rg, Rv + Rw + Ra)
 
         # kernel: rank-out second steps + v/w/a/kk/k/g gate math; flat (t, i)
         with T.Kernel(LEN * C, threads=WARP) as flat:
@@ -816,22 +797,22 @@ def _tmix_prefill_front_macro(
             for j in T.serial(Rv // WARP):
                 j_idx = n * (Rv // WARP) + j
                 pv[0] += T.cast(v2t[i, j_idx], "float32") * T.cast(
-                    vr[t, j_idx], "float32"
+                    rw[t, j_idx], "float32"
                 )
             for j in T.serial(Rw // WARP):
                 j_idx = n * (Rw // WARP) + j
                 pw[0] += T.cast(w2t[i, j_idx], "float32") * T.tanh(
-                    T.cast(wr[t, j_idx], "float32")
+                    T.cast(rw[t, Rv + j_idx], "float32")
                 )
             for j in T.serial(Ra // WARP):
                 j_idx = n * (Ra // WARP) + j
                 pa[0] += T.cast(a2t[i, j_idx], "float32") * T.cast(
-                    ar[t, j_idx], "float32"
+                    rw[t, Rv + Rw + j_idx], "float32"
                 )
             for j in T.serial(Rg // WARP):
                 j_idx = n * (Rg // WARP) + j
                 pg[0] += T.cast(g2t[i, j_idx], "float32") * T.sigmoid(
-                    T.cast(gr[t, j_idx], "float32")
+                    T.cast(rw[t, Rv + Rw + Ra + j_idx], "float32")
                 )
             v12 = T.warp_reduce_sum(pv[0])
             w12 = T.warp_reduce_sum(pw[0])
