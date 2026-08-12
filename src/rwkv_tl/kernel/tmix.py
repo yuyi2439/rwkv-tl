@@ -693,6 +693,34 @@ def _tmix_prefill_front_macro(
                         C_frag[i, j], DTYPE
                     )
 
+    # rank-out GEMM: out [LEN, C] = act(rw[:, Roff:Roff+R]) @ Wt where Wt is the
+    # rank-out weight [R, C] stored transposed as [C, R] (v2t/w2t/a2t/g2t), read
+    # transposed into shared. ``activate`` selects tanh (w), sigmoid (g) or
+    # identity (v/a) applied to the rw row before the matmul.
+    @T.macro
+    def _rank_out_gemm(rw, Wt, out, R, Roff, activate):
+        with T.Kernel(T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), threads=128) as (
+            bx,
+            by,
+        ):
+            A_sh = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
+            B_sh = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
+            C_frag = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(C_frag)
+            for kk in T.Pipelined(T.ceildiv(R, BLOCK_K), num_stages=NUM_STAGES):
+                for i, j in T.Parallel(BLOCK_M, BLOCK_K):
+                    v = T.cast(rw[by * BLOCK_M + i, Roff + kk * BLOCK_K + j], "float32")
+                    if activate == "tanh":
+                        A_sh[i, j] = T.cast(T.tanh(v), DTYPE)
+                    elif activate == "sigmoid":
+                        A_sh[i, j] = T.cast(T.sigmoid(v), DTYPE)
+                    else:
+                        A_sh[i, j] = T.cast(v, DTYPE)
+                for i, j in T.Parallel(BLOCK_K, BLOCK_N):
+                    B_sh[i, j] = Wt[bx * BLOCK_N + j, kk * BLOCK_K + i]
+                T.gemm(A_sh, B_sh, C_frag)
+            T.copy(C_frag, out[by * BLOCK_M, bx * BLOCK_N])
+
     @T.macro
     def _impl(
         x0: T.Tensor((LEN, C), DTYPE),
@@ -734,6 +762,10 @@ def _tmix_prefill_front_macro(
         """5 + 3 kernels."""
         rw = T.alloc_global((LEN, Rsum), DTYPE)
         kk = T.alloc_global((LEN, C), DTYPE)
+        v12 = T.alloc_global((LEN, C), DTYPE)
+        w12 = T.alloc_global((LEN, C), DTYPE)
+        a12 = T.alloc_global((LEN, C), DTYPE)
+        g12 = T.alloc_global((LEN, C), DTYPE)
 
         prologue(
             x0,
@@ -781,71 +813,51 @@ def _tmix_prefill_front_macro(
         _rank_gemm(xa, a1t, rw, Ra, Rv + Rw)
         _rank_gemm(xg, g1t, rw, Rg, Rv + Rw + Ra)
 
-        # kernel: rank-out second steps + v/w/a/kk/k/g gate math; flat (t, i)
+        # kernel: rank-out second steps as 4 packed T.gemm kernels
+        # [LEN,R]@[R,C] per gate -> v12/w12/a12/g12 [LEN,C] (w/g rows activated
+        # via tanh/sigmoid on the rw segments). Avoids LEN*C flat blocks that
+        # explode with larger ranks (1.5B: 1.45ms flat -> ~0.33ms GEMM).
+        _rank_out_gemm(rw, v2t, v12, Rv, 0, "none")
+        _rank_out_gemm(rw, w2t, w12, Rw, Rv, "tanh")
+        _rank_out_gemm(rw, a2t, a12, Ra, Rv + Rw, "none")
+        _rank_out_gemm(rw, g2t, g12, Rg, Rv + Rw + Ra, "sigmoid")
+
+        # kernel: v/w/a/kk/k/g gate math from v12/w12/a12/g12 + rkv; flat (t, i)
         with T.Kernel(LEN * C, threads=WARP) as flat:
             n = T.get_thread_binding(0)
             t = flat // C
             i = flat % C
-            pv = T.alloc_fragment((1,), "float32")
-            pw = T.alloc_fragment((1,), "float32")
-            pa = T.alloc_fragment((1,), "float32")
-            pg = T.alloc_fragment((1,), "float32")
-            pv[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            pw[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            pa[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            pg[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-            for j in T.serial(Rv // WARP):
-                j_idx = n * (Rv // WARP) + j
-                pv[0] += T.cast(v2t[i, j_idx], "float32") * T.cast(
-                    rw[t, j_idx], "float32"
-                )
-            for j in T.serial(Rw // WARP):
-                j_idx = n * (Rw // WARP) + j
-                pw[0] += T.cast(w2t[i, j_idx], "float32") * T.tanh(
-                    T.cast(rw[t, Rv + j_idx], "float32")
-                )
-            for j in T.serial(Ra // WARP):
-                j_idx = n * (Ra // WARP) + j
-                pa[0] += T.cast(a2t[i, j_idx], "float32") * T.cast(
-                    rw[t, Rv + Rw + j_idx], "float32"
-                )
-            for j in T.serial(Rg // WARP):
-                j_idx = n * (Rg // WARP) + j
-                pg[0] += T.cast(g2t[i, j_idx], "float32") * T.sigmoid(
-                    T.cast(rw[t, Rv + Rw + Ra + j_idx], "float32")
-                )
-            v12 = T.warp_reduce_sum(pv[0])
-            w12 = T.warp_reduce_sum(pw[0])
-            a12 = T.warp_reduce_sum(pa[0])
-            g12 = T.warp_reduce_sum(pg[0])
-            if n == 0:
-                v_cur = T.cast(rkv[2, t, i], "float32")
-                # v_first is the value residual from layer 0: layer 0
-                # (``first != 0``) keeps v and stores its whole [T, C] v;
-                # later layers gate each row toward layer-0's same-row v.
-                vf = T.if_then_else(
-                    first != 0, v_cur, T.cast(v_first[t, i], "float32")
-                )
-                sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12)
-                v_out = v_cur + sig_v * (vf - v_cur)
-                v_first[t, i] = T.cast(vf, DTYPE)
-                rkv[2, t, i] = T.cast(v_out, DTYPE)
-                w[t, i] = T.cast(
-                    T.exp(
-                        -T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
-                    ),
-                    DTYPE,
-                )
-                a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
-                a[t, i] = T.cast(a_val, DTYPE)
-                k_cur = T.cast(rkv[1, t, i], "float32")
-                kk[t, i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
-                rkv[1, t, i] = T.cast(
-                    k_cur
-                    + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
-                    DTYPE,
-                )
-                g[t, i] = T.cast(g12, DTYPE)
+            v12_v = T.cast(v12[t, i], "float32")
+            w12_v = T.cast(w12[t, i], "float32")
+            a12_v = T.cast(a12[t, i], "float32")
+            g12_v = T.cast(g12[t, i], "float32")
+            v_cur = T.cast(rkv[2, t, i], "float32")
+            # v_first is the value residual from layer 0: layer 0
+            # (``first != 0``) keeps v and stores its whole [T, C] v;
+            # later layers gate each row toward layer-0's same-row v.
+            vf = T.if_then_else(
+                first != 0, v_cur, T.cast(v_first[t, i], "float32")
+            )
+            sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12_v)
+            v_out = v_cur + sig_v * (vf - v_cur)
+            v_first[t, i] = T.cast(vf, DTYPE)
+            rkv[2, t, i] = T.cast(v_out, DTYPE)
+            w[t, i] = T.cast(
+                T.exp(
+                    -T.sigmoid(T.cast(w0[i], "float32") + w12_v) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
+                ),
+                DTYPE,
+            )
+            a_val = T.sigmoid(T.cast(a0[i], "float32") + a12_v)
+            a[t, i] = T.cast(a_val, DTYPE)
+            k_cur = T.cast(rkv[1, t, i], "float32")
+            kk[t, i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
+            rkv[1, t, i] = T.cast(
+                k_cur
+                + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
+                DTYPE,
+            )
+            g[t, i] = T.cast(g12_v, DTYPE)
 
         # kernel: fused L2-norm(kk) + neg*multiply -> kk_norm, B; flat (t, h)
         with T.Kernel(LEN * H, threads=WARP) as flat:
