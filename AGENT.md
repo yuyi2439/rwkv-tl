@@ -243,17 +243,22 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 
 ## Known issues and notes
 
-- **Fused prefill (9e81fd1) regresses on sm_86: serial oWt GEMV in `_tmix_prefill_back`.**
-  The new fused prefill front/back (commit 9e81fd1, "prefill rkv projection via fp16
-  T.gemm") was tuned on MX450 (2.1x there) but regresses badly on RTX 3060: 0.1B
-  T=128 5.19 -> 30.3ms, 0.4B 14.6 -> 114.8ms, 1.5B T=128 35 -> 386ms (T-larger =
-  worse, up to 10x). Root cause (2026-08-12 profiling): `_tmix_prefill_back`'s
-  output projection is a hand-written GEMV with `for t in T.serial(LEN) for k in
-  T.serial(C)` -- fully serial, no tensor cores, 1704us at 0.1B/T=128 vs 63us for
-  the batched `T.gemm` used by the old `out_mm` (27x). The GN kernel likewise
-  serializes over T with only H blocks. On MX450 the serial GEMV beat its
-  pathological fp16 cuBLAS, hence the commit's claim; sm_86 exposes it. Fix: use
-  batched `T.gemm` for oWt and GN (report, not fixed). See
+- **Fused prefill (9e81fd1) regressed on sm_86, now FIXED (3d05ebd, 493e3e6).**
+  The fused prefill front/back (commit 9e81fd1) was tuned on MX450 (2.1x) but
+  regressed badly on RTX 3060: 0.1B T=128 5.19 -> 30.3ms, 1.5B -> 386ms. Two
+  root causes, both fixed:
+  1. `_tmix_prefill_back`'s oWt projection was a serial-over-T hand-written
+     GEMV (`for t in serial(LEN) for k in serial(C)`), 1704us at 0.1B/T=128 vs
+     63us for batched `T.gemm` (27x); GN also serialized over T with H blocks.
+     Fixed (3d05ebd): oWt as batched `T.gemm` + GN grid (LEN, H). 2.5-2.7x.
+  2. `_tmix_prefill_front`'s rank-first-step flat kernel (`LEN*Rmax*4` blocks)
+     exploded with large ranks: 1.5B 5.6ms/layer. Fixed (493e3e6): 4 packed
+     `T.gemm` `[LEN,C]@[C,R]`. 1.5B T=128 198.7 -> 82.2ms (2.4x).
+  Final (2026-08-12, RTX 3060): 0.1B T=128 11.3ms, 0.4B 31.5ms, 1.5B 82.2ms
+  (vs the 9e81fd1 regression of 30.3/114.8/386.5ms; still ~2x the a8e2ef7
+  baseline, remaining cost is the rank-out flat kernel). fp16 suite passes;
+  greedy generate output unchanged. Remaining optimization (reported, not
+  fixed): rank-out flat kernel -> packed GEMM (~4x). See
   `docs/benchmarks/rtx3060.md` "fused prefill 接入（9e81fd1）".
 - **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
   errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
