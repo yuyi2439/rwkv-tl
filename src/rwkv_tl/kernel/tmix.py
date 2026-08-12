@@ -1025,33 +1025,40 @@ def tmix_prefill_back_macro(
         y = T.alloc_global((LEN, C), DTYPE)
         gy = T.alloc_global((LEN, C), DTYPE)
 
-        # kernel: DPLR state update (one block per (h, v_n); serial over t)
-        with T.Kernel(H, N, threads=WARP) as (h, v_n):
+        # kernel: DPLR state update, one block per head h with N threads
+        # (thread = state column v_n); each column's N-element state lives in
+        # per-thread registers (fp16, matching faster3a), so the serial over T
+        # loop has no global/smem round-trip. Column updates are independent,
+        # no cross-thread reduce.
+        with T.Kernel(H, threads=N) as h:
             n = T.get_thread_binding(0)
-            p_sa = T.alloc_fragment((1,), "float32")
-            p_y = T.alloc_fragment((1,), "float32")
+            st = T.alloc_local((N,), "float16")
+            for k in T.serial(N):
+                st[k] = T.cast(rnn[h, n, k], "float16")
+
             for t in T.serial(LEN):
+                p_sa = T.alloc_fragment((1,), "float32")
+                p_y = T.alloc_fragment((1,), "float32")
                 p_sa[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-                for j in T.serial(SERIAL):
-                    a_idx = n * SERIAL + j
-                    p_sa[0] += rnn[h, v_n, a_idx] * T.cast(
-                        kk_norm[t, h * N + a_idx], "float32"
-                    )
-                sa = T.warp_reduce_sum(p_sa[0])
-                v_val = T.cast(rkv[2, t, h * N + v_n], "float32")
                 p_y[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-                for j in T.serial(SERIAL):
-                    k_idx = n * SERIAL + j
-                    s_new = (
-                        rnn[h, v_n, k_idx] * T.cast(w[t, h * N + k_idx], "float32")
-                        + sa * T.cast(B[t, h * N + k_idx], "float32")
-                        + v_val * T.cast(rkv[1, t, h * N + k_idx], "float32")
+                for k in T.serial(N):
+                    p_sa[0] += T.cast(st[k], "float32") * T.cast(
+                        kk_norm[t, h * N + k], "float32"
                     )
-                    rnn[h, v_n, k_idx] = s_new
-                    p_y[0] += s_new * T.cast(rkv[0, t, h * N + k_idx], "float32")
-                y_val = T.warp_reduce_sum(p_y[0])
-                if n == 0:
-                    y[t, h * N + v_n] = T.cast(y_val, DTYPE)
+                sa = p_sa[0]
+                v_val = T.cast(rkv[2, t, h * N + n], "float32")
+                for k in T.serial(N):
+                    s_new = (
+                        T.cast(st[k], "float32") * T.cast(w[t, h * N + k], "float32")
+                        + sa * T.cast(B[t, h * N + k], "float32")
+                        + v_val * T.cast(rkv[1, t, h * N + k], "float32")
+                    )
+                    st[k] = T.cast(s_new, "float16")
+                    p_y[0] += s_new * T.cast(rkv[0, t, h * N + k], "float32")
+                y[t, h * N + n] = T.cast(p_y[0], DTYPE)
+
+            for k in T.serial(N):
+                rnn[h, n, k] = T.cast(st[k], "float32")
 
         # kernel: GroupNorm + r*k*r_k residual over [H, N]; one block per (t, h)
         with T.Kernel(LEN, H, threads=WARP) as (t2, h2):
