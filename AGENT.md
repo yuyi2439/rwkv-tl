@@ -279,6 +279,41 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   parallel DPLR (TODO #3). Small models are already competitive/ahead. Full
   sweep and analysis: `docs/benchmarks/rtx3060.md` "三模型 vs faster3a 完整
   差距分析".
+- **sm_75 (MX450) sweep after the rank/DPLR optimizations (2026-08-12).** On
+  this laptop 0.1B prefill is now fully ahead of faster3a: T=32 36.7 vs 49.0ms,
+  T=128 56.2 vs 87.3ms (halved from 111ms after 9e81fd1), T=512 193 vs 256ms,
+  T=1024 379 vs 483ms; decode 1x1 ~8.2ms ties. The only regression is T=8
+  (34.3 vs 28.7ms, small-T cost of the packed rank T.gemm) -- worth a look but
+  minor. So the "cannot surpass faster3a" conclusion only holds for 1.5B large-
+  T prefill on sm_86; 0.1B/0.4B are ahead on both GPUs.
+- **tilelang `T.Pipelined` cannot pipeline the serial-over-T DPLR data loads.**
+  Attempted to prefetch the per-token k-dim inputs (kk_norm/w/B/rkv) into
+  double-buffered shared to hide memory latency (faster3a uses cp.async
+  prefetch). Automatic mode (`num_stages=2`) compiles + passes numerically but
+  is 6.4x SLOWER on sm_75 (synchronous shared copies + pipeline-sync overhead
+  with no cp.async). Manual `order/stage` (5 copies as stage-0 async producers,
+  recurrence as stage-1 consumer; stage 0 = early producer per tilelang's
+  `software_pipeline_async_stages`) compiles but BREAKS correctness (max_abs
+  ~12.8) -- the reorder destroys the rnn state dependency. Pipelined is built
+  for dependency-free loops (GEMM K loop); it cannot safely separate "prefetch
+  data" from "keep compute order" for a stateful recurrence. DPLR stays
+  serial-over-T reading global (L1 suffices on sm_75).
+- **DPLR register-resident state is the real win (e0da4c7).** Holding each
+  state column in per-thread `T.alloc_local((N,), "float16")` registers
+  (faster3a's precision), grid (H,) with N threads (thread = state column v_n),
+  no cross-thread reduce -- measured -13% on 1.5B T=256 (3060). A prior
+  attempt with per-thread serial + fp32 rnn reads from global was SLOWER on
+  sm_75 (12 blocks, low occupancy + global round-trip): register residency is
+  the key, not the serial structure.
+- **Rank GEMM tile size is decisive (9972971).** Rank widths are small
+  (Rv/Rw/Ra/Rg 64/96/96/256 on 1.5B): BLOCK_N=64 is ~2x vs 128. An earlier
+  BLOCK_N=32 attempt was 6x SLOWER than the flat per-rank kernel (too small for
+  the tensor core). Match the tile to the rank width.
+- **sm_75 has no cp.async.** tilelang gates `cp.async` lowering on
+  `target_has_async_copy` (sm_80+). faster3a's local "support sm75" branch
+  (`8906c84`) keeps the double-buffer structure but falls back to synchronous
+  int4 copies with `cp_wait`/`commit` as no-ops -- no real async overlap on
+  sm_75 (why DPLR there can't benefit from the prefetch pattern).
 - **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
   errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
   Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060
