@@ -211,6 +211,12 @@ relative comparisons as reliable, absolute numbers as noisy.
 (tilelang bf16 kernels can fail to compile/lower on this device, e.g.
 "Cannot find var remap for <buffer>" in `StorageLegalizer`). bf16 paths must be
 validated on sm_80+ (RTX 3060 box); MX450 work is fp16-only.
+**Kernels tuned on MX450 must be re-verified on sm_80+.** MX450's pathological
+fp16 cuBLAS makes hand-written serial kernels look good there, but sm_86
+exposes under-parallelized implementations (see the 9e81fd1 prefill regression:
+a serial-over-T oWt GEMV looked fine on MX450 but was 27x slower than batched
+`T.gemm` on RTX 3060). Benchmark both cards before trusting an MX450-tuned
+kernel for the 3060 target.
 
 ## Performance work
 
@@ -237,6 +243,18 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 
 ## Known issues and notes
 
+- **Fused prefill (9e81fd1) regresses on sm_86: serial oWt GEMV in `_tmix_prefill_back`.**
+  The new fused prefill front/back (commit 9e81fd1, "prefill rkv projection via fp16
+  T.gemm") was tuned on MX450 (2.1x there) but regresses badly on RTX 3060: 0.1B
+  T=128 5.19 -> 30.3ms, 0.4B 14.6 -> 114.8ms, 1.5B T=128 35 -> 386ms (T-larger =
+  worse, up to 10x). Root cause (2026-08-12 profiling): `_tmix_prefill_back`'s
+  output projection is a hand-written GEMV with `for t in T.serial(LEN) for k in
+  T.serial(C)` -- fully serial, no tensor cores, 1704us at 0.1B/T=128 vs 63us for
+  the batched `T.gemm` used by the old `out_mm` (27x). The GN kernel likewise
+  serializes over T with only H blocks. On MX450 the serial GEMV beat its
+  pathological fp16 cuBLAS, hence the commit's claim; sm_86 exposes it. Fix: use
+  batched `T.gemm` for oWt and GN (report, not fixed). See
+  `docs/benchmarks/rtx3060.md` "fused prefill 接入（9e81fd1）".
 - **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
   errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
   Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060

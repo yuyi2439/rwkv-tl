@@ -48,6 +48,14 @@ cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不
 （Python 逐 op）。合计 ~530us/层 × 24 = 12.7ms + CMIX。1.5B T=128 落后 faster3a
 1.33x 大部分来自 TMIX 未融合 + DPLR 慢。
 
+**警示（2026-08-12）**：commit 9e81fd1 把 prefill 改为融合 `_tmix_prefill_front/_back`
+（MX450 上快 2.1x），但 **3060 (sm_86) 上 prefill 全面倒退 2.5-10x**——根因是
+`_tmix_prefill_back` 的 oWt 投影写成逐-token 串行手写 GEMV（`for t in serial(LEN)
+for k in serial(C)`，1704us @ 0.1B/T=128，未用 tensor core），而旧 `out_mm` 的
+batched `T.gemm` 只要 63us（27x）。GN 也串行 T。MX450 快是因为其 fp16 cuBLAS 病态
+使串行写法相对可接受。修复：oWt/GN 改 batched T.gemm。**在 MX450 上调优的 kernel
+必须在 sm_80+ 复测**，否则可能像这次一样倒退。
+
 真正解法是 chunk-based 并行 prefill：把 T 维切成 chunk（如 16/32），chunk 内并行
 计算 GEMM，chunk 间串行递推 state。参考 FlashRWKV `chunk_rwkv7` 和 FLA 的实现。
 注意 SM120 上 chunk 反而比 recurrent 慢（FlashRWKV 实测），需在我们的硬件上验证
