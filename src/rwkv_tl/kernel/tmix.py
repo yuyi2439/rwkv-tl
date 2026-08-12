@@ -669,7 +669,9 @@ def _tmix_prefill_front_macro(
     # Shared macro for the 4 first-step rank GEMVs ([LEN, C] @ [C, R]), used
     # as a @T.macro so each gate expands to its own kernel block. Weights are
     # stored transposed ``v1t [R, C]``, so B is read transposed into shared.
-    BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 32, 128, 32, 2
+    # BN=64 (not 128) since the rank widths are small (64/96/96/256 on 1.5B);
+    # measured 2x faster than BN=128 on RTX 3060.
+    BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 16, 64, 32, 3
 
     @T.macro
     def _rank_gemm(xs, Wt, out, R, col0):
@@ -699,27 +701,28 @@ def _tmix_prefill_front_macro(
     # identity (v/a) applied to the rw row before the matmul.
     @T.macro
     def _rank_out_gemm(rw, Wt, out, R, Roff, activate):
-        with T.Kernel(T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), threads=128) as (
+        BM, BN = 32, 64
+        with T.Kernel(T.ceildiv(C, BN), T.ceildiv(LEN, BM), threads=128) as (
             bx,
             by,
         ):
-            A_sh = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
-            B_sh = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
-            C_frag = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            A_sh = T.alloc_shared((BM, BLOCK_K), DTYPE)
+            B_sh = T.alloc_shared((BLOCK_K, BN), DTYPE)
+            C_frag = T.alloc_fragment((BM, BN), "float32")
             T.clear(C_frag)
             for kk in T.Pipelined(T.ceildiv(R, BLOCK_K), num_stages=NUM_STAGES):
-                for i, j in T.Parallel(BLOCK_M, BLOCK_K):
-                    v = T.cast(rw[by * BLOCK_M + i, Roff + kk * BLOCK_K + j], "float32")
+                for i, j in T.Parallel(BM, BLOCK_K):
+                    v = T.cast(rw[by * BM + i, Roff + kk * BLOCK_K + j], "float32")
                     if activate == "tanh":
                         A_sh[i, j] = T.cast(T.tanh(v), DTYPE)
                     elif activate == "sigmoid":
                         A_sh[i, j] = T.cast(T.sigmoid(v), DTYPE)
                     else:
                         A_sh[i, j] = T.cast(v, DTYPE)
-                for i, j in T.Parallel(BLOCK_K, BLOCK_N):
-                    B_sh[i, j] = Wt[bx * BLOCK_N + j, kk * BLOCK_K + i]
+                for i, j in T.Parallel(BLOCK_K, BN):
+                    B_sh[i, j] = Wt[bx * BN + j, kk * BLOCK_K + i]
                 T.gemm(A_sh, B_sh, C_frag)
-            T.copy(C_frag, out[by * BLOCK_M, bx * BLOCK_N])
+            T.copy(C_frag, out[by * BM, bx * BN])
 
     @T.macro
     def _impl(
