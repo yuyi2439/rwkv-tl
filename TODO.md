@@ -27,6 +27,14 @@ cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State c
 （36 次小 copy_）+ `.item()` 同步，另查。1.5B decode 18.93ms vs faster3a 7.91ms。
 详见 docs/benchmarks/rtx3060.md「neo kernels 基线」。
 
+**进度（2026-08-12）**：r/k/v 已合并为单 batched GEMV（`gemv_batch_macro`）。
+**精确根因已定位**（读 faster3a `rwkv7_v3a_ops.cu`）：它的单行 GEMV
+`linear_orig_row1_exact_f16` 用 128 threads/block + half2 向量化 K + 多 warp
+partial reduce（每 block 算 OutTile=2 输出），我们 `gemv_macro` 是 32 threads
+lane-per-output + K 标量串行读。1.5B 上 faster3a 41.7us/个 vs 我们 94-146us
+（链中膨胀）。修复方向：decode 单行 GEMV 重写为 faster3a 风格（128 threads +
+half2 向量化 + 多 warp reduce），见 docs/benchmarks/rtx3060.md 三模型差距分析。
+
 ### #2 batch decode（B>1）
 
 目前 decode 只支持 B=1。RNN 架构无 KV cache 内存爆炸，对 batching 有天然优势。
@@ -68,6 +76,13 @@ register state（commit e0da4c7，1.5B T=256 92→80ms），DPLR 不再是主要
 1.5B 剩余 1.6-1.9x 差距来自 **front 的 4 个 rank 一阶 GEMM（637us/层，tile 浪费：
 R=64/96 时 BLOCK_N=128 半空）+ rkv GEMM 290us**——faster3a 用 cuBLAS batched 处理。
 先优化 rank 一阶 GEMM tile（R 小时用更小 BLOCK_N）再考虑真 chunk。
+
+**进度（2026-08-12 晚）**：rank GEMM tile 已优化（BN=64，commit 9972971，1.5B
+T=128 50.3→45.1ms）。**最终路线评估**：即使 DPLR + rank GEMM 全部优化，1.5B 仍
+输 faster3a 1.3-2.1x（decode 输在单行 GEMV 结构，prefill 输在 GEMM 规模 + 串行
+DPLR latency）。真 chunk 并行是唯一未试的路径，但 faster3a 本身也不是 chunk
+并行——它的优势是手写 CUDA kernel（cp.async、row1_exact、split-K）。详见
+docs/benchmarks/rtx3060.md 三模型差距分析。
 
 
 ### #4 1.5B 模型验证（RTX 3060）

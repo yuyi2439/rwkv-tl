@@ -260,6 +260,25 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   greedy generate output unchanged. Remaining optimization (reported, not
   fixed): rank-out flat kernel -> packed GEMM (~4x). See
   `docs/benchmarks/rtx3060.md` "fused prefill 接入（9e81fd1）".
+- **Project route assessment vs faster3a_2607 (2026-08-12).** After all the
+  fused-prefill fixes and DPLR/rank optimizations this session, measured on
+  RTX 3060 (T=1..512 sweep): **0.1B/0.4B prefill beats faster3a** (0.1B
+  T<=64, 0.4B T=8..64; 0.1B decode also wins), but **1.5B loses everywhere
+  (1.3-2.1x) and all models lose large-T prefill** (T>=256, 1.5-2.0x). Two
+  structural reasons faster3a wins on big models, both hard to close with
+  tilelang high-level kernels alone:
+  1. **decode single-row GEMV**: faster3a's `linear_orig_row1_exact_f16` uses
+     128 threads + half2 vectorized-K + multi-warp reduce (41.7us on 1.5B);
+     our `gemv_macro` is 32-thread lane-per-output scalar-K (94-146us in
+     chain). C larger -> gap wider.
+  2. **prefill GEMM scale + serial DPLR latency**: C=2048 compute is ~7x
+     0.1B, run through a serial-over-T DPLR. faster3a uses cuBLAS batched +
+     cp.async prefetch.
+  Conclusion: rwkv-tl cannot fully surpass faster3a on large models without
+  hand-written CUDA kernels (contradicting the tilelang route) or the chunk-
+  parallel DPLR (TODO #3). Small models are already competitive/ahead. Full
+  sweep and analysis: `docs/benchmarks/rtx3060.md` "三模型 vs faster3a 完整
+  差距分析".
 - **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
   errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
   Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060
@@ -283,6 +302,8 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   "neo kernels 基线" analysis and TODO #1. **Partially fixed: the r/k/v
   projections are now one batched GEMV (see `gemv_batch_macro` and the
   stacked `rkvWt`); on MX450/0.4B decode 1x1 beats faster3a (~1.24x).**
+  The remaining decode gap on 1.5B is the single-row GEMV structure itself
+  (see the route assessment above).
 - The pure-torch baseline was improved by batched prefill work.
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.
