@@ -61,6 +61,15 @@ batched `T.gemm` 只要 63us（27x）。GN 也串行 T。MX450 快是因为其 f
 注意 SM120 上 chunk 反而比 recurrent 慢（FlashRWKV 实测），需在我们的硬件上验证
 交叉点。
 
+**调研更新（2026-08-12）**：读了 faster3a `rwkv7_wkv_fp16_v2.cu`——它的
+`wkv_fp16_seq_v2_kernel` **并非真 chunk 并行**，也是串行 over T，但用 (B,H) grid +
+每线程 fp16 register state + cp.async 双缓冲预取。我们已把 DPLR 对齐到 fp16
+register state（commit e0da4c7，1.5B T=256 92→80ms），DPLR 不再是主要差距。
+1.5B 剩余 1.6-1.9x 差距来自 **front 的 4 个 rank 一阶 GEMM（637us/层，tile 浪费：
+R=64/96 时 BLOCK_N=128 半空）+ rkv GEMM 290us**——faster3a 用 cuBLAS batched 处理。
+先优化 rank 一阶 GEMM tile（R 小时用更小 BLOCK_N）再考虑真 chunk。
+
+
 ### #4 1.5B 模型验证（RTX 3060）
 
 0.1B/0.4B 太小，不足以暴露真实推理场景的问题。1.5B 是 RWKV7 主力部署尺寸
