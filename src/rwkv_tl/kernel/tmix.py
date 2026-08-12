@@ -1000,8 +1000,9 @@ def tmix_prefill_back_macro(
 ):
     """TMIX prefill back: serial DPLR + GroupNorm + output projection.
 
-    All kernels here traverse T via the same serial-loop role so the shared
-    global buffers (``y``, ``gy``) keep one consistent T-axis role.
+    DPLR is serial over T (state-dependent); GN and the oWt projection are
+    batched over T (one block per (t, h) and a `T.gemm` over [LEN, C],
+    respectively) so they stay parallel.
     """
     assert C % THREADS == 0
     assert H * N == C
@@ -1058,61 +1059,64 @@ def tmix_prefill_back_macro(
                 if n == 0:
                     y[t, h * N + v_n] = T.cast(y_val, DTYPE)
 
-        # kernel: GroupNorm + r*k*r_k residual over [H, N]; serial over t
-        with T.Kernel(H, threads=WARP) as h:
+        # kernel: GroupNorm + r*k*r_k residual over [H, N]; one block per (t, h)
+        with T.Kernel(LEN, H, threads=WARP) as (t2, h2):
             n = T.get_thread_binding(0)
-            for t in T.serial(LEN):
-                p_sum = T.alloc_fragment((1,), "float32")
-                p_rkrk = T.alloc_fragment((1,), "float32")
-                p_sum[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-                p_rkrk[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-                for j in T.serial(SERIAL):
-                    idx = n * SERIAL + j
-                    p_sum[0] += T.cast(y[t, h * N + idx], "float32")
-                    p_rkrk[0] += (
-                        T.cast(rkv[0, t, h * N + idx], "float32")
-                        * T.cast(rkv[1, t, h * N + idx], "float32")
-                        * T.cast(r_k[h, idx], "float32")
-                    )
-                total_sum = T.warp_reduce_sum(p_sum[0])
-                total_rkrk = T.warp_reduce_sum(p_rkrk[0])
-                mean = total_sum / T.float32(N)  # pyright: ignore[reportCallIssue]
-                p_var = T.alloc_fragment((1,), "float32")
-                p_var[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
-                for j in T.serial(SERIAL):
-                    idx = n * SERIAL + j
-                    diff = T.cast(y[t, h * N + idx], "float32") - mean
-                    p_var[0] += diff * diff
-                total_var = T.warp_reduce_sum(p_var[0])
-                rstd = T.float32(1.0) / T.sqrt(total_var / T.float32(N) + T.float32(64e-5))  # pyright: ignore[reportCallIssue]
-                for j in T.serial(SERIAL):
-                    idx = n * SERIAL + j
-                    flat_c = h * N + idx
-                    y_norm = (T.cast(y[t, flat_c], "float32") - mean) * rstd
-                    y_aff = y_norm * T.cast(ln_xW[flat_c], "float32") + T.cast(
-                        ln_xB[flat_c], "float32"
-                    )
-                    residual = total_rkrk * T.cast(rkv[2, t, flat_c], "float32")
-                    gy[t, flat_c] = T.cast(
-                        (y_aff + residual) * T.cast(g[t, flat_c], "float32"), DTYPE
-                    )
+            p_sum = T.alloc_fragment((1,), "float32")
+            p_rkrk = T.alloc_fragment((1,), "float32")
+            p_sum[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            p_rkrk[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            for j in T.serial(SERIAL):
+                idx = n * SERIAL + j
+                p_sum[0] += T.cast(y[t2, h2 * N + idx], "float32")
+                p_rkrk[0] += (
+                    T.cast(rkv[0, t2, h2 * N + idx], "float32")
+                    * T.cast(rkv[1, t2, h2 * N + idx], "float32")
+                    * T.cast(r_k[h2, idx], "float32")
+                )
+            total_sum = T.warp_reduce_sum(p_sum[0])
+            total_rkrk = T.warp_reduce_sum(p_rkrk[0])
+            mean = total_sum / T.float32(N)  # pyright: ignore[reportCallIssue]
+            p_var = T.alloc_fragment((1,), "float32")
+            p_var[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+            for j in T.serial(SERIAL):
+                idx = n * SERIAL + j
+                diff = T.cast(y[t2, h2 * N + idx], "float32") - mean
+                p_var[0] += diff * diff
+            total_var = T.warp_reduce_sum(p_var[0])
+            rstd = T.float32(1.0) / T.sqrt(total_var / T.float32(N) + T.float32(64e-5))  # pyright: ignore[reportCallIssue]
+            for j in T.serial(SERIAL):
+                idx = n * SERIAL + j
+                flat_c = h2 * N + idx
+                y_norm = (T.cast(y[t2, flat_c], "float32") - mean) * rstd
+                y_aff = y_norm * T.cast(ln_xW[flat_c], "float32") + T.cast(
+                    ln_xB[flat_c], "float32"
+                )
+                residual = total_rkrk * T.cast(rkv[2, t2, flat_c], "float32")
+                gy[t2, flat_c] = T.cast(
+                    (y_aff + residual) * T.cast(g[t2, flat_c], "float32"), DTYPE
+                )
 
-        # kernel: out = x0 + gy @ oWt; serial over t
-        with T.Kernel(C // THREADS, threads=THREADS) as bx:
-            for t in T.serial(LEN):
-                acc = T.alloc_fragment((THREADS,), "float32")
-                T.clear(acc)
-                for k in T.serial(C):
-                    for i in T.Parallel(THREADS):
-                        acc[i] += T.cast(gy[t, k], "float32") * T.cast(
-                            oWt[k, bx * THREADS + i], "float32"
-                        )
-                for i in T.Parallel(THREADS):
-                    idx = bx * THREADS + i
-                    if idx < C:
-                        out[t, idx] = T.cast(
-                            acc[i] + T.cast(x0[t, idx], "float32"), DTYPE
-                        )
+        # kernel: out = x0 + gy @ oWt  (batched T.gemm over [LEN, C] x [C, C])
+        BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 16, 64, 32, 3
+        with T.Kernel(T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), threads=128) as (
+            bx,
+            by,
+        ):
+            A_sh = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
+            B_sh = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
+            C_frag = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(C_frag)
+            for kk in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=NUM_STAGES):
+                T.copy(gy[by * BLOCK_M, kk * BLOCK_K], A_sh)
+                T.copy(oWt[kk * BLOCK_K, bx * BLOCK_N], B_sh)
+                T.gemm(A_sh, B_sh, C_frag)
+            for i, j in T.Parallel(BLOCK_M, BLOCK_N):
+                out[by * BLOCK_M + i, bx * BLOCK_N + j] = T.cast(
+                    C_frag[i, j]
+                    + T.cast(x0[by * BLOCK_M + i, bx * BLOCK_N + j], "float32"),
+                    DTYPE,
+                )
 
     return _impl
 
