@@ -1,7 +1,6 @@
 """CUDA-Graph acceleration wrapper for any ``RWKV7Model`` implementation.
 
-Merges the old ``graph_decode``/``prefill_graph`` pair into one generic wrapper:
-instead of re-implementing the layer loop, ``CUDAGraph`` captures the wrapped
+Instead of re-implementing the layer loop, ``CUDAGraph`` captures the wrapped
 model's OWN ``decode`` and ``prefill`` methods against a fixed-address shadow
 ``State`` and replays them, copying the caller's ``State`` in/out around each
 replay. The wrapped model stays stateless -- any ``State`` works.
@@ -9,12 +8,11 @@ replay. The wrapped model stays stateless -- any ``State`` works.
 Usage::
 
     model = CUDAGraph(RWKV7TL(w))        # wrap an existing instance
-    # ... or ...
-    model = make_rwkv7(device, backend="auto")   # returns a wrapped class
+    out = model.generate("...", state=model.new_state())
 
 Capture is lazy (on first call) and per exact prefill length ``T`` up to
-``prefill_graph_max_t`` (larger ``T`` runs eager: launch overhead amortizes and
-graph memory scales with ``T``). Non-CUDA models, models whose ``prefill``
+``prefill_graph_max_t`` (larger ``T`` runs eager: launch overhead amortizes
+and graph memory scales with ``T``). Non-CUDA models, models whose ``prefill``
 rebinds ``state["x"]`` instead of updating it in place (CUDA-Graph replay
 requires fixed tensor addresses), and any capture failure transparently fall
 back to the wrapped model's eager path for the affected op.
@@ -22,21 +20,17 @@ back to the wrapped model's eager path for the affected op.
 
 from __future__ import annotations
 
-import logging
 import warnings
 from typing import Any
 
 import torch
 from torch import Tensor
 
+from rwkv_tl.model import RWKV7Model
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
-from ._rwkv7_abc import RWKV7Model
-
 __all__ = ["CUDAGraph", "make_graph_cls", "wrap_model"]
-
-_log = logging.getLogger(__name__)
 
 
 def _copy_state(dst: State, src: State) -> None:
@@ -67,8 +61,7 @@ class CUDAGraph(RWKV7Model):
         prefill_graph_max_t: Capture prefill as a graph for T in
             ``[2, prefill_graph_max_t]`` (or any T when ``None``); larger T
             runs eager. The default 1024 covers long prompts (a graph is far
-            faster than eager even at T=1024 -- measured 32 vs ~90ms on RTX
-            3060 / 0.1B); ``None`` removes the cap entirely.
+            faster than eager even at T=1024); ``None`` removes the cap.
         warmup: Warmup iterations per captured graph (initialises cuBLAS
             handles / forces lazy allocations so the graph is self-contained).
     """
@@ -260,11 +253,7 @@ def make_graph_cls(
     prefill_graph_max_t: int | None = 1024,
     warmup: int = 3,
 ) -> type[RWKV7Model]:
-    """Build a class that constructs ``base_cls(w, **kwargs)`` and wraps it.
-
-    ``make_rwkv7`` returns these so ``model_cls(w, ...)`` transparently yields a
-    graph-accelerated model with the same constructor signature.
-    """
+    """Build a class that constructs ``base_cls(w, **kwargs)`` and wraps it."""
 
     def _init(self, w: RWKV7Weight, **kwargs) -> None:
         CUDAGraph.__init__(

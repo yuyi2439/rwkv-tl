@@ -1,10 +1,10 @@
-# AGENT.md
+# AGENTS.md
 
 Working notes for agents working on this repository.
 
-**Read [CONTRIBUTING.md](CONTRIBUTING.md) first.** It is the canonical, human-facing project standard (repository layout, kernel-writing reference, conventions). AGENT.md only adds agent-specific operating rules on top of it.
+**Read [CONTRIBUTING.md](CONTRIBUTING.md) first.** It is the canonical, human-facing project standard (repository layout, kernel-writing reference, conventions). AGENTS.md only adds agent-specific operating rules on top of it.
 
-## Management rules for AGENT.md
+## Management rules for AGENTS.md
 
 This file is the operating guide for future agents. Follow these rules strictly.
 (Doc-writing style rules -- what to write, what to skip, conventions -- live in
@@ -19,11 +19,11 @@ the `docs-writer` skill; read it before updating this file.)
   large external/pulled refactor, go further and check this file's claims
   line-by-line against the code before trusting the commit message -- behavior
   and descriptions silently diverge in the same commit (e.g. `make_rwkv7`
-  `"auto"` mapping changed while AGENT.md still described the old one). Diff
+  `"auto"` mapping changed while AGENTS.md still described the old one). Diff
   the actual branches, not the narrative.
 - Update it when a new constraint, bug, environment limitation, or workflow rule is discovered.
 - Do not leave important findings only in chat history; record them here when they affect future work.
-- **Proactively record project standards the user states.** When the user states content that is a project standard (a convention, a rule, a design preference for this repo), update AGENT.md in the same session — do not leave it only in chat history or ask for confirmation.
+- **Proactively record project standards the user states.** When the user states content that is a project standard (a convention, a rule, a design preference for this repo), update AGENTS.md in the same session — do not leave it only in chat history or ask for confirmation.
 - **Self-improve skills on user feedback.** When the user raises a question or issue about behavior governed by a skill (`.agent/skill/<name>/SKILL.md`), update that skill so it prevents the problem next time.
 - When a new benchmark or experiment note is added, make sure the relevant link and summary are also reflected here.
 - **Before cross-linking per-GPU docs, confirm the machines actually match.** A claim like "see the RTX 3060 record (same machine)" was wrong -- MX450 (laptop, 2GB) and RTX 3060 (desktop, 12GB) are different machines. Verify hardware before asserting a shared test record.
@@ -56,7 +56,7 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - Correctness validation is automated via `pytest test/` (no hand-written validation doc); record test outcomes only when they change a decision or are a notable gate, not as a routine log.
 - When a new benchmark/test run is completed, record the results in the docs before moving on.
 - **A refactor (module rename/move, path changes) must update every affected
-  reference in code docstrings and project docs (AGENT.md, CONTRIBUTING.md,
+  reference in code docstrings and project docs (AGENTS.md, CONTRIBUTING.md,
   `script/benchmark_rwkv7.md`, `docs/`). Do not leave old path/name references
   behind just because the code still imports.** This is ordinary code hygiene,
   not doc work -- fix it in the same pass as the rename, and grep for stale
@@ -84,31 +84,45 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 
 These are firm, user-approved conventions. Follow them when adding or moving code.
 
-- **`src/rwkv_tl/` is the published library; `demo/` is not part of it.**
+- **`src/rwkv_tl/` is the published library and contains the models.**
   The package must be self-contained: no docstring or comment inside
-  `src/rwkv_tl/` may reference `demo/`, `script/`, or `docs/` (files that do
-  not ship with the package). Model implementations are helper/example code
-  and live OUTSIDE the package in `demo/`; do not move them into `src/rwkv_tl/`.
-- **Model interface.** `demo/_rwkv7_abc.py` defines the `RWKV7Model` ABC
-  (`decode` / `prefill` / `forward` / `generate`). Every model implements it.
-  Application scripts (`script/rwkv_chat.py`, `script/profile_prefill.py`, ...)
-  build models via `demo.make_rwkv7(w, backend="auto")` and operate on the
-  ABC; do not hard-code a specific model class into an application script.
-- **Kernels are dtype-parameterized factories, not dtype-split bindings.** The
-  fused kernel set lives in `kernel/{cmix,tmix,gemv,ln}.py`; each factory takes
-  `(C, DTYPE, ...)` and returns a `@tilelang.jit` kernel (`cmix_decode(C,
-  DTYPE)`, `cmix_prefill(C, DTYPE, LEN_block)`, `tmix_decode(C, DTYPE, H, Rv,
-  Rw, Ra, Rg)`, `gemv(M, K, DTYPE)`), re-exported from `kernel/__init__.py`.
-  The shared building-block macros (`gemv_macro`, `gemv_main_macro`,
-  `gemv_batch_macro`, `ln_prologue_macro`, `ln_per_row_macro`) are also
-  factory-returned and re-exported. The legacy
-  per-op kernels (`fused_lerp6`, `fused_dplr_T`, ...) live in `kernel/old/`
-  (bound by `build_kernels(DTYPE)`); TMIX prefill still uses them until a fused
-  `tmix_prefill` exists. The old split layout (`kernel/{gemm,lerp,gates,dplr}.py`
-  each holding dtype-split `fp16`/`bf16` namespaces, plus the `operator/` custom
-  ops) was folded into `kernel/old/` and must not be reintroduced. No fp32
-  weight copies anywhere (a future quantization path must not multiply weight
-  memory).
+  `src/rwkv_tl/` may reference `script/` or `docs/` (files that do not ship
+  with the package). Models, the tokenizer (vocab packaged in the wheel),
+  sampling, state, and CUDA-Graph all live IN the package; `demo/` was removed
+  in the 0.2 API refactor.
+- **User-facing API (firm, user-stated).** `rwkv_tl.rwkv7(path, ...)` builds a
+  model from a checkpoint path (backend auto: tilelang on CUDA, torch
+  elsewhere); `RWKV7TL` / `RWKV7Torch` are the explicit classes. The base
+  `RWKV7Model` (`rwkv_tl.model`) adds the text-level API: `generate("prompt")`
+  (text in, text out), `logits(input)` for raw next-token distributions,
+  `tune_state(prompt)` for state tune, `encode`/`detokenize`. All interfaces
+  are STATELESS: `State` is passed in and returned; models never own runtime
+  state. `State.save(path)` / `State.load(path)` persist tuned state, and it
+  attaches to generation via `generate(..., state=S)`.
+- **Model interface.** `rwkv_tl.model.RWKV7Model` defines the stateless ABC
+  (`decode` / `prefill` / `forward` / `generate` / text-level API). Every
+  model implements it. Application scripts build models via
+  `rwkv_tl.rwkv7(...)` / `rwkv_tl.make_rwkv7(...)` and operate on the ABC; do
+  not hard-code a specific model class into an application script.
+- **Kernels are weight-bound factories, not dtype-split bindings.** The
+  operator set lives in `kernel/{cmix,tmix,gemv,ln}.py`; the PUBLIC API is the
+  bound factories: each takes `(C, DTYPE, ...)` **plus the weights** at
+  construction and returns a `BoundKernel` (see `kernel/_bound.py`) whose call
+  only takes activations/state: `ln_pre = ln_kernel(C, DTYPE, W, B); y =
+  ln_pre(x)`. Both granularities are exported from `kernel/__init__.py`:
+  fine-grained composable ops (`ln_kernel`, `ln_per_row_kernel`,
+  `gemv_kernel`, `gemv_batch_kernel`) and coarse fused layer kernels
+  (`cmix_decode_kernel`, `cmix_prefill_kernel`, `tmix_decode_kernel`,
+  `tmix_prefill_kernel`). The raw `@tilelang.jit` factories and shared macros
+  (`gemv_macro`, `gemv_main_macro`, `ln_prologue_macro`, ...) stay available
+  for custom fused chains. Legacy per-op kernels live in `kernel/old/`. The
+  old split layout (`kernel/{gemm,lerp,gates,dplr}.py` dtype-split namespaces,
+  plus the `operator/` custom ops) must not be reintroduced. No fp32 weight
+  copies anywhere (a future quantization path must not multiply weight
+  memory). Weight binding is at the wrapper level (weights held by reference);
+  TileLang has no compile-time tensor-constant support, so the CUDA kernel
+  still receives weight pointers per launch -- do not pretend otherwise in
+  docs.
 - **GEMV: `gemv_main_macro` computes the fp32 `acc` fragment and returns it;
   `gemv_macro` stores that `acc` to `out` as-is.** To fuse a post-processing
   step (e.g. `relusq`, a residual add) into a GEMV store, use
@@ -138,16 +152,16 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   (default `torch.float16`, converts the bf16 checkpoint once at load; pass
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
   the model dtype. DPLR RNN state is always fp32 in both variants.
-- **`demo.make_rwkv7` backends**: `"auto"` (and `"fp16"`/`"bf16"`/`"tl"`/
-  `"tuned"`/`"mx450"`/`"rtx3060"`) all select `RWKV7TL`; `"torch"` selects
-  `RWKV7Torch`. The per-device tuned variants were folded into `RWKV7TL` once
-  the fp32-GEMM cuBLAS workaround was dropped. `use_graph=True` (default) makes
-  `make_rwkv7` return a class pre-wrapped in `CUDAGraph` for every CUDA
-  backend, so `decode` and per-T `prefill` run from captured CUDA Graphs.
-  `RWKV7Torch` updates its state in place, so it captures too; pass
-  `use_graph=False` to keep a truly eager class (e.g. the torch reference
-  used for correctness gating).
-- **`demo.cuda_graph.CUDAGraph` is THE CUDA-Graph mechanism.** Wrap any
+- **`rwkv_tl.rwkv7` / `make_rwkv7` backends**: `"auto"` selects `RWKV7TL` on
+  CUDA and `RWKV7Torch` elsewhere; `"fp16"`/`"bf16"`/`"tl"`/`"tuned"`/
+  `"mx450"`/`"rtx3060"` select `RWKV7TL`; `"torch"` selects `RWKV7Torch`. The
+  per-device tuned variants were folded into `RWKV7TL` once the fp32-GEMM
+  cuBLAS workaround was dropped. `use_graph=True` (default) makes
+  `rwkv7`/`make_rwkv7` wrap in `CUDAGraph` for every CUDA model, so `decode`
+  and per-T `prefill` run from captured CUDA Graphs. `RWKV7Torch` updates its
+  state in place, so it captures too; pass `use_graph=False` to keep a truly
+  eager model (e.g. the torch reference used for correctness gating).
+- **`rwkv_tl.cuda_graph.CUDAGraph` is THE CUDA-Graph mechanism.** Wrap any
   `RWKV7Model` instance: `model = CUDAGraph(RWKV7TL(w))`, or via
   `wrap_model(model)`, or `make_rwkv7(..., use_graph=True)` (returns a
   pre-wrapped class). It lazily captures the wrapped model's OWN `decode`
@@ -158,17 +172,18 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
 - **CUDA-Graph prefill requires in-place `state["x"]`.** The batch closures
   must `state["x"].copy_(x[-1])`, NOT rebind `state["x"] = x[-1]`, or a
   captured graph silently corrupts state across replays (measured rnn max_abs
-  1.4 vs 0.0). `rwkv7_tl.time_mix*`/`channel_mix*` use `copy_`. `CUDAGraph`
+  1.4 vs 0.0). `rwkv7_torch.time_mix*`/`channel_mix*` use `copy_`. `CUDAGraph`
   detects a rebinding model (state tensor `data_ptr`s move during warmup) and
   transparently falls back to eager for the affected op.
 - **Models are stateless; `State` is passed explicitly.** `State` and model are
   decoupled: models never own runtime state, and `decode`/`prefill`/`forward`/
   `generate` take a `State` argument and return it. State creation is a
-  standalone helper (the benchmark's `make_state`), not a model method. The
+  model method (`model.new_state()`), and `tune_state(prompt)` prefills a
+  prompt into a fresh state for state-tune workflows. The
   `CUDAGraph` wrapper preserves this: the captured graph replays against its
   own fixed-address shadow state and `decode`/`prefill` copy the caller's
   `State` in/out around each replay, so any `State` works and the model stays
-  stateless. Do not add an owned-state API or a `zero_state` model method.
+  stateless.
 
 ## Goal
 
@@ -176,10 +191,10 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 
 **Long-term direction: rwkv-tl must support TRAINING.** All new operators/optimizations must keep autograd compatibility in mind:
 - The fused kernels (`cmix_decode`, `tmix_decode`, ...) are plain tilelang
-  kernels called from `demo.rwkv7_tl`; training support will need explicit
+  kernels called from `rwkv_tl.rwkv7_tl`; training support will need explicit
   backward definitions (a future `torch.library` registration path), not
   autograd through the raw kernel calls.
-- CUDA Graph (`CUDAGraph` in `demo/cuda_graph.py`) is INFERENCE-ONLY by design: it captures the forward launch sequence and does not rebuild an autograd graph (replay does not record gradients, fixed buffers conflict with autograd's dynamic graph). Do not route anything training-relevant through it. `make_rwkv7(..., use_graph=True)` (default) integrates it as the `decode`/`prefill` path via a stateless copy-in/out around a fixed shadow state.
+- CUDA Graph (`CUDAGraph` in `rwkv_tl/cuda_graph.py`) is INFERENCE-ONLY by design: it captures the forward launch sequence and does not rebuild an autograd graph (replay does not record gradients, fixed buffers conflict with autograd's dynamic graph). Do not route anything training-relevant through it. `make_rwkv7(..., use_graph=True)` (default) integrates it as the `decode`/`prefill` path via a stateless copy-in/out around a fixed shadow state.
 - A fully-fused single kernel is NOT inherently inference-only (unlike CUDA Graph) -- any custom CUDA kernel, fused or not, needs an explicit backward to support training. But fusing a whole layer makes training hard: you must hand-write the layer's backward (including the serial DPLR recurrence, which reverses in time and needs every intermediate state saved) and manually stage/save the per-op intermediates that autograd would otherwise keep. That is far more work and error-prone than the per-op custom-op path, where each op registers its own backward and intermediates stay in the autograd graph automatically. So: prefer per-op custom ops for training; do not build a whole-layer fused kernel for the training path.
 - Measured on RTX 3060 / 0.1B: CUDA-Graph decode (via `CUDAGraph`) is already 1.63 ms/token with launch gaps squeezed to ~0.08 ms (GPU kernel time ~1.55 ms). Fusing all decode layers into one kernel would gain <0.1 ms over that and (as above) hurt training. The remaining real cost is the ~1.5 ms of GEMV compute itself.
 
@@ -195,10 +210,10 @@ Implement and validate faster RWKV7 inference paths in this repo. Keep the imple
 
 Project-guide and TileLang-writing knowledge lives in skills under
 `.agent/skill/`, not in this file. Before writing/editing a TileLang kernel,
-read `tilelang-writer`; before updating AGENT.md / adding a skill, read
+read `tilelang-writer`; before updating AGENTS.md / adding a skill, read
 `docs-writer` (placement rules, what not to write, skill conventions).
 Apply the skill; do not re-derive or re-document what it already covers. Add
-new hard-won TileLang findings to the skill, not to AGENT.md.
+new hard-won TileLang findings to the skill, not to AGENTS.md.
 
 ## Hardware note
 
@@ -359,7 +374,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   bottleneck, not the TMIX gate chains.
 - **Prefill is CUDA-Graphed per exact T up to `prefill_graph_max_t` (default
   1024; `None` = no cap).** Small-T prefill is launch-bound (a constant
-  ~2175 kernels regardless of T), and `CUDAGraph` (demo/cuda_graph.py)
+  ~2175 kernels regardless of T), and `CUDAGraph` (rwkv_tl/cuda_graph.py)
   captures the whole prefill per exact T (no padding -- the DPLR recurrence
   advances state per token), replaying with a State copy-in/out so the model
   stays stateless. Graph beats eager at EVERY T, not just small T: measured
@@ -421,18 +436,18 @@ done yet. When working on the related area, remind the user whether to proceed.
   graph-wrapped via `make_rwkv7(use_graph=True)`) on the RTX 3060 before
   settling the default. Requires the RTX 3060 box (not this MX450 laptop).
 
-- **DONE — model code lives in `demo/`, functional style.** The library ships
-  only kernels + state/sampling/weight/tokenizer (in `rwkv_tl.kernel` /
-  `rwkv_tl.state` / ...); model implementations live in `demo/`:
-  `demo.rwkv7_tl.RWKV7TL` (fused tilelang kernels, fp16/bf16) and
-  `demo.rwkv7_torch.RWKV7Torch` (pure torch reference). The model is
-  functional (like `rwkv7_torch`): module-level `time_mix` / `channel_mix` /
-  `time_mix_batch` / `channel_mix_batch` take the weight + input + state dict,
-  and `RWKV7TL.decode`/`prefill` loop the blocks. `demo.cuda_graph.CUDAGraph`
-  wraps any `RWKV7Model` instance and provides CUDA-Graph decode + per-T
-  prefill. `demo.make_rwkv7(device, backend=...)` returns a model class; all
-  tilelang backends resolve to `RWKV7TL` (the per-device `tuned` variants were
-  deleted with the fp32-GEMM workaround).
+- **DONE — models live in the library (0.2 refactor).** `rwkv_tl.rwkv7_tl.RWKV7TL`
+  (fused tilelang kernels, fp16/bf16) and `rwkv_tl.rwkv7_torch.RWKV7Torch`
+  (pure torch reference, CPU-capable) are part of the published package; the
+  pure-torch functional ops (`time_mix` / `channel_mix` / `time_mix_batch` /
+  `channel_mix_batch`) live in `rwkv_tl.rwkv7_torch`. `RWKV7TL` binds weights
+  to `BoundKernel` wrappers at construction and compiles kernels lazily.
+  `rwkv_tl.cuda_graph.CUDAGraph` wraps any `RWKV7Model` instance and provides
+  CUDA-Graph decode + per-T prefill. `rwkv_tl.rwkv7(path, ...)` /
+  `make_rwkv7(device, backend=...)` build models; all tilelang backends
+  resolve to `RWKV7TL` (the per-device `tuned` variants were deleted with the
+  fp32-GEMM workaround). The vocab file is packaged in the wheel
+  (`rwkv_tl/rwkv_vocab_v20230424.txt`); `Tokenizer()` uses it by default.
 - **Adopt a stateless operator API.** Future kernel/operator APIs should take
   `initial_state` and return `final_state` explicitly instead of mutating an
   in-place `state` dict. This is clearer, autograd-friendly, and matches the

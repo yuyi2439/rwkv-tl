@@ -173,7 +173,9 @@ def build(DTYPE: str) -> SimpleNamespace:
                 pg[0] = T.float32(0.0)
                 for j in T.serial(Rv // WARP):
                     j_idx = n * (Rv // WARP) + j
-                    pv[0] += T.cast(v2t[i, j_idx], "float32") * T.cast(vr[j_idx], "float32")
+                    pv[0] += T.cast(v2t[i, j_idx], "float32") * T.cast(
+                        vr[j_idx], "float32"
+                    )
                 for j in T.serial(Rw // WARP):
                     j_idx = n * (Rw // WARP) + j
                     pw[0] += T.cast(w2t[i, j_idx], "float32") * T.tanh(
@@ -181,7 +183,9 @@ def build(DTYPE: str) -> SimpleNamespace:
                     )
                 for j in T.serial(Ra // WARP):
                     j_idx = n * (Ra // WARP) + j
-                    pa[0] += T.cast(a2t[i, j_idx], "float32") * T.cast(ar[j_idx], "float32")
+                    pa[0] += T.cast(a2t[i, j_idx], "float32") * T.cast(
+                        ar[j_idx], "float32"
+                    )
                 for j in T.serial(Rg // WARP):
                     j_idx = n * (Rg // WARP) + j
                     pg[0] += T.cast(g2t[i, j_idx], "float32") * T.sigmoid(
@@ -198,7 +202,10 @@ def build(DTYPE: str) -> SimpleNamespace:
                         vf + sig_v * (T.cast(v_first[i], "float32") - vf), DTYPE
                     )
                     w_out[i] = T.cast(
-                        T.exp(-T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)),
+                        T.exp(
+                            -T.sigmoid(T.cast(w0[i], "float32") + w12)
+                            / T.float32(_SQRT_E)
+                        ),
                         DTYPE,
                     )
                     a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
@@ -352,9 +359,7 @@ def build(DTYPE: str) -> SimpleNamespace:
             return v_out, w_out, a, k * k_k, k + k_a * (k * a - k), g12
         return _gates_kernel(
             vr.shape[0], wr.shape[0], ar.shape[0], gr.shape[0], v.shape[0]
-        )(
-            vr, wr, ar, gr, v2t, w2t, a2t, g2t, v, v_first, k, v0, w0, a0, k_k, k_a
-        )
+        )(vr, wr, ar, gr, v2t, w2t, a2t, g2t, v, v_first, k, v0, w0, a0, k_k, k_a)
 
     return SimpleNamespace(
         fused_w_gate=fused_w_gate,

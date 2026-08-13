@@ -12,8 +12,8 @@ import os
 import pytest
 import torch
 
-from demo.rwkv7_torch import time_mix as time_mix_ref
 from rwkv_tl.kernel.tmix import tmix_decode
+from rwkv_tl.rwkv7_torch import time_mix as time_mix_ref
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -33,7 +33,7 @@ def model():
 @pytest.fixture(scope="module")
 def kernel(model):
     b = model.blocks[0].att
-    C, H, N = model.C, b.r_k.shape[0], b.r_k.shape[1]
+    C, H = model.C, b.r_k.shape[0]
     Rv, Rw, Ra, Rg = b.v1.shape[1], b.w1.shape[1], b.a1.shape[1], b.g1.shape[1]
     return tmix_decode(C, "float16", H, Rv, Rw, Ra, Rg)
 
@@ -41,7 +41,6 @@ def kernel(model):
 @pytest.fixture(scope="module")
 def kw(model):
     b = model.blocks[0].att
-    C = model.C
     d = {
         "ln_preW": b.ln_pre.w,
         "ln_preB": b.ln_pre.b,
@@ -51,13 +50,13 @@ def kw(model):
         "w1t": b.w1t,
         "a1t": b.a1t,
         "g1t": b.g1t,
-        "v2t": b.v2.T.contiguous(),
-        "w2t": b.w2.T.contiguous(),
-        "a2t": b.a2.T.contiguous(),
-        "g2t": b.g2.T.contiguous(),
-        "v0": b.v0.reshape(-1),
-        "w0": b.w0.reshape(-1),
-        "a0": b.a0.reshape(-1),
+        "v2t": b.v2t,
+        "w2t": b.w2t,
+        "a2t": b.a2t,
+        "g2t": b.g2t,
+        "v0": b.v0,
+        "w0": b.w0,
+        "a0": b.a0,
         "k_k": b.k_k.reshape(-1),
         "k_a": b.k_a.reshape(-1),
         "r_k": b.r_k,
@@ -84,9 +83,7 @@ def test_tmix_decode(seed: int, model, kernel, kw) -> None:
         g = torch.Generator(device="cuda").manual_seed(seed * 10 + t)
         x0 = torch.randn(C, device="cuda", dtype=torch.float16, generator=g) * 0.5
 
-        ref, v_first_e = time_mix_ref(
-            b, x0, v_first_e, S_ref.tmix[0], H, N
-        )
+        ref, v_first_e = time_mix_ref(b, x0, v_first_e, S_ref.tmix[0], H, N)
         out = kernel(
             x0,
             kw["ln_preW"],

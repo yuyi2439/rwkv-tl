@@ -22,8 +22,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
-from demo.rwkv7_tl import RWKV7TL as RWKV7
-from demo.rwkv7_torch import RWKV7Torch
+from rwkv_tl import RWKV7TL as RWKV7
+from rwkv_tl import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from demo.rwkv7_tl import RWKV7TL as RWKV7
+from rwkv_tl import RWKV7TL as RWKV7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 

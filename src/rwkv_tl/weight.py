@@ -35,21 +35,21 @@ class RWKV7ATTWeight:
 
     x_rkvwag: Tensor
 
-    w0: Tensor
-    w1: Tensor
-    w1t: Tensor
-    w2: Tensor
-    a0: Tensor
-    a1: Tensor
-    a1t: Tensor
-    a2: Tensor
     v0: Tensor
     v1: Tensor
     v1t: Tensor
-    v2: Tensor
+    v2t: Tensor
+    w0: Tensor
+    w1: Tensor
+    w1t: Tensor
+    w2t: Tensor
+    a0: Tensor
+    a1: Tensor
+    a1t: Tensor
+    a2t: Tensor
     g1: Tensor
     g1t: Tensor
-    g2: Tensor
+    g2t: Tensor
 
     r_k: Tensor
     k_k: Tensor
@@ -74,21 +74,21 @@ class RWKV7ATTWeight:
             dim=0,
         )
 
-        self.w0 = W[f"{prefix}.w0"]
-        self.w1 = W[f"{prefix}.w1"]
-        self.w1t = W[f"{prefix}.w1"].t().contiguous()
-        self.w2 = W[f"{prefix}.w2"]
-        self.a0 = W[f"{prefix}.a0"]
-        self.a1 = W[f"{prefix}.a1"]
-        self.a1t = W[f"{prefix}.a1"].t().contiguous()
-        self.a2 = W[f"{prefix}.a2"]
-        self.v0 = W[f"{prefix}.v0"]
+        self.v0 = W[f"{prefix}.v0"].squeeze()
         self.v1 = W[f"{prefix}.v1"]
-        self.v1t = W[f"{prefix}.v1"].t().contiguous()
-        self.v2 = W[f"{prefix}.v2"]
+        self.v1t = W[f"{prefix}.v1"].T.contiguous()
+        self.v2t = W[f"{prefix}.v2"].T.contiguous()
+        self.w0 = W[f"{prefix}.w0"].squeeze()
+        self.w1 = W[f"{prefix}.w1"]
+        self.w1t = W[f"{prefix}.w1"].T.contiguous()
+        self.w2t = W[f"{prefix}.w2"].T.contiguous()
+        self.a0 = W[f"{prefix}.a0"].squeeze()
+        self.a1 = W[f"{prefix}.a1"]
+        self.a1t = W[f"{prefix}.a1"].T.contiguous()
+        self.a2t = W[f"{prefix}.a2"].T.contiguous()
         self.g1 = W[f"{prefix}.g1"]
-        self.g1t = W[f"{prefix}.g1"].t().contiguous()
-        self.g2 = W[f"{prefix}.g2"]
+        self.g1t = W[f"{prefix}.g1"].T.contiguous()
+        self.g2t = W[f"{prefix}.g2"].T.contiguous()
 
         self.r_k = W[f"{prefix}.r_k"]
         self.k_k = W[f"{prefix}.k_k"]

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from importlib.resources import files
+from pathlib import Path
+
 # This file is adapted from ChatRWKV tokenizer implementation:
 # https://github.com/BlinkDL/ChatRWKV/blob/main/tokenizer/rwkv_tokenizer.py
 # Original implementation by BlinkDL/ChatRWKV.
+
+_DEFAULT_VOCAB = "rwkv_vocab_v20230424.txt"
 
 
 class TRIE:
@@ -26,11 +31,22 @@ class TRIE:
 
 
 class Tokenizer:
-    def __init__(self, vocab_path: str) -> None:
+    def __init__(self, vocab_path: str | Path | None = None) -> None:
+        """Build the RWKV word tokenizer from a vocab file.
+
+        Args:
+            vocab_path: Path to the ``rwkv_vocab_v20230424.txt`` file. None
+                uses the vocab packaged with this library.
+        """
         idx2token: dict[int, bytes] = {}
         sorted: list[bytes] = []  # must be already sorted
-        with open(vocab_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        if vocab_path is None:
+            vocab = files("rwkv_tl").joinpath(_DEFAULT_VOCAB)
+            with vocab.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+        else:
+            with open(vocab_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
         for l in lines:
             idx = int(l[: l.index(" ")])
             x = eval(l[l.index(" ") : l.rindex(" ")])

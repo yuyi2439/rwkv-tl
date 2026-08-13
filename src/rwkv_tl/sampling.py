@@ -1,7 +1,7 @@
 """Token sampling helpers for autoregressive generation.
 
-Shared by ``RWKV7Model.generate`` and the pure_torch reference, so both
-shells sample identically.
+Shared by the model classes' ``generate`` so every backend samples
+identically.
 """
 
 from __future__ import annotations
@@ -67,4 +67,4 @@ def sample_logits(
         l = l.scatter(-1, sorted_idx, vals)
 
     probs = torch.softmax(l, dim=-1)
-    return torch.multinomial(probs, 1).squeeze(-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)

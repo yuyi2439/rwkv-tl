@@ -271,9 +271,13 @@ def build(DTYPE: str) -> SimpleNamespace:
         major, minor = torch.cuda.get_device_capability()
         return (major, minor) < (8, 0)
 
-    def _tl_mm(a: Tensor, b: Tensor, block_n: int, block_k: int, num_stages: int) -> Tensor:
+    def _tl_mm(
+        a: Tensor, b: Tensor, block_n: int, block_k: int, num_stages: int
+    ) -> Tensor:
         """Run ``a @ b`` through the tilelang fp16 kernel (Turing only)."""
-        kernel = _try_compile_tl_mm(b.shape[0], b.shape[1], block_n, block_k, num_stages)
+        kernel = _try_compile_tl_mm(
+            b.shape[0], b.shape[1], block_n, block_k, num_stages
+        )
         return kernel(a, b)
 
     def _tl_mm_or_none(

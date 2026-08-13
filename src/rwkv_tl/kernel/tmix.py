@@ -5,6 +5,7 @@ import math
 import tilelang
 import tilelang.language as T
 
+from ._bound import BoundKernel, require_bind
 from ._common import HEAD_DIM, SERIAL, WARP
 from .gemv import gemv_batch_macro, gemv_macro
 from .ln import ln_prologue_macro
@@ -38,14 +39,14 @@ def _gate_gemv_macro(R: int, C: int, DTYPE: str):
         out: T.Tensor((R,), DTYPE),
     ):
         """Args:
-            j: Rank-row index (blockIdx.x); must be ``< R``.
-            n: Thread index within the warp.
-            x: This gate's shifted activation ``[C]`` (e.g. ``xv``).
-            W: This gate's rank-in weight ``[R, C]`` (e.g. ``v1t``).
-            out: This gate's rank-out result ``[R]`` (e.g. ``vr``).
+        j: Rank-row index (blockIdx.x); must be ``< R``.
+        n: Thread index within the warp.
+        x: This gate's shifted activation ``[C]`` (e.g. ``xv``).
+        W: This gate's rank-in weight ``[R, C]`` (e.g. ``v1t``).
+        out: This gate's rank-out result ``[R]`` (e.g. ``vr``).
         """
         acc = T.alloc_fragment((1,), "float32")
-        acc[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
+        T.clear(acc)
         for c in T.serial(C // WARP):
             c_idx = n * (C // WARP) + c
             acc[0] += T.cast(W[j, c_idx], "float32") * T.cast(x[c_idx], "float32")
@@ -87,12 +88,12 @@ def _tmix_shift6_macro(C: int, DTYPE: str):
         xg: T.Tensor((C,), DTYPE),
     ):
         """Args:
-            ln_val: Current row's LN_pre output ``[C]`` (fp32, before the
-                DTYPE store).
-            shift: Shift source ``[C]`` (prev token's LN output / ``prev_x``).
-            x_rkvwag: Six token-shift weights stacked ``[6, C]`` (r/k/v/w/a/g).
-            xrkv: Stacked r/k/v lerps ``[3, C]``.
-            xv/xw/xa/xg: Low-rank gate inputs ``[C]``.
+        ln_val: Current row's LN_pre output ``[C]`` (fp32, before the
+            DTYPE store).
+        shift: Shift source ``[C]`` (prev token's LN output / ``prev_x``).
+        x_rkvwag: Six token-shift weights stacked ``[6, C]`` (r/k/v/w/a/g).
+        xrkv: Stacked r/k/v lerps ``[3, C]``.
+        xv/xw/xa/xg: Low-rank gate inputs ``[C]``.
         """
         for i in T.Parallel(C):
             lv = ln_val[i]
@@ -194,7 +195,9 @@ def tmix_decode_main_macro(
     assert Rv % WARP == 0 and Rw % WARP == 0
     assert Ra % WARP == 0 and Rg % WARP == 0
 
-    gv = gemv_batch_macro(C, C, 3, DTYPE, THREADS)  # [3, K, M] = [3, C, C]: xrkv @ rkvWt
+    gv = gemv_batch_macro(
+        C, C, 3, DTYPE, THREADS
+    )  # [3, K, M] = [3, C, C]: xrkv @ rkvWt
 
     @T.macro
     def _impl(
@@ -663,7 +666,6 @@ def _tmix_prefill_front_macro(
     assert Rv % WARP == 0 and Rw % WARP == 0
     assert Ra % WARP == 0 and Rg % WARP == 0
 
-
     prologue = tmix_prefill_prologue_macro(LEN, C, DTYPE)
 
     # Shared macro for the 4 first-step rank GEMVs ([LEN, C] @ [C, R]), used
@@ -787,7 +789,9 @@ def _tmix_prefill_front_macro(
 
         # kernel: rkv = [xr; xk; xv] @ rkvWt  (batched GEMM over T rows x 3 projections)
         BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES = 16, 64, 32, 3
-        with T.Kernel(T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), 3, threads=128) as (
+        with T.Kernel(
+            T.ceildiv(C, BLOCK_N), T.ceildiv(LEN, BLOCK_M), 3, threads=128
+        ) as (
             bx,
             by,
             bz,
@@ -839,9 +843,7 @@ def _tmix_prefill_front_macro(
             # v_first is the value residual from layer 0: layer 0
             # (``first != 0``) keeps v and stores its whole [T, C] v;
             # later layers gate each row toward layer-0's same-row v.
-            vf = T.if_then_else(
-                first != 0, v_cur, T.cast(v_first[t, i], "float32")
-            )
+            vf = T.if_then_else(first != 0, v_cur, T.cast(v_first[t, i], "float32"))
             sig_v = T.sigmoid(T.cast(v0[i], "float32") + v12_v)
             v_out = v_cur + sig_v * (vf - v_cur)
             v_first[t, i] = T.cast(vf, DTYPE)
@@ -857,8 +859,7 @@ def _tmix_prefill_front_macro(
             k_cur = T.cast(rkv[1, t, i], "float32")
             kk[t, i] = T.cast(k_cur * T.cast(k_k[i], "float32"), DTYPE)
             rkv[1, t, i] = T.cast(
-                k_cur
-                + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
+                k_cur + T.cast(k_a[i], "float32") * (k_cur * a_val - k_cur),
                 DTYPE,
             )
             g[t, i] = T.cast(g12_v, DTYPE)
@@ -883,7 +884,10 @@ def _tmix_prefill_front_macro(
                     T.cast(kk[t, flat_c], "float32") / den, DTYPE
                 )
                 B[t, flat_c] = T.cast(
-                    -(T.cast(kk_norm[t, flat_c], "float32") * T.cast(a[t, flat_c], "float32")),
+                    -(
+                        T.cast(kk_norm[t, flat_c], "float32")
+                        * T.cast(a[t, flat_c], "float32")
+                    ),
                     DTYPE,
                 )
 
@@ -902,9 +906,7 @@ def _tmix_prefill_front(
     Rg: int,
 ):
     """Prefill front jit: returns (rkv, w, a, kk_norm, B, g) + updates state."""
-    front = _tmix_prefill_front_macro(
-        LEN, C, DTYPE, H, Rv, Rw, Ra, Rg
-    )
+    front = _tmix_prefill_front_macro(LEN, C, DTYPE, H, Rv, Rw, Ra, Rg)
 
     @T.prim_func
     def _impl(
@@ -1172,3 +1174,97 @@ def _tmix_prefill_back(
         )
 
     return _impl
+
+
+_TMIX_WEIGHTS = (
+    "ln_preW",
+    "ln_preB",
+    "x_rkvwag",
+    "rkvWt",
+    "v1t",
+    "w1t",
+    "a1t",
+    "g1t",
+    "v2t",
+    "w2t",
+    "a2t",
+    "g2t",
+    "v0",
+    "w0",
+    "a0",
+    "k_k",
+    "k_a",
+    "r_k",
+    "ln_xW",
+    "ln_xB",
+    "oWt",
+)
+_TMIX_FRONT_WEIGHTS = _TMIX_WEIGHTS[:-4]
+_TMIX_BACK_WEIGHTS = _TMIX_WEIGHTS[-4:]
+
+
+def tmix_decode_kernel(
+    C: int, DTYPE: str, H: int, Rv: int, Rw: int, Ra: int, Rg: int, **weights
+):
+    """Bound single-token tmix: ``t = tmix_decode_kernel(C, DTYPE, H, ...)``
+    then ``y = t(x0, prev_x, rnn, v_first, first)``.
+
+    All 21 weights are captured at construction; ``prev_x``/``rnn``/``v_first``
+    are updated in place.
+    """
+    require_bind(weights, _TMIX_WEIGHTS, "tmix_decode_kernel")
+    return BoundKernel(
+        tmix_decode,
+        (C, DTYPE, H, Rv, Rw, Ra, Rg),
+        bind=weights,
+        call=("x0", "prev_x", "rnn", "v_first", "first"),
+        name="tmix_decode_kernel",
+    )
+
+
+class _TmixPrefill:
+    """Prefill front + back bound as one callable: ``y = t(x0, prev_x, rnn, v_first, first)``."""
+
+    def __init__(self, front: BoundKernel, back: BoundKernel) -> None:
+        self.front = front
+        self.back = back
+
+    def __call__(self, x0, prev_x, rnn, v_first, first):
+        rkv, w, a, kk_norm, B, g = self.front(x0, prev_x, v_first, first)
+        return self.back(rkv, w, kk_norm, B, a, g, x0, rnn)
+
+    def __repr__(self) -> str:
+        return (
+            "tmix_prefill_kernel(front="
+            + repr(self.front)
+            + ", back="
+            + repr(self.back)
+            + ")"
+        )
+
+
+def tmix_prefill_kernel(
+    LEN: int, C: int, DTYPE: str, H: int, Rv: int, Rw: int, Ra: int, Rg: int, **weights
+):
+    """Bound tmix prefill over ``LEN`` rows (see ``tmix_decode_kernel``).
+
+    ``LEN`` is a compile-time hyperparameter; distinct lengths compile
+    separate kernels (cached by the caller).
+    """
+    require_bind(weights, _TMIX_WEIGHTS, "tmix_prefill_kernel")
+    args = (LEN, C, DTYPE, H, Rv, Rw, Ra, Rg)
+    front = BoundKernel(
+        _tmix_prefill_front,
+        args,
+        bind={n: weights[n] for n in _TMIX_FRONT_WEIGHTS},
+        call=("x0", "prev_x", "v_first", "first"),
+        name="tmix_prefill_front",
+    )
+    back = BoundKernel(
+        _tmix_prefill_back,
+        args,
+        bind={n: weights[n] for n in _TMIX_BACK_WEIGHTS},
+        call=("rkv", "w", "kk_norm", "B", "a", "g", "x0", "rnn"),
+        name="tmix_prefill_back",
+    )
+    return _TmixPrefill(front, back)

@@ -9,10 +9,7 @@ import torch
 # Make the repo-root packages importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from demo import make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.tokenizer import Tokenizer
-from rwkv_tl.weight import RWKV7Weight
+import rwkv_tl
 
 
 def parse_args():
@@ -20,10 +17,6 @@ def parse_args():
     parser.add_argument(
         "checkpoint",
         help="Path to RWKV checkpoint (.pth)",
-    )
-    parser.add_argument(
-        "vocab",
-        help="Path to RWKV vocabulary file",
     )
     parser.add_argument(
         "--max-tokens",
@@ -60,19 +53,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # tuned (default): device-name-matched CUDA-Graph variant (MX450/RTX3060),
-    # falling back to auto (fp16 on sm<80, bf16 otherwise), so the same chat
-    # works on any device.
-    w = RWKV7Weight(args.checkpoint)
-    model_cls = make_rwkv7(w.device)
-    model = model_cls(w)
-    tokenizer = Tokenizer(args.vocab)
-    S = State(
-        model.L,
-        model.C,
-        64,
-        device=model.w.device,
-    )
+    model = rwkv_tl.rwkv7(args.checkpoint)
+    S = model.new_state()
 
     print("Simple RWKV chat. Empty input exits.")
     while True:
@@ -81,17 +63,15 @@ def main():
             print("Exit.")
             break
 
-        user_tokens = tokenizer.encode(f"User: {text}\n\nAssistant: ")
-        response_tokens, S = model.generate(
-            user_tokens,
+        response = model.generate(
+            f"User: {text}\n\nAssistant: ",
             S,
-            args.max_tokens,
+            max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
         )
-        response = tokenizer.decode(response_tokens)
 
         print("assistant:", response)
 

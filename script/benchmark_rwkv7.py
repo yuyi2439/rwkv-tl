@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Benchmark multiple RWKV7 implementations through a shared driver.
 
-Models are built with ``demo.make_rwkv7(backend=...)`` (no bespoke builder
+Models are built with ``rwkv_tl.make_rwkv7(backend=...)`` (no bespoke builder
 functions) so every target goes through the same entry point:
 
 - faster3a_2607: Albatross CUDA implementation (external module).
-- tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
+- tl-fp16: tilelang fp16 (``rwkv_tl.make_rwkv7(backend="fp16")``).
 - tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
 - pure-torch: pure PyTorch baseline (``backend="torch"``; graph-wrapped on
   CUDA by default, eager reference available via ``use_graph=False``).
@@ -38,7 +38,7 @@ for path in (SCRIPT_ROOT, SRC_ROOT := REPO_ROOT / "src", REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from demo import RWKV7Model, make_rwkv7
+from rwkv_tl import RWKV7Model, make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -408,9 +408,7 @@ def run_benchmark(args):
             # faster3a_2607 is not gated.
             if args.correctness_check and target in GATED_TARGETS:
                 assert w is not None and gate_dtype is not None
-                ref_cls = make_rwkv7(
-                    rwkv_device, backend="torch", use_graph=False
-                )
+                ref_cls = make_rwkv7(rwkv_device, backend="torch", use_graph=False)
                 reference = ref_cls(w, is_torch_compile=False)  # type: ignore[call-arg]
 
             for B, T in parsed_cases:

@@ -1,6 +1,6 @@
 # RWKV7 Benchmark
 
-> 这个文件只记录可复现的测试入口、执行环境、主要结果和简要解释。更细的实验发现请见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)，运行与维护注意事项请见 [AGENT.md](../AGENT.md)。
+> 这个文件只记录可复现的测试入口、执行环境、主要结果和简要解释。更细的实验发现请见 [docs/benchmarks/rtx3060.md](../docs/benchmarks/rtx3060.md)，运行与维护注意事项请见 [AGENTS.md](../AGENTS.md)。
 
 ## 运行命令
 
@@ -35,7 +35,7 @@ uv run python script/benchmark_rwkv7.py \
 
 注：
 - `--device cpu` 时，faster3a_2607 自动跳过（CUDA-only）。
-- graph_decoder benchmark target 已移除：CUDA Graph 现由 `demo.cuda_graph.CUDAGraph` 通用包装器提供，`tl-mx450`/`tl-rtx3060`/`tl-tuned` 通过 `make_rwkv7(use_graph=True)`（默认）自动叠加 decode + 小 T prefill 的 graph。
+- graph_decoder benchmark target 已移除：CUDA Graph 现由 `rwkv_tl.cuda_graph.CUDAGraph` 通用包装器提供，`tl-mx450`/`tl-rtx3060`/`tl-tuned` 通过 `make_rwkv7(use_graph=True)`（默认）自动叠加 decode + 小 T prefill 的 graph。
 - warmup=5, iters=10 (CUDA); warmup=1, iters=3 (CPU，因耗时较长)。
 - 正确性门控**默认关闭**（`--correctness-check` 开启）：每个 case 计时前先把输出与同 dtype 的 pure_torch 参考对比（argmax 一致且 max_abs ≤ 16），不一致则该 case 输出 `SKIP reason=incorrect` 且不报延迟。默认关是为了省显存（参考模型共享 target 权重对象，但多 target 混跑仍可能压 2GB 卡）。
 - **权重按 target 加载/释放**：每个 target 独立 `RWKV7Weight`，跑完即删（`del` + `gc.collect()` + `empty_cache()`），同进程同时只有一份权重在显存。
@@ -58,6 +58,52 @@ uv run python script/benchmark_rwkv7.py \
 | 32 | 43.9ms | **15.8ms** |
 | 64 | 47.0ms | **22.5ms** |
 | 128 | 88.6ms | **43.4ms** |
+
+## tl vs 纯 torch（MX450，0.1B，fp16）
+
+> 复现：`python script/bench_tl_vs_torch.py ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth`
+> （warmup=2, median of 7；decode 为 64 步中位 per-token 耗时。三个变体同进程依次测量，
+> torch 先行、tl 随后，MX450 显存压力影响有限。）
+
+| T | torch (eager) | tl (eager) | tl+graph | tl / torch |
+|---|---|---|---|---|
+| 32 | 397.3 ms | 38.1 ms | 24.1 ms | **10.4x** |
+| 64 | 589.6 ms | 33.1 ms | 32.9 ms | **17.8x** |
+| 128 | 1737.2 ms | 54.5 ms | 55.7 ms | **31.9x** |
+| 256 | 1748.9 ms | 103.9 ms | 104.6 ms | **16.8x** |
+| 512 | 3905.4 ms | 193.1 ms | 193.5 ms | **20.2x** |
+
+decode（单 token）：torch 31.1 ms/token (32.2 tok/s) vs tl 7.3 ms/token (137.0 tok/s)，
+**4.3x**；tl+graph 8.1 ms/token (123.5 tok/s)（小模型上 state copy 开销略高于裸 launch）。
+
+结论：prefill 提速 10–32x（T≥64 基本 17–32x），decode 提速约 4.3x。T 越大 tl 优势越明显；
+T=32 的 graph 路径额外省 launch 开销（24.1 vs 38.1 ms）。
+
+## 重构后 tl vs faster3a_2607（MX450，0.1B，fp16）
+
+> 复现：`python script/bench_tl_vs_fast.py ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth`
+> （warmup=2, median of 7；decode 64 步中位 per-token。faster3a 为本地
+> `support/sm75` 适配分支，扩展已缓存；每 target 计时前先释放前一 target 权重，
+> 避免 2GB 显存压力。计时前同 prompt 对拍：max_abs=0.062，argmax/top-5 一致。）
+
+| T | faster3a_2607 (sm75) | tl (eager) | tl+graph | tl / faster3a |
+|---|---|---|---|---|
+| 1 | 8.97 ms | 8.30 ms | 8.65 ms | **1.08x** |
+| 8 | 24.75 ms | 33.62 ms | 21.48 ms | 0.74x / **1.15x(graph)** |
+| 16 | 33.21 ms | 20.68 ms | 21.94 ms | **1.61x** |
+| 32 | 44.51 ms | 23.52 ms | 24.10 ms | **1.89x** |
+| 64 | 46.70 ms | 31.84 ms | 32.72 ms | **1.47x** |
+| 128 | 87.47 ms | 55.06 ms | 55.50 ms | **1.59x** |
+| 256 | 168.61 ms | 104.16 ms | 105.08 ms | **1.62x** |
+| 512 | 256.59 ms | 193.62 ms | 194.87 ms | **1.33x** |
+
+decode（单 token）：faster3a 7.18 ms/token (139.3 tok/s) vs tl 6.82 ms/token
+(146.7 tok/s)，**1.05x**；tl+graph 7.66 ms/token。
+
+结论：T≥16 时 tl 全面领先 faster3a（1.3–1.9x）；T=8 的 eager 路径 tl 反而偏慢
+（33.6 vs 24.8 ms，小 T fused kernel 启动/占用劣势），CUDA Graph 把 T=8 拉回领先
+（21.5 ms）；decode/T=1 两者基本持平（tl 略快）。输出与 faster3a 一致
+（max_abs=0.062，argmax/top-5 相同）。
 
 结论：
 - **T=1 decode：mx450 稳定 8.3ms**（CUDA Graph 消除 launch 开销），faster3a 波动到 20ms+。
@@ -121,9 +167,9 @@ warmup=10, iters=20，正确性门控全过。`tl-fp16`/`tl-bf16`/`pure-torch` �
 > **fp16 迁移对 sm_75 的影响**：c2c4283 起 prefill 的批量 GEMM 从 bf16（cuBLAS magma
 > fp32 模拟）改为 fp16。Turing 的 cuBLAS fp16 tensor-core 内核对 `[T,C]@[C,C]`（T=32..128）
 > 病态慢（fp16 bmm ~1.3ms vs fp32 ~0.16ms，4-8x），导致 MX450 prefill 较旧记录 ~1.9x 变慢
-> （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`demo.rwkv7_tl.RWKV7TL`（fused tilelang，全 fp16/bf16）
+> （46.4 vs 24.7ms @ T=32）。已按设备拆分模型类：`rwkv_tl.rwkv7_tl.RWKV7TL`（fused tilelang，全 fp16/bf16）
 > （单模型类，per-device tuned 变体已并入）。
-> `demo.make_rwkv7` 按 arch 自动选择。**2026-08-04 实测 tl-bf16 是 MX450 prefill 最快的变体**：
+> `rwkv_tl.make_rwkv7` 按 arch 自动选择。**2026-08-04 实测 tl-bf16 是 MX450 prefill 最快的变体**：
 > T=8 20.5 vs tl-fp16 45.1ms，T=128 39.8 vs tl-fp16 92.2ms——bf16 的 tilelang kernel 在 Turing 走
 > fp32 模拟路径，绕开了病态的 fp16 cuBLAS GEMM。
 >

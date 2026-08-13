@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Self
 
 import torch
@@ -59,3 +60,40 @@ class State(tuple[list[dict[str, Tensor]], list[dict[str, Tensor]]]):
         for s in self.tmix + self.cmix:
             for tensor in s.values():
                 tensor.zero_()
+
+    def save(self, path: str | Path) -> None:
+        """Save the state to a file (``State.load`` reads it back)."""
+        torch.save({"tmix": self.tmix, "cmix": self.cmix}, path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Self:
+        """Load a state saved by ``State.save``.
+
+        Args:
+            path: File written by ``save``.
+            device: Move the loaded tensors to this device (None keeps the
+                saved device).
+            dtype: Convert loaded tensors to this dtype (None keeps the saved
+                dtype). The RNN state stays fp32 as usual.
+        """
+        data = torch.load(path, map_location=device, weights_only=True)
+        try:
+            tmix = data["tmix"]
+            cmix = data["cmix"]
+            assert isinstance(tmix, list) and isinstance(cmix, list)
+        except (KeyError, TypeError, AssertionError) as e:
+            raise ValueError(f"{path} is not a saved rwkv_tl State file") from e
+
+        if dtype is not None:
+            tmix = [
+                {k: (t.to(dtype) if k != "rnn" else t) for k, t in layer.items()}
+                for layer in tmix
+            ]
+            cmix = [{k: t.to(dtype) for k, t in layer.items()} for layer in cmix]
+        return tuple.__new__(cls, (tmix, cmix))

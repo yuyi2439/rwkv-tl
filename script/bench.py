@@ -7,7 +7,7 @@ import torch
 
 sys.path.insert(0, "/home/yuyi2439/rwkv/rwkv-tl")
 
-from demo import make_rwkv7
+from rwkv_tl import make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
@@ -70,4 +70,4 @@ for T in (1, 8, 32, 64, 128):
         fn()
         torch.cuda.synchronize()
         ts.append((time.perf_counter() - t0) * 1000)
-    print(f"  T={T:3d}  {sorted(ts)[len(ts)//2]:8.3f} ms")
+    print(f"  T={T:3d}  {sorted(ts)[len(ts) // 2]:8.3f} ms")

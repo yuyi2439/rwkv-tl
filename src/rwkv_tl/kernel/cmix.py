@@ -3,6 +3,7 @@
 import tilelang
 import tilelang.language as T
 
+from ._bound import BoundKernel, require_bind
 from ._common import WARP
 from .gemv import gemv_main_macro
 from .ln import _LN_EPS, ln_per_row_macro
@@ -358,7 +359,7 @@ def cmix_prefill_main_macro(
     HID_block = 128
 
     # shared ≤ 48KB  (note: `^` is XOR, use `**` for power)
-    assert (LEN_block * _BK + _BK * HID_block) * STAGES * dtype_bytes <= 48 * 2**10 # pyright: ignore[reportOperatorIssue]
+    assert (LEN_block * _BK + _BK * HID_block) * STAGES * dtype_bytes <= 48 * 2**10  # pyright: ignore[reportOperatorIssue]
 
     # # Look at https://github.com/tile-ai/tilelang/issues/2916
     # LEN = T.dynamic("LEN")
@@ -375,7 +376,7 @@ def cmix_prefill_main_macro(
         out: T.Tensor((LEN, C), DTYPE),
     ):
         """2 kernels."""
-        assert LEN % LEN_block == 0  # pyright: ignore[reportOperatorIssue]
+        assert LEN % LEN_block == 0
         h = T.alloc_global((LEN, HID), DTYPE)
 
         # h = relusq(x @ kWt)
@@ -456,3 +457,39 @@ def cmix_prefill(C: int, DTYPE: str, LEN_block: int):
         main(x, x0, kWt, vWt, out=out)
 
     return _impl
+
+
+_CMIX_WEIGHTS = ("ln_preW", "ln_preB", "x_k", "kWt", "vWt")
+
+
+def cmix_decode_kernel(C: int, DTYPE: str, **weights):
+    """Bound single-token cmix: ``c = cmix_decode_kernel(C, DTYPE, **weights)``
+    then ``y = c(x0, prev_x)`` (``prev_x`` updated in place).
+
+    The five weights (``ln_preW``/``ln_preB``/``x_k``/``kWt``/``vWt``) are
+    captured at construction.
+    """
+    require_bind(weights, _CMIX_WEIGHTS, "cmix_decode_kernel")
+    return BoundKernel(
+        cmix_decode,
+        (C, DTYPE),
+        bind=weights,
+        call=("x0", "prev_x"),
+        name="cmix_decode_kernel",
+    )
+
+
+def cmix_prefill_kernel(C: int, DTYPE: str, LEN_block: int, **weights):
+    """Bound batched cmix prefill (see ``cmix_decode_kernel``).
+
+    ``x0`` must be padded to a multiple of ``LEN_block`` rows; returns the
+    full padded output (callers slice off padding).
+    """
+    require_bind(weights, _CMIX_WEIGHTS, "cmix_prefill_kernel")
+    return BoundKernel(
+        cmix_prefill,
+        (C, DTYPE, LEN_block),
+        bind=weights,
+        call=("x0", "prev_x"),
+        name="cmix_prefill_kernel",
+    )

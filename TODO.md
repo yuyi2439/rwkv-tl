@@ -2,6 +2,11 @@
 
 按优先级排列。完成一项就删掉对应条目。
 
+**进度（2026-08-13）**：0.2 API 重构完成——模型进库（`rwkv_tl.rwkv7` /
+`RWKV7TL` / `RWKV7Torch`），kernel 改为权重绑定的 `*_kernel` 工厂
+（粗细粒度都导出），文本级 `generate` / `logits` / `tune_state` + `State`
+save/load，vocab 打包进 wheel，全部接口 stateless。量化（#6）是下一个主线。
+
 ## P0 — decode 性能与可用性（最高优先级）
 
 ### #1 手写 GEMV（decode 路径，不走 TensorCore）
@@ -113,12 +118,14 @@ prefill T=8/32 快 faster3a ~2x，但 decode 1x1（18.93ms）与 T≥64 prefill 
 
 ## P3 — 后续优化
 
-### #6 量化（融合进手写 GEMV kernel）
+### #6 量化（权重绑定到 wrapper 之后的主线）
 
 decode 是 memory-bound，量化直接减半 memory bandwidth。weight 用 int8/any4 存储，
-kernel 内做 dequant + compute 融合；DPLR state 保持 fp32。应在 #1 手写 GEMV 完成
-后在 GEMV kernel 内融合 dequant，而非单独做量化路径。参考 rwkv7-quantization
-（any4 在 RTX 2080 Ti 达 114.7 tok/s）。
+kernel 内做 dequant + compute 融合；DPLR state 保持 fp32。0.2 的 `BoundKernel`
+已经把权重所有权收进 wrapper（构建期绑定），量化权重（int8/any4 + scale）直接
+住进 wrapper，kernel 只看到 dequant 输入或 int8+scale，模型代码零改动。应在 #1
+手写 GEMV 完成后在 GEMV kernel 内融合 dequant，而非单独做量化路径。参考
+rwkv7-quantization（any4 在 RTX 2080 Ti 达 114.7 tok/s）。
 
 ### #7 decode 路径深融合（减少 launch）
 

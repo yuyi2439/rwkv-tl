@@ -1,13 +1,12 @@
 """Pure PyTorch RWKV7 reference implementation (no fused custom kernels).
 
 A readable, kernel-free baseline that mirrors the ``decode``/``prefill``/
-``forward``/``generate`` API of ``demo.rwkv7_tl.RWKV7TL``. Slower than the
-tilelang path but serves as the numerical reference for correctness tests
-and benchmarking.
+``forward``/``generate`` API of ``rwkv_tl.rwkv7_tl.RWKV7TL``. Slower than the
+tilelang path but serves as the numerical reference for correctness tests and
+benchmarking, and runs anywhere (including CPU).
 
 State tensors are updated in place (``copy_``), never rebound, so the class is
-CUDA-Graph capturable: ``make_rwkv7(..., backend="torch", use_graph=True)``
-wraps it like any other CUDA model.
+CUDA-Graph capturable.
 """
 
 from __future__ import annotations
@@ -17,10 +16,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
+from rwkv_tl.model import RWKV7Model
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7ATTWeight, RWKV7FFNWeight, RWKV7Weight
-
-from ._rwkv7_abc import RWKV7Model
 
 
 def _sigmoid(x: Tensor) -> Tensor:
@@ -95,14 +93,13 @@ def time_mix(
         v = _lerp(
             v,
             v_first,
-            _sigmoid(weight.v0.reshape(-1) + xv @ weight.v1 @ weight.v2),
+            _sigmoid(weight.v0 + weight.v2t @ (xv @ weight.v1)),
         )
 
     w = torch.exp(
-        -_sigmoid(weight.w0.reshape(-1) + torch.tanh(xw @ weight.w1) @ weight.w2)
-        / (torch.e**0.5)
+        -_sigmoid(weight.w0 + weight.w2t @ torch.tanh(xw @ weight.w1)) / (torch.e**0.5)
     )
-    a = _sigmoid(weight.a0.reshape(-1) + xa @ weight.a1 @ weight.a2)
+    a = _sigmoid(weight.a0 + weight.a2t @ (xa @ weight.a1))
     kk = k * weight.k_k.reshape(-1)
     k = _lerp(k, k * a, weight.k_a.reshape(-1))
 
@@ -114,7 +111,7 @@ def time_mix(
     y = _group_norm(y, weight.ln_x.w, weight.ln_x.b, 64e-5)
     y += (torch.sum(r * k * weight.r_k, dim=1, keepdim=True) * v).reshape(-1)
     g = torch.mv(
-        weight.g2.T.contiguous(),
+        weight.g2t,
         torch.sigmoid(torch.mv(weight.g1t, xg)),
     )
     return torch.add(x0, (y * g) @ weight.oWt), v_first
@@ -136,10 +133,7 @@ def time_mix_batch(
     H: int,
     N: int,
 ) -> tuple[Tensor, Tensor]:
-    """Batched TMIX for prefill: [T, C] GEMM path instead of per-token GEMV.
-
-    DPLR recurrence stays serial over T (state-dependent).
-    """
+    """Batched TMIX for prefill: [T, C] GEMM path instead of per-token GEMV."""
     T_len = x0.shape[0]
     x = weight.ln_pre(x0)
     prev = torch.cat([state["x"].unsqueeze(0), x[:-1]], dim=0)
@@ -159,14 +153,17 @@ def time_mix_batch(
         v = _lerp(
             v,
             v_first,
-            _sigmoid(weight.v0.reshape(-1) + xv @ weight.v1 @ weight.v2),
+            _sigmoid(weight.v0 + torch.einsum("tr,cr->tc", xv @ weight.v1, weight.v2t)),
         )
 
     w = torch.exp(
-        -_sigmoid(weight.w0.reshape(-1) + torch.tanh(xw @ weight.w1) @ weight.w2)
+        -_sigmoid(
+            weight.w0
+            + torch.einsum("tr,cr->tc", torch.tanh(xw @ weight.w1), weight.w2t)
+        )
         / (torch.e**0.5)
     )
-    a = _sigmoid(weight.a0.reshape(-1) + xa @ weight.a1 @ weight.a2)
+    a = _sigmoid(weight.a0 + torch.einsum("tr,cr->tc", xa @ weight.a1, weight.a2t))
     kk = k * weight.k_k.reshape(-1)
     k = _lerp(k, k * a, weight.k_a.reshape(-1))
 
@@ -185,7 +182,7 @@ def time_mix_batch(
     y = F.group_norm(y.reshape(T_len, H * N), H, weight.ln_x.w, weight.ln_x.b, 64e-5)
     rkrk = torch.sum(r * k * weight.r_k, dim=-1, keepdim=True)
     y = (y.view(T_len, H, N) + rkrk * v).reshape(T_len, H * N)
-    g = torch.sigmoid(xg @ weight.g1) @ weight.g2
+    g = torch.einsum("tr,cr->tc", torch.sigmoid(xg @ weight.g1), weight.g2t)
     return x0 + (y * g) @ weight.oWt, v_first
 
 
@@ -203,15 +200,23 @@ def channel_mix_batch(
 class RWKV7Torch(RWKV7Model):
     """Pure PyTorch RWKV7 baseline without fused custom kernels.
 
-    State is passed in and out explicitly (``State``), so the instance itself is stateless.
+    State is passed in and out explicitly (``State``), so the instance itself
+    is stateless. Accepts a checkpoint path or an ``RWKV7Weight``.
     """
 
     def __init__(
         self,
-        w: RWKV7Weight,
+        path_or_weight: str | RWKV7Weight,
         *,
-        is_torch_compile: bool = True,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float16,
+        is_torch_compile: bool = False,
     ) -> None:
+        w = (
+            path_or_weight
+            if isinstance(path_or_weight, RWKV7Weight)
+            else RWKV7Weight(path_or_weight, device=device, dtype=dtype)
+        )
         super().__init__(w)
         self._is_torch_compile = is_torch_compile
 

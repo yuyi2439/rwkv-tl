@@ -2,7 +2,7 @@
 
 Runs the full RWKV7 forward over a fixed 32-token sequence through both the
 rwkv_tl implementation (tilelang fused kernels) and the pure-PyTorch reference
-(``demo/rwkv7_torch.py``), on both the batched-prefill path and the
+(``rwkv_tl/rwkv7_torch.py``), on both the batched-prefill path and the
 per-token decode path.
 
 The fused kernels accumulate in fp32 but cast to bf16 at the store and evaluate
@@ -16,8 +16,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from demo.rwkv7_tl import RWKV7TL as RWKV7
-from demo.rwkv7_torch import RWKV7Torch
+from rwkv_tl import RWKV7TL as RWKV7
+from rwkv_tl import RWKV7Torch
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 

@@ -1,7 +1,9 @@
 # pyright: reportInvalidTypeForm=false
 
+import tilelang
 import tilelang.language as T
 
+from ._bound import BoundKernel
 from ._common import WARP
 
 
@@ -142,7 +144,9 @@ def gemv_batch_macro(M: int, K: int, B: int, DTYPE: str, THREADS: int = WARP):
     return _impl
 
 
-def gemv_batch_T_macro(T_len: int, M: int, K: int, B: int, DTYPE: str, THREADS: int = WARP):
+def gemv_batch_T_macro(
+    T_len: int, M: int, K: int, B: int, DTYPE: str, THREADS: int = WARP
+):
     """Batched GEMV ``out[t, b, m] = sum_k x[t, b, k] * W[b, k, m]``.
 
     Fuses ``B`` independent GEMVs per row into a single launch using a 3D grid
@@ -191,3 +195,80 @@ def gemv_batch_T_macro(T_len: int, M: int, K: int, B: int, DTYPE: str, THREADS: 
             out[bt, bz, bx * THREADS + i] = T.cast(acc[i], DTYPE)
 
     return _impl
+
+
+@tilelang.jit(out_idx=[2])
+def gemv_jit(M: int, K: int, DTYPE: str, THREADS: int = WARP):
+    """GEMV kernel: ``out = x @ W`` (``x [K]``, ``W [K, M]``).
+
+    Args:
+        M: Output length (columns of ``W``). Must be a multiple of THREADS.
+        K: Reduction length (rows of ``W``, size of ``x``).
+        DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
+        THREADS: Threads per block.
+    """
+    main = gemv_main_macro(M, K, DTYPE, THREADS)
+
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((K,), DTYPE),
+        W: T.Tensor((K, M), DTYPE),
+        out: T.Tensor((M,), DTYPE),
+    ):
+        with T.Kernel(M // THREADS, threads=THREADS) as bx:
+            acc = main(bx, x, W)
+            for i in T.Parallel(THREADS):
+                out[bx * THREADS + i] = T.cast(acc[i], DTYPE)
+
+    return _impl
+
+
+@tilelang.jit(out_idx=[2])
+def gemv_batch_jit(M: int, K: int, B: int, DTYPE: str, THREADS: int = WARP):
+    """Batched GEMV kernel: ``out[b] = x[b] @ W[b]``.
+
+    Args:
+        M: Output length (columns of each ``W[b]``). Multiple of THREADS.
+        K: Reduction length (rows of each ``W[b]``, size of each ``x[b]``).
+        B: Stacked batch count.
+        DTYPE: Element type, ``"float16"`` or ``"bfloat16"``.
+        THREADS: Threads per block.
+    """
+    main = gemv_batch_macro(M, K, B, DTYPE, THREADS)
+
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((B, K), DTYPE),
+        W: T.Tensor((B, K, M), DTYPE),
+        out: T.Tensor((B, M), DTYPE),
+    ):
+        with T.Kernel(M // THREADS, B, threads=THREADS) as (bx, bz):
+            main(bx, bz, x, W, out=out)
+
+    return _impl
+
+
+def gemv_kernel(M: int, K: int, DTYPE: str, W):
+    """Bound GEMV: ``g = gemv_kernel(M, K, DTYPE, W)`` then ``y = g(x)``.
+
+    ``W`` is the project's row-major ``[K, M]`` layout (``x @ W``); it is
+    captured at construction.
+    """
+    return BoundKernel(
+        gemv_jit,
+        (M, K, DTYPE),
+        bind={"W": W},
+        call=("x",),
+        name="gemv_kernel",
+    )
+
+
+def gemv_batch_kernel(M: int, K: int, B: int, DTYPE: str, W):
+    """Bound batched GEMV (see ``gemv_kernel``); ``W`` is ``[B, K, M]``."""
+    return BoundKernel(
+        gemv_batch_jit,
+        (M, K, B, DTYPE),
+        bind={"W": W},
+        call=("x",),
+        name="gemv_batch_kernel",
+    )

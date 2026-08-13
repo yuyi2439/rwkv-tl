@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO))
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from demo import make_rwkv7
+from rwkv_tl import make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
