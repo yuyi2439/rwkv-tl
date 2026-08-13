@@ -1,11 +1,11 @@
-"""Unit tests for the token sampling helpers (demo.sampling)."""
+"""Unit tests for the token sampling helpers (rwkv_tl.sampling)."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from demo.sampling import sample_logits
+from rwkv_tl.sampling import sample_logits
 
 
 def test_greedy_argmax() -> None:

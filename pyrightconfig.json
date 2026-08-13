@@ -1,5 +1,5 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "exclude": ["src/rwkv_tl/operators"]
+  "exclude": ["src/rwkv_tl/kernel", "**/node_modules", "**/__pycache__", "**/.*", ".venv"]
 }

@@ -5,15 +5,15 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/home/yuyi2439/rwkv/rwkv-tl")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from demo import make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl import make_rwkv7
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 CKPT = sys.argv[1]
-which = sys.argv[2]  # bf16 | mx450 | faster3a
-FAST = "/home/yuyi2439/rwkv/Albatross/faster3a_2607/rwkv7_fast_v3a.py"
+which = sys.argv[2]  # bf16 | fp16 | faster3a
+FAST = sys.argv[3] if len(sys.argv) > 3 else None
 dev = torch.device("cuda")
 
 
@@ -27,21 +27,22 @@ def load_fast(module_path: Path, model_path: str):
 
 
 if which == "faster3a":
+    assert FAST is not None, "usage: bench.py CKPT faster3a FAST_SCRIPT_PATH"
     model = load_fast(Path(FAST), CKPT)
     label = "faster3a_2607"
 else:
     if which == "bf16":
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.bfloat16)
-        cls = make_rwkv7(dev, backend="bf16")
+        cls = make_rwkv7(dev, backend="tl")
         label = "bf16+graph"
     elif which == "fp16":
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.float16)
-        cls = make_rwkv7(dev, backend="fp16")
+        cls = make_rwkv7(dev, backend="tl")
         label = "fp16-base+graph"
     else:
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.float16)
-        cls = make_rwkv7(dev, backend="mx450")
-        label = "mx450+graph"
+        cls = make_rwkv7(dev, backend="tl")
+        label = "fp16+graph"
     model = cls(w, is_torch_compile=False)
 
 
@@ -70,4 +71,4 @@ for T in (1, 8, 32, 64, 128):
         fn()
         torch.cuda.synchronize()
         ts.append((time.perf_counter() - t0) * 1000)
-    print(f"  T={T:3d}  {sorted(ts)[len(ts)//2]:8.3f} ms")
+    print(f"  T={T:3d}  {sorted(ts)[len(ts) // 2]:8.3f} ms")

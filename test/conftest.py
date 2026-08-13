@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure src/ and demo/ are importable when running `pytest` from repo root
+# Ensure src/ is importable when running `pytest` from repo root
 # without install.
 REPO = Path(__file__).resolve().parent.parent
-for _path in (REPO / "src", REPO):
+for _path in (REPO / "src",):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
@@ -59,7 +59,7 @@ def ckpt_path() -> str:
 
 @pytest.fixture(scope="session")
 def vocab_path(repo_root: Path) -> str:
-    return str(repo_root / "asset" / "rwkv_vocab_v20230424.txt")
+    return str(repo_root / "src" / "rwkv_tl" / "asset" / "rwkv_vocab_v20230424.txt")
 
 
 @pytest.fixture(scope="session")

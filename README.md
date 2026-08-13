@@ -1,20 +1,97 @@
 # rwkv-tl
 
-RWKV7 inference with TileLang fused CUDA kernels and CUDA Graph. The goal is to make decode and prefill faster than the pure PyTorch baseline and approach the performance of the Albatross reference implementation.
+An RWKV7 operator library (built on TileLang) plus ready-to-use stateless
+models. Import the package, point it at a checkpoint, and generate:
 
-- Model: RWKV7-g1d (0.1B and 0.4B variants)
-- Precision: float16 compute with float32 accumulation (DPLR state stays fp32), matching Albatross
-- Paths:
-  - Decode (T=1): fused TMIX/CMIX kernels, CUDA-Graph accelerated via `CUDAGraph`
-  - Prefill (T>1): batched TMIX/CMIX kernels that turn token-wise GEMV into batched GEMM; per-T CUDA-Graph replay for T<=64
+```python
+import rwkv_tl
 
-## Project layout
+model = rwkv_tl.rwkv7("model-0.4b.pth")          # tilelang on CUDA, torch elsewhere
+out = model.generate("Once upon a time", max_tokens=128)
+print(out)
+```
+
+Everything is **stateless**: models never own runtime state. Pass a `State`
+in and (optionally) get it back, or let `generate` create a fresh one.
+
+## User API
+
+Build a model from a checkpoint path (or a pre-loaded `RWKV7Weight`):
+
+```python
+model = rwkv_tl.rwkv7("model.pth")                       # backend auto-selected
+model = rwkv_tl.rwkv7("model.pth", backend="torch")      # pure-PyTorch reference
+model = rwkv_tl.RWKV7TL("model.pth")                     # explicit tilelang class
+```
+
+Text in, text out:
+
+```python
+text = model.generate("The meaning of life is",
+                      max_new_tokens=64, temperature=0.8, stop="\n\n")
+```
+
+Chat (messages through the packaged chat template):
+
+```python
+answer = model.chat([
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"},
+], max_new_tokens=128)
+```
+
+## Demo
+
+`examples/` holds runnable walk-throughs: `basic_load_and_generate.py`
+loads a checkpoint and generates text, `chat.py` chats through the template:
+
+```bash
+.venv/bin/python examples/basic_load_and_generate.py /path/to/rwkv7-0.1b.pth
+.venv/bin/python examples/chat.py /path/to/rwkv7-0.1b.pth
+```
+
+## Operator library
+
+`rwkv_tl.kernel` is a TileLang operator library for building efficient RWKV
+implementations. Every factory is **weight-bound**: it takes the compile-time
+hyperparameters *and* the weights at construction and returns a callable that
+only needs activations/state at call time:
+
+```python
+from rwkv_tl.kernel import ln_kernel, gemv_kernel
+
+ln_pre = ln_kernel(C, DTYPE, ln_preW, ln_preB)   # weights captured here
+x_ln = ln_pre(x0)                                 # call with activations only
+```
+
+Both granularities are supported:
+
+- Fine-grained composable operators: `ln_kernel`, `ln_per_row_kernel`,
+  `gemv_kernel`, `gemv_batch_kernel`.
+- Coarse fused layer kernels: `cmix_decode_kernel`, `cmix_prefill_kernel`,
+  `tmix_decode_kernel`, `tmix_prefill_kernel`.
+
+The raw `@tilelang.jit` factories and shared macros (`gemv_macro`,
+`gemv_main_macro`, ...) remain available for custom fused chains. Weights are
+held by the wrapper, which is the hook for a future quantized-weight path
+(int8/any4 storage + dequant fused into the kernels).
+
+## Layout
 
 ```text
-src/rwkv_tl/        # main implementation and fused kernels
-script/             # benchmarking and profiling scripts
-test/               # correctness and kernel tests
-asset/              # tokenizer vocabulary
+src/rwkv_tl/        # published library: models, State, Tokenizer, kernel/
+  core/             # low-level/inference modules (model/state/tokenizer/
+                    # weight/cuda_graph); no references outside core
+  kernel/           # weight-bound tilelang operator factories
+  text_model.py     # RWKV7TextModel (exposed): composes a token model
+                    # (self.model) + tokenizer; tokenize/generate/chat
+  rwkv7_tl.py       # tilelang fused model
+  rwkv7_torch.py    # pure-PyTorch reference model
+  asset/            # packaged data: vocab + chat template
+script/             # chat, benchmark, profiling scripts
+examples/           # runnable usage examples
+test/               # correctness and API tests
+docs/               # benchmark reports and tuning notes (Chinese)
 ```
 
 ## Install and test
@@ -25,80 +102,30 @@ uv sync
 .venv/bin/python -m pytest test/ -v
 ```
 
-## Benchmark status
-
-The numbers below were collected on an NVIDIA RTX 3060 (sm_86, 12GB), the
-target validation GPU. `tl-fp16`/`tl-rtx3060` are the fp16 base wrapped with
-`CUDAGraph` (CUDA-Graph decode + per-T prefill graph); `pure-torch` is the
-eager PyTorch baseline. The benchmark harness routes through the eager methods
-so a sweep does not recompile a fresh graph per token count.
-
-| Case | tl-fp16 | tl-rtx3060 | faster3a_2607 | pure-torch |
-|---|---:|---:|---:|---:|
-| 1x1 | 10.08 ms | **2.16 ms** | 4.40 ms | 15.78 ms |
-| 1x8 | 16.46 ms | **2.86 ms** | 6.41 ms | 41.44 ms |
-| 1x32 | 16.55 ms | **3.41 ms** | 8.16 ms | 119.29 ms |
-| 1x64 | 16.60 ms | **4.00 ms** | 7.71 ms | 228.87 ms |
-| 1x128 | 16.64 ms | 17.47 ms | **7.06 ms** | 428.54 ms |
-| 8x8 | 16.29 ms | **3.89 ms** | 7.69 ms | 223.73 ms |
-| 16x16 | 16.60 ms | **17.34 ms** | 8.02 ms | 850.39 ms |
-
-Key points:
-- The CUDA-Graph-accelerated `tl-rtx3060` (decode + per-T prefill graph for
-  T<=64) leads every implementation at T=1..64, beating faster3a_2607 by
-  ~1.5-2x and pure-torch by ~7-60x.
-- T=128 prefill stays eager (T>64 graph cap) and trails faster3a_2607
-  (~20 vs 7.8 ms) -- large-T prefill is the common tilelang-path bottleneck.
-- Every CUDA model -- including `backend="torch"` -- is graph-wrapped by
-  default (`make_rwkv7(use_graph=True)`); pass `use_graph=False` for a truly
-  eager class (e.g. the torch reference used for correctness gating).
-- Compiling `prefill` gives 1.11-1.43x on 0.1B, but recompiles a
-  fresh graph per prompt length (minutes), so it stays eager. See
-  `script/benchmark_rwkv7.md` and `docs/benchmarks/rtx3060.md`.
-
-## MX450 tuning (sm_75) now partially beats the sm75-adapted faster3a_2607
-
-`tl-mx450` (sm_75 tuning: fp32 prefill GEMMs + T<=16 tilelang fp16 rkv + CUDA-Graph decode)
-vs the sm75-adapted faster3a_2607 from
-[yuyi2439/Albatross `support/sm75`](https://github.com/yuyi2439/Albatross/tree/support/sm75)
-(0.1B / MX450, warmup=10, iters=20, single session):
-
-| T | faster3a_2607 (sm75-adapted) | tl-mx450 |
-|---|---|---|
-| 1 | 9.6ms (noisy) | **8.3ms (stable)** |
-| 2 | 11.4ms | **11.5ms (tie)** |
-| 4 | **10.8ms** | 11.7ms |
-| 8 | 23.6ms | **13.0ms** |
-| 16 | 34.0ms | **19.5ms** |
-| 32 | 43.9ms | **15.8ms** |
-| 64 | 47.0ms | **22.5ms** |
-| 128 | 88.6ms | **43.4ms** |
-
-**`tl-mx450` now leads (or ties) the sm75-adapted faster3a_2607 at every T.** The
-wins stack three sm_75 findings: CUDA-Graph decode (stable 8.3ms T=1), CUDA-Graph
-prefill for T<=64 (small-T prefill was launch-bound: a constant ~2175 launches
-regardless of T; T=4 dropped 33 -> 11.7ms), and `.contiguous()` on transposed
-GEMM weights (non-contiguous cuBLAS operands are ~2.7x slower on Turing;
-T=128 prefill dropped 70.6 -> 43.4ms).
-
-Why we win despite both sides using CUDA Graph: faster3a_2607 (its sm75
-adaptation also captures per-stage `torch.cuda.CUDAGraph`s) still runs its
-prefill through **fp16 tensor-core GEMMs** (`volta_fp16_s884gemm...` ~39ms of
-42.6ms at T=32), which are the pathological Turing fp16 cuBLAS kernels (~4-6x
-slower than fp32 for these shapes). `tl-mx450` deliberately uses **fp32 GEMMs**
-for prefill, which is the correct sm_75 adaptation. This is an architecture-level
-difference, not a measurement artifact.
-
-## Run benchmark
+Kernel correctness tests need CUDA and `RWKV_CHECKPOINT_PATH`:
 
 ```bash
-.venv/bin/python script/benchmark_rwkv7.py \
-  --project-checkpoint <checkpoint.pth> \
-  --vocab asset/rwkv_vocab_v20230424.txt \
-  --targets tl-fp16,pure-torch \
-  --device cuda \
-  --cases 1x1,1x8,1x32,2x1,8x1,8x8,16x16 \
-  --warmup 10 --iters 20
+RWKV_CHECKPOINT_PATH=/path/to/rwkv7-g1d-0.1b.pth .venv/bin/python -m pytest test/ -v
 ```
 
-On memory-constrained machines, split large sweeps into separate processes to avoid compiler-cache pressure and OOMs.
+The user-facing text API and the pure-torch backend also run on CPU.
+
+`script/check_torch_vs_official.py` additionally validates the pure-torch
+backend against the official RWKV-LM v7 demo (pure-torch path) on the same
+checkpoint — logits must agree on argmax and top-5 for batched and per-token
+decode:
+
+```bash
+.venv/bin/python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth \
+  --fast-path /path/to/RWKV-LM/RWKV-v7/rwkv_v7_demo.py
+```
+
+## Performance
+
+Decode and prefill use fused tilelang kernels with fp16 compute and fp32
+accumulation (DPLR state stays fp32), CUDA-Graph accelerated on CUDA by
+default. Current numbers vs the Albatross reference implementation are in
+`docs/runs/rtx3060.md` (RTX 3060, the current target card).
+`script/bench_tl_vs_torch.py` measures tl vs pure-torch on CUDA (prefill
+sweep + decode), and `script/bench_tl_vs_fast.py` compares tl against the
+Albatross faster3a_2607 reference implementation.

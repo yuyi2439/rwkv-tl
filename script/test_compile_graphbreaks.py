@@ -22,10 +22,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO))
 
-from demo.rwkv7_fp16 import RWKV7FP16 as RWKV7
-from demo.rwkv7_torch import RWKV7Torch
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl import RWKV7TL as RWKV7
+from rwkv_tl import RWKV7Torch
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH", "")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

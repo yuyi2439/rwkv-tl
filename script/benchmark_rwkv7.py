@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Benchmark multiple RWKV7 implementations through a shared driver.
 
-Models are built with ``demo.make_rwkv7(backend=...)`` (no bespoke builder
+Models are built with ``rwkv_tl.make_rwkv7(backend=...)`` (no bespoke builder
 functions) so every target goes through the same entry point:
 
 - faster3a_2607: Albatross CUDA implementation (external module).
-- tl-fp16: tilelang fp16 (``demo.make_rwkv7(backend="fp16")``).
-- tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
-- tl-tuned: per-device tuned variant (``backend="tuned"``).
+- tl-fp16: tilelang fp16 (``rwkv_tl.make_rwkv7(backend="tl")`` with fp16
+  weights).
+- tl-bf16: tilelang bf16 (backend ``"tl"`` with bf16 weights, keeping the raw
+  checkpoint dtype).
 - pure-torch: pure PyTorch baseline (``backend="torch"``; graph-wrapped on
   CUDA by default, eager reference available via ``use_graph=False``).
-
-Reserved but not yet implemented targets:
-- fla
-- FlashRWKV
 
 Args via argparse:
     --project-checkpoint: model checkpoint path
@@ -43,30 +40,23 @@ for path in (SCRIPT_ROOT, SRC_ROOT := REPO_ROOT / "src", REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from demo import RWKV7Model, make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl import make_rwkv7
+from rwkv_tl.core import RWKV7Model
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
-BACKEND_FOR_TARGET = {
-    "tl-fp16": "fp16",
-    "tl-bf16": "bf16",
-    "tl-mx450": "mx450",
-    "tl-rtx3060": "rtx3060",
-    "tl-tuned": "tuned",
-    "pure-torch": "torch",
-}
-
-DTYPE_FOR_TARGET = {
-    "tl-fp16": torch.float16,
-    "tl-bf16": torch.bfloat16,
-    "tl-mx450": torch.float16,
-    "tl-rtx3060": torch.float16,
-    "tl-tuned": torch.float16,
-    "pure-torch": torch.float16,
+# Each project target selects a (backend, dtype) pair. The tilelang backend is
+# the same ("tl") for fp16/bf16; the target name only differs in weight dtype
+# (the old dtype-carrying backend names "fp16"/"bf16" were removed from
+# `rwkv_tl`).
+TARGET_SPEC = {
+    "tl-fp16": ("tl", torch.float16),
+    "tl-bf16": ("tl", torch.bfloat16),
+    "pure-torch": ("torch", torch.float16),
 }
 
 # Project targets gated against a matching-dtype pure-torch reference.
-GATED_TARGETS = {"tl-fp16", "tl-bf16", "tl-mx450", "tl-rtx3060", "tl-tuned"}
+GATED_TARGETS = {"tl-fp16", "tl-bf16"}
 
 
 def percentile(values, q):
@@ -201,12 +191,7 @@ def parse_targets(text: str) -> list[str]:
         "faster3a_2607",
         "tl-fp16",
         "tl-bf16",
-        "tl-mx450",
-        "tl-rtx3060",
-        "tl-tuned",
         "pure-torch",
-        "fla",
-        "FlashRWKV",
     }
     unknown = [target for target in targets if target not in allowed]
     if unknown:
@@ -353,7 +338,6 @@ def run_benchmark(args):
     """根据 --targets 与 --device 运行选定实现的计时。
 
     faster3a_2607 始终 CUDA；项目 target 运行在 --device。
-    fla / FlashRWKV 先保留为占位 target，后续再接入。
 
     Args:
         args: argparse 解析结果。
@@ -401,32 +385,21 @@ def run_benchmark(args):
                 )
                 device = torch.device("cuda")
                 gate_dtype: torch.dtype | None = None
-            elif target in BACKEND_FOR_TARGET:
+            elif target in TARGET_SPEC:
                 # One fresh weight per target, freed after the target's cases:
                 # only ONE weight copy is resident in VRAM at any time (MX450
                 # has 2GB and the correctness reference shares this same object).
-                dtype = DTYPE_FOR_TARGET[target]
+                backend_name, dtype = TARGET_SPEC[target]
                 w = RWKV7Weight(
                     str(args.project_checkpoint), device=rwkv_device, dtype=dtype
                 )
                 model_cls = make_rwkv7(
                     rwkv_device,
-                    backend=BACKEND_FOR_TARGET[target],
+                    backend=backend_name,
                 )
                 model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
                 gate_dtype = dtype
-                if target == "tl-tuned":
-                    # The tuned selector is device-name based; surface which
-                    # variant was picked so a run is reproducible on paper.
-                    print(
-                        f"MODEL label={target} class={model_cls.__name__}",
-                        flush=True,
-                    )
-            elif target in {"fla", "FlashRWKV"}:
-                raise NotImplementedError(
-                    f"target '{target}' is reserved but not implemented yet"
-                )
             else:
                 raise ValueError(f"unknown target: {target}")
 
@@ -436,9 +409,7 @@ def run_benchmark(args):
             # faster3a_2607 is not gated.
             if args.correctness_check and target in GATED_TARGETS:
                 assert w is not None and gate_dtype is not None
-                ref_cls = make_rwkv7(
-                    rwkv_device, backend="torch", use_graph=False
-                )
+                ref_cls = make_rwkv7(rwkv_device, backend="torch", use_graph=False)
                 reference = ref_cls(w, is_torch_compile=False)  # type: ignore[call-arg]
 
             for B, T in parsed_cases:
@@ -490,7 +461,9 @@ def run_benchmark(args):
 
 def main():
     """主入口：解析参数并运行 benchmark。"""
-    default_vocab = str(REPO_ROOT / "asset" / "rwkv_vocab_v20230424.txt")
+    default_vocab = str(
+        REPO_ROOT / "src" / "rwkv_tl" / "asset" / "rwkv_vocab_v20230424.txt"
+    )
     parser = argparse.ArgumentParser(
         description="Benchmark multiple RWKV7 implementations"
     )
@@ -510,8 +483,7 @@ def main():
         default="faster3a_2607,tl-fp16,pure-torch",
         help=(
             "Comma/space separated targets: faster3a_2607, tl-fp16, tl-bf16, "
-            "tl-tuned, pure-torch, fla, FlashRWKV. Defaults to the implemented "
-            "targets."
+            "pure-torch. Defaults to the implemented targets."
         ),
     )
     parser.add_argument(

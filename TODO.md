@@ -2,6 +2,11 @@
 
 按优先级排列。完成一项就删掉对应条目。
 
+**进度（2026-08-13）**：0.2 API 重构完成——模型进库（`rwkv_tl.rwkv7` /
+`RWKV7TL` / `RWKV7Torch`），kernel 改为权重绑定的 `*_kernel` 工厂
+（粗细粒度都导出），文本级 `generate` / `logits` / `tune_state` + `State`
+save/load，vocab 打包进 wheel，全部接口 stateless。量化（#6）是下一个主线。
+
 ## P0 — decode 性能与可用性（最高优先级）
 
 ### #1 手写 GEMV（decode 路径，不走 TensorCore）
@@ -14,6 +19,26 @@ decode 是 `[C]×[C,C]`（M=1），TensorCore m16n8k16 对 M=1 利用率仅 1/16
 
 graph_decoder 的 1.55ms GPU kernel time 里 GEMV 计算是主要成本，手写预计快 30-50%。
 这是当前 decode 路径收益最大的单项优化。
+
+**观察（2026-08-10）**：neo kernels 启用后（a8e2ef7）decode 反而变慢——0.1B
+tl-fp16 从旧基线 2.36ms（逐 op kernel + graph）涨到 graph 4.15ms / eager 3.44ms。
+profiler 定位根因：`tmix_decode` 单层 ~11 个顺序 kernel，r/k/v 三个 GEMV 占 decode
+GPU 时间 60-73%，且链中每个膨胀 2.4-3.8x（55/71/149us vs 微基准 17/19/63us @
+C=768/1024/2048）——因每个读前一 kernel 刚写的 global、无 overlap、occupancy 低
+（24-64 个 32-thread block）。**GEMV 单 kernel 本身不慢**（微基准与 cuBLAS 持平），
+faster3a 用 `row1_exact4` 把 r/k/v 融合成 14.8us/kernel。修复方向：把 r/k/v 三个 GEMV
+合并成一个 batched GEMV kernel、减少单层 kernel 数、HEAD 专精（现在 `[65536,C]`
+cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State copy-in/out
+（36 次小 copy_）+ `.item()` 同步，另查。1.5B decode 18.93ms vs faster3a 7.91ms。
+详见 docs/runs/rtx3060.md「neo kernels 基线」。
+
+**进度（2026-08-12）**：r/k/v 已合并为单 batched GEMV（`gemv_batch_macro`）。
+**精确根因已定位**（读 faster3a `rwkv7_v3a_ops.cu`）：它的单行 GEMV
+`linear_orig_row1_exact_f16` 用 128 threads/block + half2 向量化 K + 多 warp
+partial reduce（每 block 算 OutTile=2 输出），我们 `gemv_macro` 是 32 threads
+lane-per-output + K 标量串行读。1.5B 上 faster3a 41.7us/个 vs 我们 94-146us
+（链中膨胀）。修复方向：decode 单行 GEMV 重写为 faster3a 风格（128 threads +
+half2 向量化 + 多 warp reduce），见 docs/runs/rtx3060.md 三模型差距分析。
 
 ### #2 batch decode（B>1）
 
@@ -29,10 +54,41 @@ T=128 prefill 落后 faster3a 2.5x，根因是 faster3a 的 wkv_seq kernel 用 c
 cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不够。T-bucketing
 （按 T 分桶捕获 graph）只省 launch 开销，不解决计算效率问题，仅作过渡。
 
+**量化（2026-08-10）**：1.5B prefill 的 TMIX 仍走旧逐 op 路径，单层 T=64 拆解：
+`fused_dplr_T` 296us（faster3a `wkv_fp16_seq_v2` 仅 47us，**慢 6.3x**——grid `(H,N)`
+=2048 blocks × 32 threads 串行整个 T，occupancy 低、无 chunk 并行）、`fused_rkv_gemm`
+189us（旧 tilelang，faster3a 用 cuBLAS 大 tile）、torch 6-shift lerp + gates ~90us
+（Python 逐 op）。合计 ~530us/层 × 24 = 12.7ms + CMIX。1.5B T=128 落后 faster3a
+1.33x 大部分来自 TMIX 未融合 + DPLR 慢。
+
+**警示（2026-08-12）**：commit 9e81fd1 把 prefill 改为融合 `_tmix_prefill_front/_back`
+（MX450 上快 2.1x），但 **3060 (sm_86) 上 prefill 全面倒退 2.5-10x**——根因是
+`_tmix_prefill_back` 的 oWt 投影写成逐-token 串行手写 GEMV（`for t in serial(LEN)
+for k in serial(C)`，1704us @ 0.1B/T=128，未用 tensor core），而旧 `out_mm` 的
+batched `T.gemm` 只要 63us（27x）。GN 也串行 T。MX450 快是因为其 fp16 cuBLAS 病态
+使串行写法相对可接受。修复：oWt/GN 改 batched T.gemm。**在 MX450 上调优的 kernel
+必须在 sm_80+ 复测**，否则可能像这次一样倒退。
+
 真正解法是 chunk-based 并行 prefill：把 T 维切成 chunk（如 16/32），chunk 内并行
 计算 GEMM，chunk 间串行递推 state。参考 FlashRWKV `chunk_rwkv7` 和 FLA 的实现。
 注意 SM120 上 chunk 反而比 recurrent 慢（FlashRWKV 实测），需在我们的硬件上验证
 交叉点。
+
+**调研更新（2026-08-12）**：读了 faster3a `rwkv7_wkv_fp16_v2.cu`——它的
+`wkv_fp16_seq_v2_kernel` **并非真 chunk 并行**，也是串行 over T，但用 (B,H) grid +
+每线程 fp16 register state + cp.async 双缓冲预取。我们已把 DPLR 对齐到 fp16
+register state（commit e0da4c7，1.5B T=256 92→80ms），DPLR 不再是主要差距。
+1.5B 剩余 1.6-1.9x 差距来自 **front 的 4 个 rank 一阶 GEMM（637us/层，tile 浪费：
+R=64/96 时 BLOCK_N=128 半空）+ rkv GEMM 290us**——faster3a 用 cuBLAS batched 处理。
+先优化 rank 一阶 GEMM tile（R 小时用更小 BLOCK_N）再考虑真 chunk。
+
+**进度（2026-08-12 晚）**：rank GEMM tile 已优化（BN=64，commit 9972971，1.5B
+T=128 50.3→45.1ms）。**最终路线评估**：即使 DPLR + rank GEMM 全部优化，1.5B 仍
+输 faster3a 1.3-2.1x（decode 输在单行 GEMV 结构，prefill 输在 GEMM 规模 + 串行
+DPLR latency）。真 chunk 并行是唯一未试的路径，但 faster3a 本身也不是 chunk
+并行——它的优势是手写 CUDA kernel（cp.async、row1_exact、split-K）。详见
+docs/runs/rtx3060.md 三模型差距分析。
+
 
 ### #4 1.5B 模型验证（RTX 3060）
 
@@ -40,6 +96,13 @@ cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不
 （bf16 需 ~3GB，RTX 3060 12GB 可装）。大模型会暴露：SMEM 不足（更大 N 影响
 `fused_gn_rkrk`/`fused_dplr` register pressure）、occupancy 下降（H=64 时 grid 更大）、
 DPLR N 维并行度变化。7.2B 需等量化支持后再测（bf16 ~14.4GB）。
+
+**进度（2026-08-08）**：`rwkv7-g1i-1.5b-20260805-ctx16384.pth`（C=2048, H=32, N=64,
+L=24）已在本机 3060 加载成功（g1i 权重键结构与 g1d 一致，`RWKV7Weight` 零改动），
+decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。
+**进度（2026-08-10）**：完整 benchmark 已补测（neo kernels 基线，a8e2ef7）：1.5B
+prefill T=8/32 快 faster3a ~2x，但 decode 1x1（18.93ms）与 T≥64 prefill 落后。
+详见 docs/runs/rtx3060.md。
 
 ## P2 — 训练路径
 
@@ -55,12 +118,14 @@ DPLR N 维并行度变化。7.2B 需等量化支持后再测（bf16 ~14.4GB）�
 
 ## P3 — 后续优化
 
-### #6 量化（融合进手写 GEMV kernel）
+### #6 量化（权重绑定到 wrapper 之后的主线）
 
 decode 是 memory-bound，量化直接减半 memory bandwidth。weight 用 int8/any4 存储，
-kernel 内做 dequant + compute 融合；DPLR state 保持 fp32。应在 #1 手写 GEMV 完成
-后在 GEMV kernel 内融合 dequant，而非单独做量化路径。参考 rwkv7-quantization
-（any4 在 RTX 2080 Ti 达 114.7 tok/s）。
+kernel 内做 dequant + compute 融合；DPLR state 保持 fp32。0.2 的 `BoundKernel`
+已经把权重所有权收进 wrapper（构建期绑定），量化权重（int8/any4 + scale）直接
+住进 wrapper，kernel 只看到 dequant 输入或 int8+scale，模型代码零改动。应在 #1
+手写 GEMV 完成后在 GEMV kernel 内融合 dequant，而非单独做量化路径。参考
+rwkv7-quantization（any4 在 RTX 2080 Ti 达 114.7 tok/s）。
 
 ### #7 decode 路径深融合（减少 launch）
 
