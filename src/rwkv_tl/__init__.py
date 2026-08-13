@@ -60,9 +60,7 @@ def _resolve_cls(backend: str):
         return RWKV7TL
     if backend == "torch":
         return RWKV7Torch
-    raise ValueError(
-        f"unknown backend {backend!r} (expected auto/tl/torch)"
-    )
+    raise ValueError(f"unknown backend {backend!r} (expected auto/tl/torch)")
 
 
 def rwkv7(

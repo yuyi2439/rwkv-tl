@@ -460,9 +460,7 @@ def run_benchmark(args):
 
 def main():
     """主入口：解析参数并运行 benchmark。"""
-    default_vocab = str(
-        REPO_ROOT / "src" / "rwkv_tl" / "rwkv_vocab_v20230424.txt"
-    )
+    default_vocab = str(REPO_ROOT / "src" / "rwkv_tl" / "rwkv_vocab_v20230424.txt")
     parser = argparse.ArgumentParser(
         description="Benchmark multiple RWKV7 implementations"
     )
