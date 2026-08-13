@@ -18,8 +18,8 @@ import pytest
 import torch
 
 from rwkv_tl import RWKV7TL as RWKV7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]

@@ -59,7 +59,7 @@ def ckpt_path() -> str:
 
 @pytest.fixture(scope="session")
 def vocab_path(repo_root: Path) -> str:
-    return str(repo_root / "src" / "rwkv_tl" / "rwkv_vocab_v20230424.txt")
+    return str(repo_root / "src" / "rwkv_tl" / "asset" / "rwkv_vocab_v20230424.txt")
 
 
 @pytest.fixture(scope="session")

@@ -30,7 +30,8 @@ import torch
 # Make the repo-root package importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rwkv_tl import RWKV7TL, CUDAGraph, RWKV7Weight, Tokenizer
+from rwkv_tl import RWKV7TL
+from rwkv_tl.core import CUDAGraph, RWKV7Weight, Tokenizer
 
 PREFILL_TS = (1, 8, 16, 32, 64, 128, 256, 512)
 WARMUP = 2

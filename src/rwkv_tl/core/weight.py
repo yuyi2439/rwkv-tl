@@ -163,6 +163,11 @@ class RWKV7Weight:
         # bf16's 7-bit). Pass dtype=torch.bfloat16 to keep the raw checkpoint
         # dtype (no conversion) for the bf16 model.
         # Accumulation stays fp32 inside every kernel.
+        if device is None:
+            # A checkpoint saved from CUDA records cuda:0 locations; without
+            # an explicit device, resolve to the default device so CPU-only
+            # machines can load it too.
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         W = torch.load(model_path, map_location=device)
         W = {
             k: (v.to(dtype) if isinstance(v, torch.Tensor) else v) for k, v in W.items()

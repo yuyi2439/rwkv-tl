@@ -13,13 +13,18 @@ A short guide for human contributors. For agent-specific operating rules, see
     Raw `@tilelang.jit` factories and shared macros (`gemv_macro`,
     `gemv_main_macro`, `ln_prologue_macro`, ...) stay available for custom
     fused chains. Legacy per-op kernels live in `kernel/old/`.
-  - `model.py` — the stateless `RWKV7Model` interface plus the text-level API
-    (`generate` / `logits` / `tune_state` / `encode` / `detokenize`).
+  - `core/` — low-level/inference modules (`model.py` `RWKV7Model` token
+    contract, `state.py`, `tokenizer.py`, `weight.py`, `cuda_graph.py`
+    `CUDAGraph`); core must not reference code outside `core/`.
+  - `text_model.py` — the upper-layer `RWKV7TextModel`: COMPOSES a
+    `RWKV7Model` as `self.model` (no inheritance) + tokenizer, and adds
+    `tokenize` / `detokenize` / `generate(str, ...) -> str` (with a `stop`
+    string) / `chat(messages, ...) -> str` (renders
+    `asset/rwkv_chat_template_v20260805.jinja`).
   - `rwkv7_tl.py` — fused tilelang model; `rwkv7_torch.py` — pure-PyTorch
-    reference; `cuda_graph.py` — CUDA-Graph wrapper; `sampling.py`,
-    `tokenizer.py` (vocab packaged inside the package, e.g.
-    `rwkv_vocab_v20230424.txt`), `state.py` (save/load), `weight.py`.
+    reference; `sampling.py`.
 - `script/` — chat, benchmark, and profiling scripts.
+- `examples/` — runnable usage examples.
 - `test/` — correctness and API tests.
 - `docs/` — benchmark reports and tuning notes (Chinese).
 

@@ -5,46 +5,40 @@ Build a model directly from a checkpoint path::
     import rwkv_tl
 
     model = rwkv_tl.rwkv7("model-0.4b.pth")          # backend auto-selected
-    state = model.tune_state("You are a helpful assistant.")   # state tune
-    state.save("persona.pt")
-    state = rwkv_tl.State.load("persona.pt")
-    out = model.generate("Hello!", state=state)      # text in, text out
+    text = model.generate("Hello", max_new_tokens=64)
+    answer = model.chat([{"role": "user", "content": "Hi!"}])
 
-Advanced users can drop to the low-level stateless interface
-``model.decode(token, state)`` / ``model.prefill(tokens, state)`` /
-``model.logits(input, state)`` for raw logits, or compose custom fused
-kernels from ``rwkv_tl.kernel`` (weight-bound operator factories).
+Low-level core modules (``RWKV7Model`` / ``State`` / ``Tokenizer`` /
+``RWKV7Weight`` / ``CUDAGraph``) are NOT re-exported from the top level:
+import them from ``rwkv_tl.core`` when needed. ``rwkv7()`` returns the
+application-layer ``RWKV7TextModel`` (composition over the token model).
+Fused operator factories live in ``rwkv_tl.kernel`` (weight-bound wrappers).
 """
 
 from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
+from typing import TYPE_CHECKING
 
 import torch
 
-from .cuda_graph import CUDAGraph, make_graph_cls, wrap_model
-from .model import RWKV7Model
+from .core.cuda_graph import CUDAGraph
 from .rwkv7_tl import RWKV7TL
 from .rwkv7_torch import RWKV7Torch
 from .sampling import sample_logits
-from .state import State
-from .tokenizer import Tokenizer
-from .weight import LNWeight, RWKV7Weight
+from .text_model import RWKV7TextModel
+
+if TYPE_CHECKING:
+    from .core.weight import RWKV7Weight
 
 __all__ = [
     "RWKV7TL",
-    "CUDAGraph",
-    "LNWeight",
-    "RWKV7Model",
+    "RWKV7TextModel",
     "RWKV7Torch",
-    "RWKV7Weight",
-    "State",
-    "Tokenizer",
     "make_rwkv7",
     "rwkv7",
     "sample_logits",
-    "wrap_model",
 ]
 
 try:
@@ -71,7 +65,7 @@ def rwkv7(
     backend: str = "auto",
     use_graph: bool = True,
     **kwargs,
-) -> RWKV7Model:
+) -> RWKV7TextModel:
     """Build an RWKV7 model from a checkpoint path (or ``RWKV7Weight``).
 
     Args:
@@ -89,8 +83,8 @@ def rwkv7(
     cls = _resolve_cls(backend)
     model = cls(path_or_weight, device=device, dtype=dtype, **kwargs)
     if use_graph and torch.cuda.is_available() and model.w.device.type == "cuda":
-        return CUDAGraph(model)
-    return model
+        model = CUDAGraph(model)
+    return RWKV7TextModel(model)
 
 
 def make_rwkv7(
@@ -99,7 +93,7 @@ def make_rwkv7(
     backend: str = "auto",
     use_graph: bool = True,
     device_name: str | None = None,
-) -> type[RWKV7Model]:
+) -> type[RWKV7TextModel]:
     """Build a model implementation class for a device (class-returning form
     used by benchmark scripts).
 
@@ -112,6 +106,11 @@ def make_rwkv7(
             variant (all CUDA devices use ``RWKV7TL``).
     """
     cls = _resolve_cls(backend)
-    if use_graph and device.type == "cuda":
-        return make_graph_cls(cls)
-    return cls
+
+    def _init(self: RWKV7TextModel, w: RWKV7Weight, **kwargs) -> None:
+        model = cls(w, **kwargs)
+        if use_graph and device.type == "cuda":
+            model = CUDAGraph(model)
+        RWKV7TextModel.__init__(self, model)
+
+    return type("RWKV7TextModelFactory", (RWKV7TextModel,), {"__init__": _init})

@@ -26,11 +26,10 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from rwkv_tl.model import RWKV7Model
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from .model import RWKV7Model
+from .state import State
 
-__all__ = ["CUDAGraph", "make_graph_cls", "wrap_model"]
+__all__ = ["CUDAGraph"]
 
 
 def _copy_state(dst: State, src: State) -> None:
@@ -231,36 +230,3 @@ class CUDAGraph(RWKV7Model):
                 stacklevel=2,
             )
             return None
-
-
-def wrap_model(
-    model: RWKV7Model,
-    *,
-    prefill_graph_max_t: int | None = 1024,
-    warmup: int = 3,
-) -> CUDAGraph:
-    """Wrap an existing ``RWKV7Model`` instance with CUDA-Graph acceleration."""
-    return CUDAGraph(
-        model,
-        prefill_graph_max_t=prefill_graph_max_t,
-        warmup=warmup,
-    )
-
-
-def make_graph_cls(
-    base_cls: type[RWKV7Model],
-    *,
-    prefill_graph_max_t: int | None = 1024,
-    warmup: int = 3,
-) -> type[RWKV7Model]:
-    """Build a class that constructs ``base_cls(w, **kwargs)`` and wraps it."""
-
-    def _init(self, w: RWKV7Weight, **kwargs) -> None:
-        CUDAGraph.__init__(
-            self,
-            base_cls(w, **kwargs),
-            prefill_graph_max_t=prefill_graph_max_t,
-            warmup=warmup,
-        )
-
-    return type(f"CUDAGraph{base_cls.__name__}", (CUDAGraph,), {"__init__": _init})

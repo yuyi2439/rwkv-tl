@@ -40,9 +40,10 @@ for path in (SCRIPT_ROOT, SRC_ROOT := REPO_ROOT / "src", REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from rwkv_tl import RWKV7Model, make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl import make_rwkv7
+from rwkv_tl.core import RWKV7Model
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 # Each project target selects a (backend, dtype) pair. The tilelang backend is
 # the same ("tl") for fp16/bf16; the target name only differs in weight dtype
@@ -460,7 +461,9 @@ def run_benchmark(args):
 
 def main():
     """主入口：解析参数并运行 benchmark。"""
-    default_vocab = str(REPO_ROOT / "src" / "rwkv_tl" / "rwkv_vocab_v20230424.txt")
+    default_vocab = str(
+        REPO_ROOT / "src" / "rwkv_tl" / "asset" / "rwkv_vocab_v20230424.txt"
+    )
     parser = argparse.ArgumentParser(
         description="Benchmark multiple RWKV7 implementations"
     )

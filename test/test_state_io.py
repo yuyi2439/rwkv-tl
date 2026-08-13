@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from rwkv_tl.state import State
+from rwkv_tl.core.state import State
 
 
 def test_save_load_roundtrip(tmp_path) -> None:

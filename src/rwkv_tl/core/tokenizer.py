@@ -41,7 +41,7 @@ class Tokenizer:
         idx2token: dict[int, bytes] = {}
         sorted: list[bytes] = []  # must be already sorted
         if vocab_path is None:
-            vocab = files("rwkv_tl").joinpath(_DEFAULT_VOCAB)
+            vocab = files("rwkv_tl").joinpath("asset", _DEFAULT_VOCAB)
             with vocab.open("r", encoding="utf-8") as f:
                 lines = f.readlines()
         else:

@@ -16,9 +16,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
-from rwkv_tl.model import RWKV7Model
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7ATTWeight, RWKV7FFNWeight, RWKV7Weight
+from rwkv_tl.core.model import RWKV7Model
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7ATTWeight, RWKV7FFNWeight, RWKV7Weight
 
 
 def _sigmoid(x: Tensor) -> Tensor:

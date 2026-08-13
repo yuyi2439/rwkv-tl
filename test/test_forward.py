@@ -18,8 +18,8 @@ import torch
 
 from rwkv_tl import RWKV7TL as RWKV7
 from rwkv_tl import RWKV7Torch
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 N_TOKENS = 32
 TOKENS = [(i * 1103515245 + 12345) % 65536 for i in range(N_TOKENS)]
@@ -105,7 +105,7 @@ def test_decode_matches_prefill(models) -> None:
         "tilelang host-side BF16StorageLegalize crashes on hoisted bf16 global "
         "buffers (`Cannot find var remap for xrkv`); upstream unfixed in "
         "tilelang 0.1.13. Re-enable after a tilelang upgrade and remove this "
-        "skip once it passes (see AGENTS.md known issues)."
+        "skip once it passes (see .agent/known-issues.md)."
     )
 )
 def test_bf16_consistent(ckpt_path: str) -> None:

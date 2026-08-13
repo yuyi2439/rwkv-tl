@@ -14,8 +14,8 @@ import torch
 
 from rwkv_tl.kernel.tmix import tmix_decode
 from rwkv_tl.rwkv7_torch import time_mix as time_mix_ref
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH")
 if not CKPT:

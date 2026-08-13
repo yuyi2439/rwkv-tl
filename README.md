@@ -27,36 +27,27 @@ model = rwkv_tl.RWKV7TL("model.pth")                     # explicit tilelang cla
 Text in, text out:
 
 ```python
-out = model.generate("The meaning of life is", max_tokens=64, temperature=0.8)
+text = model.generate("The meaning of life is",
+                      max_new_tokens=64, temperature=0.8, stop="\n\n")
 ```
 
-Advanced users can get raw logits or drive the model token-by-token:
+Chat (messages through the packaged chat template):
 
 ```python
-S = model.new_state()
-logits, S = model.logits("The meaning of life is", state=S)   # next-token distribution
-logits, S = model.decode(token_id, S)                         # one token at a time
-```
-
-### State tune (prompt -> state, save/load)
-
-```python
-S = model.tune_state("You are a helpful assistant.")  # state tuned by a prompt
-S.save("persona.pt")
-S = rwkv_tl.State.load("persona.pt")
-out = model.generate("Hello!", state=S, max_tokens=64)
+answer = model.chat([
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"},
+], max_new_tokens=128)
 ```
 
 ## Demo
 
-`script/demo_rwkv7.py` is a single-file, runnable walk-through of the whole
-API: build a model from a checkpoint, state tune with save/load, inspect raw
-logits, generate text, and decode token-by-token:
+`examples/` holds runnable walk-throughs: `basic_load_and_generate.py`
+loads a checkpoint and generates text, `chat.py` chats through the template:
 
 ```bash
-.venv/bin/python script/demo_rwkv7.py /path/to/rwkv7-0.1b.pth \
-  --prompt "The meaning of life is" --max-tokens 64 \
-  --tune-prompt "You are a helpful assistant." --save-state persona.pt
+.venv/bin/python examples/basic_load_and_generate.py /path/to/rwkv7-0.1b.pth
+.venv/bin/python examples/chat.py /path/to/rwkv7-0.1b.pth
 ```
 
 ## Operator library
@@ -89,13 +80,16 @@ held by the wrapper, which is the hook for a future quantized-weight path
 
 ```text
 src/rwkv_tl/        # published library: models, State, Tokenizer, kernel/
+  core/             # low-level/inference modules (model/state/tokenizer/
+                    # weight/cuda_graph); no references outside core
   kernel/           # weight-bound tilelang operator factories
-  model.py          # stateless RWKV7Model interface + text API
+  text_model.py     # RWKV7TextModel (exposed): composes a token model
+                    # (self.model) + tokenizer; tokenize/generate/chat
   rwkv7_tl.py       # tilelang fused model
   rwkv7_torch.py    # pure-PyTorch reference model
-  state.py          # State (save/load included)
-  tokenizer.py      # RWKV word tokenizer (vocab packaged inside the package)
+  asset/            # packaged data: vocab + chat template
 script/             # chat, benchmark, profiling scripts
+examples/           # runnable usage examples
 test/               # correctness and API tests
 docs/               # benchmark reports and tuning notes (Chinese)
 ```

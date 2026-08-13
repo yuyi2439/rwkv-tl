@@ -33,7 +33,7 @@ def model() -> rwkv_tl.RWKV7Torch:
 
 def test_encode_detokenize(model) -> None:
     text = "The meaning of life"
-    assert model.detokenize(model.encode(text)) == text
+    assert model.detokenize(model.tokenize(text)) == text
 
 
 def test_tune_state_and_logits(model) -> None:
@@ -46,7 +46,7 @@ def test_tune_state_and_logits(model) -> None:
 def test_generate_text_and_tokens(model) -> None:
     out = model.generate("The meaning of life is", max_tokens=2)
     assert isinstance(out, str) and len(out) > 0
-    ids = model.generate(model.encode("The meaning of life is"), max_tokens=2)
+    ids = model.generate(model.tokenize("The meaning of life is"), max_tokens=2)
     assert isinstance(ids, list) and all(isinstance(i, int) for i in ids)
 
 
@@ -54,6 +54,6 @@ def test_state_tune_save_load_attach(tmp_path, model) -> None:
     S = model.tune_state("You are a helpful assistant.")
     path = tmp_path / "tuned.pt"
     S.save(path)
-    loaded = rwkv_tl.State.load(path)
+    loaded = rwkv_tl.core.State.load(path)
     out = model.generate("Hi", state=loaded, max_tokens=2)
     assert isinstance(out, str)

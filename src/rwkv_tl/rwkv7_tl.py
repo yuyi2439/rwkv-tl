@@ -14,6 +14,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from rwkv_tl._compat import maybe_torch_compile
+from rwkv_tl.core.model import RWKV7Model
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7ATTWeight, RWKV7FFNWeight, RWKV7Weight
 from rwkv_tl.kernel import (
     cmix_decode_kernel,
     cmix_prefill_kernel,
@@ -21,9 +24,6 @@ from rwkv_tl.kernel import (
     tmix_decode_kernel,
     tmix_prefill_kernel,
 )
-from rwkv_tl.model import RWKV7Model
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7ATTWeight, RWKV7FFNWeight, RWKV7Weight
 
 
 def _dtype_s(dtype: torch.dtype) -> str:

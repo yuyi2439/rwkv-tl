@@ -8,8 +8,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rwkv_tl import make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 CKPT = sys.argv[1]
 which = sys.argv[2]  # bf16 | fp16 | faster3a

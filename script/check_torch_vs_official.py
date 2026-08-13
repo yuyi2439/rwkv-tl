@@ -49,7 +49,7 @@ def load_official(demo_path: Path, ckpt_path: str) -> tuple[object, object]:
         raise ValueError(f"unexpected rwkv_v7_demo.py layout in {demo_path}")
 
     head = head.replace("USE_CUDA_KERNEL = True", "USE_CUDA_KERNEL = False")
-    vocab_path = str(files("rwkv_tl").joinpath("rwkv_vocab_v20230424.txt"))
+    vocab_path = str(files("rwkv_tl").joinpath("asset", "rwkv_vocab_v20230424.txt"))
     head = head.replace(
         'RWKV_TOKENIZER("rwkv_vocab_v20230424.txt")',
         f"RWKV_TOKENIZER({vocab_path!r})",
@@ -146,7 +146,7 @@ def main() -> None:
         # Batched path: official GPT-mode over the whole sequence vs our
         # prefill(tokens[:-1]) + decode(last).
         for text in TEXTS:
-            tokens = model.encode(text)
+            tokens = model.tokenize(text)
             label = f"batched[{len(tokens):3d} tok]"
             ref = official(
                 torch.tensor(tokens, dtype=torch.long, device=args.device).unsqueeze(0)
@@ -155,7 +155,7 @@ def main() -> None:
             compare_logits(got, ref, label)
 
         # Decode path: official one token per fresh call vs our carried state.
-        tokens = model.encode(TEXTS[0])
+        tokens = model.tokenize(TEXTS[0])
         S = model.new_state()
         seq = torch.tensor(tokens, dtype=torch.long, device=args.device).unsqueeze(0)
         for i, t in enumerate(tokens):

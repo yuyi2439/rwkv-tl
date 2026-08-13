@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rwkv_tl import Tokenizer
+from rwkv_tl.core import Tokenizer
 
 
 def test_default_vocab_roundtrip() -> None:
@@ -16,9 +16,9 @@ def test_default_vocab_roundtrip() -> None:
 def test_explicit_vocab_path() -> None:
     from importlib.resources import files
 
-    from rwkv_tl.tokenizer import _DEFAULT_VOCAB
+    from rwkv_tl.core.tokenizer import _DEFAULT_VOCAB
 
-    vocab = files("rwkv_tl").joinpath(_DEFAULT_VOCAB)
+    vocab = files("rwkv_tl").joinpath("asset", _DEFAULT_VOCAB)
     with vocab.open("r", encoding="utf-8"):
         pass  # packaged file is readable
     tok = Tokenizer(vocab)

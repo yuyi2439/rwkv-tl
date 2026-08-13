@@ -18,8 +18,8 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from rwkv_tl import make_rwkv7
-from rwkv_tl.state import State
-from rwkv_tl.weight import RWKV7Weight
+from rwkv_tl.core.state import State
+from rwkv_tl.core.weight import RWKV7Weight
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH")
 T = 32

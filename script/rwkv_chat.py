@@ -19,6 +19,11 @@ def parse_args():
         help="Path to RWKV checkpoint (.pth)",
     )
     parser.add_argument(
+        "--system",
+        default="You are a helpful assistant.",
+        help="System prompt for the conversation",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=128,
@@ -54,7 +59,7 @@ def parse_args():
 def main():
     args = parse_args()
     model = rwkv_tl.rwkv7(args.checkpoint)
-    S = model.new_state()
+    messages = [{"role": "system", "content": args.system}]
 
     print("Simple RWKV chat. Empty input exits.")
     while True:
@@ -63,15 +68,16 @@ def main():
             print("Exit.")
             break
 
-        response = model.generate(
-            f"User: {text}\n\nAssistant: ",
-            S,
-            max_tokens=args.max_tokens,
+        messages.append({"role": "user", "content": text})
+        response = model.chat(
+            messages,
+            max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
         )
+        messages.append({"role": "assistant", "content": response})
 
         print("assistant:", response)
 
