@@ -131,7 +131,7 @@ decode:
 Decode and prefill use fused tilelang kernels with fp16 compute and fp32
 accumulation (DPLR state stays fp32), CUDA-Graph accelerated on CUDA by
 default. Current numbers vs the Albatross reference implementation are in
-`script/benchmark_rwkv7.md` and `docs/benchmarks/` (RTX 3060 / MX450).
+`docs/runs/rtx3060.md` (RTX 3060, the current target card).
 `script/bench_tl_vs_torch.py` measures tl vs pure-torch on CUDA (prefill
 sweep + decode), and `script/bench_tl_vs_fast.py` compares tl against the
 Albatross faster3a_2607 reference implementation.

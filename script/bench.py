@@ -12,7 +12,7 @@ from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
 CKPT = sys.argv[1]
-which = sys.argv[2]  # bf16 | mx450 | faster3a
+which = sys.argv[2]  # bf16 | fp16 | faster3a
 FAST = sys.argv[3] if len(sys.argv) > 3 else None
 dev = torch.device("cuda")
 
@@ -33,16 +33,16 @@ if which == "faster3a":
 else:
     if which == "bf16":
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.bfloat16)
-        cls = make_rwkv7(dev, backend="bf16")
+        cls = make_rwkv7(dev, backend="tl")
         label = "bf16+graph"
     elif which == "fp16":
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.float16)
-        cls = make_rwkv7(dev, backend="fp16")
+        cls = make_rwkv7(dev, backend="tl")
         label = "fp16-base+graph"
     else:
         w = RWKV7Weight(CKPT, device=dev, dtype=torch.float16)
-        cls = make_rwkv7(dev, backend="mx450")
-        label = "mx450+graph"
+        cls = make_rwkv7(dev, backend="tl")
+        label = "fp16+graph"
     model = cls(w, is_torch_compile=False)
 
 

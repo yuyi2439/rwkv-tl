@@ -5,8 +5,10 @@ Models are built with ``rwkv_tl.make_rwkv7(backend=...)`` (no bespoke builder
 functions) so every target goes through the same entry point:
 
 - faster3a_2607: Albatross CUDA implementation (external module).
-- tl-fp16: tilelang fp16 (``rwkv_tl.make_rwkv7(backend="fp16")``).
-- tl-bf16: tilelang bf16 (raw checkpoint dtype, ``backend="bf16"``).
+- tl-fp16: tilelang fp16 (``rwkv_tl.make_rwkv7(backend="tl")`` with fp16
+  weights).
+- tl-bf16: tilelang bf16 (backend ``"tl"`` with bf16 weights, keeping the raw
+  checkpoint dtype).
 - pure-torch: pure PyTorch baseline (``backend="torch"``; graph-wrapped on
   CUDA by default, eager reference available via ``use_graph=False``).
 
@@ -42,16 +44,14 @@ from rwkv_tl import RWKV7Model, make_rwkv7
 from rwkv_tl.state import State
 from rwkv_tl.weight import RWKV7Weight
 
-BACKEND_FOR_TARGET = {
-    "tl-fp16": "fp16",
-    "tl-bf16": "bf16",
-    "pure-torch": "torch",
-}
-
-DTYPE_FOR_TARGET = {
-    "tl-fp16": torch.float16,
-    "tl-bf16": torch.bfloat16,
-    "pure-torch": torch.float16,
+# Each project target selects a (backend, dtype) pair. The tilelang backend is
+# the same ("tl") for fp16/bf16; the target name only differs in weight dtype
+# (the old dtype-carrying backend names "fp16"/"bf16" were removed from
+# `rwkv_tl`).
+TARGET_SPEC = {
+    "tl-fp16": ("tl", torch.float16),
+    "tl-bf16": ("tl", torch.bfloat16),
+    "pure-torch": ("torch", torch.float16),
 }
 
 # Project targets gated against a matching-dtype pure-torch reference.
@@ -384,17 +384,17 @@ def run_benchmark(args):
                 )
                 device = torch.device("cuda")
                 gate_dtype: torch.dtype | None = None
-            elif target in BACKEND_FOR_TARGET:
+            elif target in TARGET_SPEC:
                 # One fresh weight per target, freed after the target's cases:
                 # only ONE weight copy is resident in VRAM at any time (MX450
                 # has 2GB and the correctness reference shares this same object).
-                dtype = DTYPE_FOR_TARGET[target]
+                backend_name, dtype = TARGET_SPEC[target]
                 w = RWKV7Weight(
                     str(args.project_checkpoint), device=rwkv_device, dtype=dtype
                 )
                 model_cls = make_rwkv7(
                     rwkv_device,
-                    backend=BACKEND_FOR_TARGET[target],
+                    backend=backend_name,
                 )
                 model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
@@ -460,7 +460,9 @@ def run_benchmark(args):
 
 def main():
     """主入口：解析参数并运行 benchmark。"""
-    default_vocab = str(REPO_ROOT / "asset" / "rwkv_vocab_v20230424.txt")
+    default_vocab = str(
+        REPO_ROOT / "src" / "rwkv_tl" / "rwkv_vocab_v20230424.txt"
+    )
     parser = argparse.ArgumentParser(
         description="Benchmark multiple RWKV7 implementations"
     )

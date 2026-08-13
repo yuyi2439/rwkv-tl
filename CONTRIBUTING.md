@@ -69,5 +69,5 @@ usage, `T.gemm` invocation, reduction idiom) over inventing a new pattern.
 - `script/check_torch_vs_official.py` cross-checks `RWKV7Torch` logits
   against the official RWKV-LM v7 demo (requires CUDA and a checkpoint).
 - `script/benchmark_rwkv7.py` for performance; results go in
-  `script/benchmark_rwkv7.md` (Chinese, report-style).
+  `docs/runs/rtx3060.md` (Chinese, report-style).
 - Long benchmarks must run as background processes writing to a log file.

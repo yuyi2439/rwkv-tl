@@ -28,16 +28,23 @@ the `docs-writer` skill; read it before updating this file.)
 - When a new benchmark or experiment note is added, make sure the relevant link and summary are also reflected here.
 - **Before cross-linking per-GPU docs, confirm the machines actually match.** A claim like "see the RTX 3060 record (same machine)" was wrong -- MX450 (laptop, 2GB) and RTX 3060 (desktop, 12GB) are different machines. Verify hardware before asserting a shared test record.
 
-## Management rules for benchmark_rwkv7.md
+## Management rules for benchmark records
 
-This file is the canonical benchmark report for this repository. Follow these rules strictly:
+Benchmark/test results are recorded in
+[docs/runs/rtx3060.md](docs/runs/rtx3060.md) (the old
+`script/benchmark_rwkv7.md` report and `docs/benchmarks/` were removed/merged
+into `docs/runs/`). Follow these rules strictly:
 
 - Keep it in Chinese.
-- Keep it concise and report-like. It should only contain the benchmark entry script, environment, measured results, and short explanations that directly interpret those results.
-- Do not put exploratory findings, long reasoning, speculative conclusions, or operational caveats in this file.
-- Put extra experimental findings in [docs/benchmarks/rtx3060.md](docs/benchmarks/rtx3060.md).
-- Put runtime warnings, environment constraints, and maintenance guidance in this file.
-- When a new benchmark run is added, update this report with the new numbers and keep the narrative short.
+- Keep it concise and report-like: benchmark entry script, environment,
+  measured results, and short explanations that directly interpret those
+  results.
+- Do not put exploratory findings, long reasoning, speculative conclusions, or
+  operational caveats in the run record.
+- Put runtime warnings, environment constraints, and maintenance guidance in
+  this file.
+- When a new benchmark/test run is completed, add the numbers to the run record
+  and keep the narrative short.
 
 ## Management rules for test validation records
 
@@ -57,11 +64,11 @@ This is a practical compromise: the benchmark report should stay easy to skim, w
 - When a new benchmark/test run is completed, record the results in the docs before moving on.
 - **A refactor (module rename/move, path changes) must update every affected
   reference in code docstrings and project docs (AGENTS.md, CONTRIBUTING.md,
-  `script/benchmark_rwkv7.md`, `docs/`). Do not leave old path/name references
-  behind just because the code still imports.** This is ordinary code hygiene,
-  not doc work -- fix it in the same pass as the rename, and grep for stale
-  names (e.g. the old `kernels/`/`operators` paths) after moving code.
-- Model checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var / `--project-checkpoint` flag (the run command in `script/benchmark_rwkv7.md` shows the exact names used); the directory is machine-specific. Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the originally-used model first, then the others; watch ou for OOM.
+  `docs/` 含 `docs/runs/`). Do not leave old path/name references behind just
+  because the code still imports.** This is ordinary code hygiene, not doc work
+  -- fix it in the same pass as the rename, and grep for stale names (e.g. the
+  old `kernels/`/`operators` paths) after moving code.
+- Model checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var / `--project-checkpoint` flag (the run command in `docs/runs/rtx3060.md` shows the exact names used); the directory is machine-specific. Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the originally-used model first, then the others; watch ou for OOM.
 - **Weights are never stored or duplicated above 16 bit/param.** No fp32
   weights, fp32 weight copies, or fp32-input GEMMs as a performance lever
   (2x weight VRAM). fp32 is allowed only for compute internals: fp32
@@ -153,10 +160,10 @@ These are firm, user-approved conventions. Follow them when adding or moving cod
   `torch.bfloat16` to keep the raw dtype). `State(..., dtype=...)` must match
   the model dtype. DPLR RNN state is always fp32 in both variants.
 - **`rwkv_tl.rwkv7` / `make_rwkv7` backends**: `"auto"` selects `RWKV7TL` on
-  CUDA and `RWKV7Torch` elsewhere; `"fp16"`/`"bf16"`/`"tl"`/`"tuned"`/
-  `"mx450"`/`"rtx3060"` select `RWKV7TL`; `"torch"` selects `RWKV7Torch`. The
-  per-device tuned variants were folded into `RWKV7TL` once the fp32-GEMM
-  cuBLAS workaround was dropped. `use_graph=True` (default) makes
+  CUDA and `RWKV7Torch` elsewhere; `"tl"` selects `RWKV7TL`; `"torch"` selects
+  `RWKV7Torch`. 特调变体（`tl-mx450`/`tl-rtx3060`/`tl-tuned`）和自带 dtype 的
+  backend 名（`"fp16"`/`"bf16"`）已于 2026-08-13 移除，不再可用；权重精度一律
+  由 `RWKV7Weight(dtype=...)` 控制，细节见 git 历史。`use_graph=True` (default) makes
   `rwkv7`/`make_rwkv7` wrap in `CUDAGraph` for every CUDA model, so `decode`
   and per-T `prefill` run from captured CUDA Graphs. `RWKV7Torch` updates its
   state in place, so it captures too; pass `use_graph=False` to keep a truly
@@ -217,11 +224,11 @@ new hard-won TileLang findings to the skill, not to AGENTS.md.
 
 ## Hardware note
 
-Validation completed on an RTX 3060 (sm_86, 12GB). MX450 (sm_75, 2GB) is now an
-ACTIVE optimization target (`tl-mx450`), not just historical: it is a Turing
-card with pathological fp16 cuBLAS GEMMs and severe thermal throttling under
-sustained load (latencies inflate up to ~50%, p90 >> p10) -- treat single-session
-relative comparisons as reliable, absolute numbers as noisy.
+Validation completed on an RTX 3060 (sm_86, 12GB). MX450 (sm_75, 2GB) 是旧参考
+GPU（per-device 特调变体 `tl-mx450` 已于 2026-08-13 移除，细节见 git 历史）：
+it is a Turing card with pathological fp16 cuBLAS GEMMs and severe thermal
+throttling under sustained load (latencies inflate up to ~50%, p90 >> p10) --
+treat single-session relative comparisons as reliable, absolute numbers as noisy.
 **MX450 (sm_75) has no bf16 tensor cores: do NOT test or benchmark bf16 here**
 (tilelang bf16 kernels can fail to compile/lower on this device, e.g.
 "Cannot find var remap for <buffer>" in `StorageLegalizer`). bf16 paths must be
@@ -241,8 +248,9 @@ kernel for the 3060 target.
 - Prefill path: batched GEMM instead of per-token GEMV where possible.
 - Keep correctness first: forward and prefill must use independent state objects in tests.
 - `prefill` is deliberately NOT torch.compile'd: each distinct prompt length recompiles a fresh graph (T=256 took ~12 min on 0.1B with the GPU idle) for a steady-state gain of only 1.11-1.43x. Keep it eager.
-- The benchmark harness (`benchmark_rwkv7.py`) builds rwkv_tl/pure_torch with `is_torch_compile=False` and routes them through `decode`/`prefill` (via `_eager_dispatch`) so a sweep measures the eager implementation and never triggers per-case torch.compile recompiles (which previously made it look frozen for minutes). The correctness gate is OFF by default (`--correctness-check` opt-in) to keep VRAM low on 2GB GPUs. The `graph_decoder` benchmark target was removed when CUDA-Graph moved into the tuned variants; the tuned targets (`tl-mx450`/`tl-rtx3060`/`tl-tuned`) now get graphs via the `CUDAGraph` wrapper.
-- MX450 tuning (0.1B) now partially beats the sm75-adapted faster3a_2607: a stable 8.2ms T=1 decode (CUDA Graph) and T>=16 prefill wins; faster3a still leads T=2/4/8. See `README.md`, `script/benchmark_rwkv7.md`, and the kernel-level analysis in `docs/benchmarks/mx450_sm75.md` (RTX 3060 experiments in `docs/benchmarks/rtx3060.md`).
+- The benchmark harness (`benchmark_rwkv7.py`) builds rwkv_tl/pure_torch with `is_torch_compile=False` and routes them through `decode`/`prefill` (via `_eager_dispatch`) so a sweep measures the eager implementation and never triggers per-case torch.compile recompiles (which previously made it look frozen for minutes). The correctness gate is OFF by default (`--correctness-check` opt-in) to keep VRAM low on 2GB GPUs. The `graph_decoder` benchmark target was removed when CUDA-Graph moved into the model wrapper; every tl target gets graphs via the `CUDAGraph` wrapper.
+- 历史：MX450 (sm_75) 上 0.1B prefill 曾全面领先 faster3a（特调变体已移除，
+  历史数据见 git 历史）。RTX 3060 实验记录在 `docs/runs/rtx3060.md`。
 
 ## Benchmarks
 
@@ -274,7 +282,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   baseline, remaining cost is the rank-out flat kernel). fp16 suite passes;
   greedy generate output unchanged. Remaining optimization (reported, not
   fixed): rank-out flat kernel -> packed GEMM (~4x). See
-  `docs/benchmarks/rtx3060.md` "fused prefill 接入（9e81fd1）".
+  `docs/runs/rtx3060.md` "fused prefill 接入（9e81fd1）".
 - **Project route assessment vs faster3a_2607 (2026-08-12).** After all the
   fused-prefill fixes and DPLR/rank optimizations this session, measured on
   RTX 3060 (T=1..512 sweep): **0.1B/0.4B prefill beats faster3a** (0.1B
@@ -292,7 +300,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   Conclusion: rwkv-tl cannot fully surpass faster3a on large models without
   hand-written CUDA kernels (contradicting the tilelang route) or the chunk-
   parallel DPLR (TODO #3). Small models are already competitive/ahead. Full
-  sweep and analysis: `docs/benchmarks/rtx3060.md` "三模型 vs faster3a 完整
+  sweep and analysis: `docs/runs/rtx3060.md` "三模型 vs faster3a 完整
   差距分析".
 - **sm_75 (MX450) sweep after the rank/DPLR optimizations (2026-08-12).** On
   this laptop 0.1B prefill is now fully ahead of faster3a: T=32 36.7 vs 49.0ms,
@@ -329,12 +337,24 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   (`8906c84`) keeps the double-buffer structure but falls back to synchronous
   int4 copies with `cp_wait`/`commit` as no-ops -- no real async overlap on
   sm_75 (why DPLR there can't benefit from the prefetch pattern).
-- **bf16 `tmix_decode` fails to compile on sm_86 (a8e2ef7).** `test_bf16_consistent`
-  errors with `Cannot find var remap for xr` in `unsupported_dtype_legalize.cc`.
-  Same error family as the MX450 sm_75 note below, but reproduced on RTX 3060
-  (sm_86), so it is a bug in the new `tmix_decode` bf16 path, not a hardware
-  limit. fp16 is unaffected (full suite minus bf16 passes). Reproduced by
-  `test_forward.py::test_bf16_consistent`.
+- **bf16 `tmix_decode` fails to compile on sm_86 (tilelang bug, upstream unfixed).**
+  `test_bf16_consistent` errors with `Cannot find var remap for xrkv` (old
+  reports said `xr`, before the r/k/v projections were batched) in
+  `unsupported_dtype_legalize.cc`. Root cause (2026-08-13, read from tilelang
+  source + repro attempts): sm_86 HAS native bf16, so the device side is fine;
+  the crash is in the HOST-side `BF16StorageLegalize` (runs unconditionally in
+  `host_codegen` because the host target is llvm and `CheckDataTypeSupport`
+  only accepts cuda targets). `HoistGlobalBufferAllocations` moves
+  `T.alloc_global` buffers (e.g. `xrkv`) into the host main block's
+  `alloc_buffers`; the pass only pre-registers function params / let/bind vars
+  in `var_remap_`, and the `AllocBuffer` visitor queries the map BEFORE its
+  force-remap fallback, so the host-side bf16 alloc throws. Not a rwkv-tl
+  logic bug, not a hardware limit; fp16 unaffected. **Decision (2026-08-13):
+  `test_bf16_consistent` is temporarily skipped (pytest.mark.skip) until
+  tilelang updates -- re-run it after any tilelang upgrade and remove the skip
+  when it passes.** Verify upstream status before re-enabling: as of
+  v0.1.13 / 2026-08-13 the only related fix is #19383 (target-less PrimFunc
+  bad-optional-access), which is a different bug.
 - **Decode regressed with the neo-kernel path (a8e2ef7).** Measured on RTX 3060
   / 0.1B: `tl-fp16` decode went 2.36ms (legacy per-op kernels + graph) to
   eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Root cause
@@ -348,7 +368,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
   at 14.8us each. The GEMV kernel itself is NOT slow (microbench ties
   cuBLAS). The `head @ ln_out` cuBLAS GEMV ([65536,C]) adds 0.3-0.8ms.
   Additionally `CUDAGraph.decode`'s per-token State copy-in/out (~36 tiny
-  `copy_`) makes graph slower than eager. See `docs/benchmarks/rtx3060.md`
+  `copy_`) makes graph slower than eager. See `docs/runs/rtx3060.md`
   "neo kernels 基线" analysis and TODO #1. **Partially fixed: the r/k/v
   projections are now one batched GEMV (see `gemv_batch_macro` and the
   stacked `rkvWt`); on MX450/0.4B decode 1x1 beats faster3a (~1.24x).**
@@ -358,7 +378,7 @@ On memory-constrained GPUs, split large sweeps into separate processes. A single
 - A token-shift aliasing bug existed in the old TMIX path. Any state update that overwrites previous state must happen only after all reads from the old state are complete.
 - The benchmark harness should skip per-case OOMs rather than abort the whole sweep.
 - DPLR A term must be the L2-normalized key (kk/||kk||), not raw kk. Passing raw kk silently corrupts the state update and destabilizes the recurrence (decode/prefill diverged ~14 in logits and argmax flipped). `fused_l2norm_neg_kk_a` returns `(kk_norm, B)` for this reason.
-- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/benchmarks/rtx3060.md for the RTX 3060 measurement that led to this decision).
+- `maybe_torch_compile` is a plain decorator (`@maybe_torch_compile`) applied to `decode`. Whether it compiles is decided per-instance via `self._is_torch_compile` (constructor param `is_torch_compile`); if False the method runs eagerly. When compiling, the first call caches the compiled callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`). The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see docs/runs/rtx3060.md for the RTX 3060 measurement that led to this decision).
 - The old `operator/` custom-op layer (`torch.ops.rwkv_tl.*`) is **deleted** (it wrapped the legacy per-op kernels). torch.compile of the fused decode path is not yet validated; if it graph-breaks, revisit after the fused kernels gain explicit autograd/`torch.library` support.
 - **Non-contiguous cuBLAS operands are ~2.7x slower on Turing.** A transposed
   weight view (`W.T`, strides `(1, N)`) passed straight to `matmul`/`bmm` runs
@@ -467,7 +487,7 @@ done yet. When working on the related area, remind the user whether to proceed.
 
 - Compiled-prefill perf and the `forward` `Tensor.item()` graph break were
   verified on the RTX 3060 and are documented in
-  `docs/benchmarks/rtx3060.md`. Compiled prefill was faster
+  `docs/runs/rtx3060.md`. Compiled prefill was faster
   (1.11-1.43x) but kept eager due to per-length recompile cost.
 
 ## Reference

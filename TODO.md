@@ -30,7 +30,7 @@ faster3a 用 `row1_exact4` 把 r/k/v 融合成 14.8us/kernel。修复方向：�
 合并成一个 batched GEMV kernel、减少单层 kernel 数、HEAD 专精（现在 `[65536,C]`
 cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State copy-in/out
 （36 次小 copy_）+ `.item()` 同步，另查。1.5B decode 18.93ms vs faster3a 7.91ms。
-详见 docs/benchmarks/rtx3060.md「neo kernels 基线」。
+详见 docs/runs/rtx3060.md「neo kernels 基线」。
 
 **进度（2026-08-12）**：r/k/v 已合并为单 batched GEMV（`gemv_batch_macro`）。
 **精确根因已定位**（读 faster3a `rwkv7_v3a_ops.cu`）：它的单行 GEMV
@@ -38,7 +38,7 @@ cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State c
 partial reduce（每 block 算 OutTile=2 输出），我们 `gemv_macro` 是 32 threads
 lane-per-output + K 标量串行读。1.5B 上 faster3a 41.7us/个 vs 我们 94-146us
 （链中膨胀）。修复方向：decode 单行 GEMV 重写为 faster3a 风格（128 threads +
-half2 向量化 + 多 warp reduce），见 docs/benchmarks/rtx3060.md 三模型差距分析。
+half2 向量化 + 多 warp reduce），见 docs/runs/rtx3060.md 三模型差距分析。
 
 ### #2 batch decode（B>1）
 
@@ -87,7 +87,7 @@ T=128 50.3→45.1ms）。**最终路线评估**：即使 DPLR + rank GEMM 全部
 输 faster3a 1.3-2.1x（decode 输在单行 GEMV 结构，prefill 输在 GEMM 规模 + 串行
 DPLR latency）。真 chunk 并行是唯一未试的路径，但 faster3a 本身也不是 chunk
 并行——它的优势是手写 CUDA kernel（cp.async、row1_exact、split-K）。详见
-docs/benchmarks/rtx3060.md 三模型差距分析。
+docs/runs/rtx3060.md 三模型差距分析。
 
 
 ### #4 1.5B 模型验证（RTX 3060）
@@ -102,7 +102,7 @@ L=24）已在本机 3060 加载成功（g1i 权重键结构与 g1d 一致，`RWK
 decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。
 **进度（2026-08-10）**：完整 benchmark 已补测（neo kernels 基线，a8e2ef7）：1.5B
 prefill T=8/32 快 faster3a ~2x，但 decode 1x1（18.93ms）与 T≥64 prefill 落后。
-详见 docs/benchmarks/rtx3060.md。
+详见 docs/runs/rtx3060.md。
 
 ## P2 — 训练路径
 

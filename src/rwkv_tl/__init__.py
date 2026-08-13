@@ -56,12 +56,12 @@ except PackageNotFoundError:  # pragma: no cover - package metadata unavailable
 def _resolve_cls(backend: str):
     if backend in ("auto",):
         return RWKV7TL if torch.cuda.is_available() else RWKV7Torch
-    if backend in ("tl", "fp16", "bf16", "tuned", "mx450", "rtx3060"):
+    if backend in ("tl",):
         return RWKV7TL
     if backend == "torch":
         return RWKV7Torch
     raise ValueError(
-        f"unknown backend {backend!r} (expected auto/tl/fp16/bf16/tuned/torch)"
+        f"unknown backend {backend!r} (expected auto/tl/torch)"
     )
 
 
@@ -82,16 +82,13 @@ def rwkv7(
         dtype: Weight precision (``torch.float16`` default; pass
             ``torch.bfloat16`` to keep the raw checkpoint dtype).
         backend: ``"auto"`` selects tilelang on CUDA and pure torch elsewhere;
-            ``"tl"``/``"fp16"``/``"bf16"`` force tilelang; ``"torch"`` forces
-            the pure-PyTorch reference.
+            ``"tl"`` forces tilelang; ``"torch"`` forces the pure-PyTorch
+            reference.
         use_graph: Wrap in CUDA-Graph acceleration when CUDA is available.
         **kwargs: Passed to the model constructor (e.g. ``is_torch_compile``,
             ``cmix_len_block``).
     """
     cls = _resolve_cls(backend)
-    if backend == "bf16" and dtype is torch.float16:
-        # backend="bf16" means keep the raw bf16 checkpoint weights.
-        dtype = torch.bfloat16
     model = cls(path_or_weight, device=device, dtype=dtype, **kwargs)
     if use_graph and torch.cuda.is_available() and model.w.device.type == "cuda":
         return CUDAGraph(model)
