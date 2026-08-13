@@ -28,7 +28,7 @@ A short guide for human contributors. For agent-specific operating rules, see
 TileLang kernels in this project fuse the elementwise chains and GEMM/GEMV steps
 of rwkv-tl. When you write or modify a kernel, **use the TileLang
 example suite as the primary reference** — the `examples/` directory of [tilelang](https://github.com/tile-ai/tilelang)
-is also checked out at `/home/yuyi2439/tilelang`:
+(set `TILELANG_SRC` to your tilelang checkout, or use a pip-installed copy):
 
 - `examples/gemm/` — `T.gemm`, autotune, persistent kernels, intrinsics.
 - `examples/gemv/` — GEMV tiling, relevant for decode-path kernels.

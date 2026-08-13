@@ -6,7 +6,8 @@ path (``USE_CUDA_KERNEL=False``) and compares logits with
 ``rwkv_tl.RWKV7Torch`` on the same checkpoint, for both the batched path and
 the per-token decode path:
 
-    python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth
+    python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth \
+        --fast-path /path/to/RWKV-LM/RWKV-v7/rwkv_v7_demo.py
 
 The official demo is a torch.jit.script (GPT-mode) model, so this script only
 imports the class definitions from it -- its module-level inference tail is
@@ -29,7 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import rwkv_tl
 
-DEFAULT_FAST_PATH = "/home/yuyi2439/rwkv/RWKV-LM/RWKV-v7/rwkv_v7_demo.py"
 MAX_ABS_TOL = 2.0  # fp16 op ordering differs between the two implementations
 
 TEXTS = [
@@ -127,8 +127,8 @@ def main() -> None:
     parser.add_argument(
         "--fast-path",
         type=Path,
-        default=Path(DEFAULT_FAST_PATH),
-        help="Path to the official rwkv_v7_demo.py",
+        required=True,
+        help="Path to the official rwkv_v7_demo.py (required)",
     )
     parser.add_argument(
         "--device", default="cuda", help="torch device for the comparison"

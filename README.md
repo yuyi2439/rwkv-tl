@@ -122,7 +122,8 @@ checkpoint — logits must agree on argmax and top-5 for batched and per-token
 decode:
 
 ```bash
-.venv/bin/python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth
+.venv/bin/python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth \
+  --fast-path /path/to/RWKV-LM/RWKV-v7/rwkv_v7_demo.py
 ```
 
 ## Performance

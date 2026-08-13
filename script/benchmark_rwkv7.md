@@ -6,8 +6,8 @@
 
 ```bash
 uv run python script/benchmark_rwkv7.py \
-  --project-checkpoint ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth \
-  --fast-script ~/rwkv/Albatross/faster3a_2607 \
+  --project-checkpoint <path-to-rwkv7-ckpt>.pth \
+  --fast-script <path-to-faster3a_2607-dir> \
   --device cuda \
   --targets faster3a_2607,tl-fp16,pure-torch \
   --cases 1x1,8x8,16x16
@@ -61,7 +61,7 @@ uv run python script/benchmark_rwkv7.py \
 
 ## tl vs 纯 torch（MX450，0.1B，fp16）
 
-> 复现：`python script/bench_tl_vs_torch.py ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth`
+> 复现：`python script/bench_tl_vs_torch.py <path-to-rwkv7-ckpt>.pth`
 > （warmup=2, median of 7；decode 为 64 步中位 per-token 耗时。三个变体同进程依次测量，
 > torch 先行、tl 随后，MX450 显存压力影响有限。）
 
@@ -81,7 +81,7 @@ T=32 的 graph 路径额外省 launch 开销（24.1 vs 38.1 ms）。
 
 ## 重构后 tl vs faster3a_2607（MX450，0.1B，fp16）
 
-> 复现：`python script/bench_tl_vs_fast.py ~/rwkv/rwkv7-g1d-0.1b-20260129-ctx8192.pth`
+> 复现：`python script/bench_tl_vs_fast.py <path-to-rwkv7-ckpt>.pth --fast-path <path-to-rwkv7_fast_v3a.py>`
 > （warmup=2, median of 7；decode 64 步中位 per-token。faster3a 为本地
 > `support/sm75` 适配分支，扩展已缓存；每 target 计时前先释放前一 target 权重，
 > 避免 2GB 显存压力。计时前同 prompt 对拍：max_abs=0.062，argmax/top-5 一致。）

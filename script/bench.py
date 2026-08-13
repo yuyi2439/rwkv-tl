@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/home/yuyi2439/rwkv/rwkv-tl")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rwkv_tl import make_rwkv7
 from rwkv_tl.state import State
@@ -13,7 +13,7 @@ from rwkv_tl.weight import RWKV7Weight
 
 CKPT = sys.argv[1]
 which = sys.argv[2]  # bf16 | mx450 | faster3a
-FAST = "/home/yuyi2439/rwkv/Albatross/faster3a_2607/rwkv7_fast_v3a.py"
+FAST = sys.argv[3] if len(sys.argv) > 3 else None
 dev = torch.device("cuda")
 
 
@@ -27,6 +27,7 @@ def load_fast(module_path: Path, model_path: str):
 
 
 if which == "faster3a":
+    assert FAST is not None, "usage: bench.py CKPT faster3a FAST_SCRIPT_PATH"
     model = load_fast(Path(FAST), CKPT)
     label = "faster3a_2607"
 else:

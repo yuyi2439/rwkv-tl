@@ -11,7 +11,8 @@ top-5 with a loose fp16 tolerance). Each target is released before the next
 is loaded, to keep MX450 (2GB) free of cross-target memory pressure.
 
 Usage:
-    python script/bench_tl_vs_fast.py /path/to/rwkv7-0.1b.pth
+    python script/bench_tl_vs_fast.py /path/to/rwkv7-0.1b.pth \
+        --fast-path /path/to/faster3a_2607/rwkv7_fast_v3a.py
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from rwkv_tl import RWKV7TL, CUDAGraph, RWKV7Weight, Tokenizer
 
-DEFAULT_FAST_PATH = "/home/yuyi2439/rwkv/Albatross/faster3a_2607/rwkv7_fast_v3a.py"
 PREFILL_TS = (1, 8, 16, 32, 64, 128, 256, 512)
 WARMUP = 2
 RUNS = 7
@@ -114,8 +114,8 @@ def main() -> None:
     parser.add_argument(
         "--fast-path",
         type=Path,
-        default=Path(DEFAULT_FAST_PATH),
-        help="Path to Albatross rwkv7_fast_v3a.py",
+        required=True,
+        help="Path to Albatross rwkv7_fast_v3a.py (required)",
     )
     args = parser.parse_args()
 
