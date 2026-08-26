@@ -24,7 +24,6 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from rwkv_tl.quant import QTensor
 from rwkv_tl.kernel import (
     cmix_decode_kernel,
     cmix_decode_q8_kernel,
@@ -33,6 +32,7 @@ from rwkv_tl.kernel import (
     tmix_decode_kernel,
     tmix_prefill_kernel,
 )
+from rwkv_tl.quant import QTensor
 
 # Big projection weights that may be quantized, per module.
 _TMIX_PROJ = ("rkvWt", "oWt")
@@ -184,7 +184,9 @@ class CmixOps:
             return cmix_prefill_kernel(self._C, self._DTYPE, self._cmix_len_block, **w)
         k = self._prefill.get(T_len)
         if k is None:
-            k = cmix_prefill_kernel(self._C, self._DTYPE, self._cmix_len_block, **self._w_fp16)
+            k = cmix_prefill_kernel(
+                self._C, self._DTYPE, self._cmix_len_block, **self._w_fp16
+            )
             self._prefill[T_len] = k
         return k
 
@@ -195,4 +197,4 @@ class CmixOps:
         return f"CmixOps(mode={self._mode!r})"
 
 
-__all__ = ["HeadOps", "TmixOps", "CmixOps"]
+__all__ = ["CmixOps", "HeadOps", "TmixOps"]

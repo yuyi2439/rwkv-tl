@@ -71,10 +71,9 @@ Attribution via single-layer tmix_decode_kernel probe + kernel-source dump
 - DPLR/DeltaLog: not worth porting (4.5% single-layer share, 1.4% whole
   decode; fp32 state removes the precision motive). Closed.
 - CUDAGraph decode: bare-model decode does only 2 DtoD copies/step (0.1%) --
-  the old "73 copies/step" premise was stale after v0.2. The wrapper's own
-  copy-in/out was removed by capturing against the caller's State and
-  snapshot/restore of the capture baseline (bitwise-equal to eager, fast
-  path on address match, copy fallback otherwise); the per-step
+  the old "73 copies/step" premise was stale after v0.2. The wrapper now owns
+  one internal State: calls passing `CUDAGraph.state` replay with zero state
+  copies, other States run eager (no copy bridge). The per-step
   `token.item()` host sync was dropped in the same change.
 
 ## Guidance

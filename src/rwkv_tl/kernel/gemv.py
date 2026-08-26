@@ -3,8 +3,8 @@
 import tilelang
 import tilelang.language as T
 
-from ._op import KernelOp
 from ._common import WARP
+from ._op import KernelOp
 
 
 def gemv_main_macro(M: int, K: int, DTYPE: str, THREADS: int = WARP):
@@ -386,7 +386,9 @@ def gemv_q8_macro(M: int, K: int, G: int, DTYPE: str, THREADS: int = WARP):
     return _impl
 
 
-def gemv_batch_q8_macro(M: int, K: int, B: int, G: int, DTYPE: str, THREADS: int = WARP):
+def gemv_batch_q8_macro(
+    M: int, K: int, B: int, G: int, DTYPE: str, THREADS: int = WARP
+):
     """W8A16 batched GEMV ``out[b,m] = sum_k x[b,k] * (Wq[b,k,m] * s[b,k//G,m])``."""
 
     assert M % THREADS == 0 and K % G == 0

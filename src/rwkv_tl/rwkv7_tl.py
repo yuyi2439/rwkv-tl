@@ -56,7 +56,9 @@ class RWKV7TL(RWKV7Model):
         self._head_ops = HeadOps(W.head, self._DTYPE)
         self._ln_out = ln_kernel(self.C, self._DTYPE, W.ln_out.w, W.ln_out.b)
         self._att = [TmixOps(b.att, self.C, self.H, self._DTYPE) for b in W.blocks]
-        self._ffn = [CmixOps(b.ffn, self.C, self._DTYPE, self._cmix_len_block) for b in W.blocks]
+        self._ffn = [
+            CmixOps(b.ffn, self.C, self._DTYPE, self._cmix_len_block) for b in W.blocks
+        ]
 
         if is_torch_compile and self.w.device.type == "cuda":
             # torch.compile traces decode on first call; compile the bound
@@ -100,7 +102,9 @@ class RWKV7TL(RWKV7Model):
                 if v_first is not None
                 else torch.zeros(T_len, self.C, device=x.device, dtype=x.dtype)
             )
-            x = self._att[i].prefill(T_len)(x, st["x"], st["rnn"], vf, 1 if v_first is None else 0)
+            x = self._att[i].prefill(T_len)(
+                x, st["x"], st["rnn"], vf, 1 if v_first is None else 0
+            )
             v_first = vf
 
             pad = (-T_len) % self._cmix_len_block

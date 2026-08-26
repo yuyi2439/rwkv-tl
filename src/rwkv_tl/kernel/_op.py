@@ -1,4 +1,5 @@
 """KernelOp: a tilelang kernel with its weights bound at construction."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence

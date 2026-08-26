@@ -16,7 +16,7 @@ import argparse
 
 import torch
 
-from rwkv_tl.quant import DEFAULT_GROUP, QTensor, quant_error, quantize
+from rwkv_tl.quant import DEFAULT_GROUP, quant_error, quantize
 
 # Suffixes of 2D projection weights worth quantizing (att r/k/v/o + ffn k/v).
 _QUANT_SUFFIXES = (
@@ -57,9 +57,9 @@ def main() -> None:
         bytes_before += b0
         bytes_after += b1
         print(
-            f"{k:42s} {str(tuple(v.shape)):14s} -> int8 g={args.group} "
+            f"{k:42s} {tuple(v.shape)!s:14s} -> int8 g={args.group} "
             f"rel={err['rel']:.4%} cos={err['cos']:.6f} "
-            f"{b0/1e6:.1f}MB->{b1/1e6:.1f}MB"
+            f"{b0 / 1e6:.1f}MB->{b1 / 1e6:.1f}MB"
         )
     for v in W.values():
         if isinstance(v, torch.Tensor):
@@ -68,7 +68,7 @@ def main() -> None:
     torch.save(W, args.out)
     print(
         f"\nquantized {n_q} tensors "
-        f"({bytes_before/1e6:.0f}MB -> {bytes_after/1e6:.0f}MB, "
+        f"({bytes_before / 1e6:.0f}MB -> {bytes_after / 1e6:.0f}MB, "
         f"{(1 - bytes_after / bytes_before) * 100:.0f}% saved), "
         f"{n_keep} fp16 tensors kept -> {args.out}"
     )

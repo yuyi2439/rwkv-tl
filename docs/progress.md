@@ -8,12 +8,13 @@
 
 - 0.2 API 重构完成。
 - w 衰减对齐 Albatross（delta = w-1 存储，S + S*delta 更新）。
-- CUDAGraph decode zero-copy fast-path：capture 绑定调用方 State 地址 +
-  snapshot/restore 基线，去掉每步 `token.item()` 同步，逐位验证等价。
+- CUDAGraph 重构为 stateful 单例设计：wrapper 拥有唯一的内部 State
+  （`model.state`），只有传入它的调用走 graph replay（零状态拷贝），
+  其他 State 直接走 eager；去掉每步 `token.item()` 同步。
 
 ### 2026-08-26 · W8A16 量化落地
 
-- QTensor（W8A16：int8 权重 + fp16 per-group G 缩放、非对称）+ 离线量化器
+- QTensor（W8A16：int8 权重 + fp16 per-group G 缩放、对称）+ 离线量化器
   `script/quantize.py`，量化 checkpoint 由 RWKV7Weight 透明加载。
 - head 投影换 W8A16 手写 GEMV：1.96x vs torch.mv，端到端 decode -15%。
 - 权重-算子静态路由：`HeadOps/TmixOps/CmixOps`（kernel/ops.py），按权重类型

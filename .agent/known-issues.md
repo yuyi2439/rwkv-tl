@@ -107,8 +107,11 @@ removed from `docs/` on 2026-08-20).
   at 14.8us each. The GEMV kernel itself is NOT slow (microbench ties
   cuBLAS). The `head @ ln_out` cuBLAS GEMV ([65536,C]) adds 0.3-0.8ms.
   Additionally `CUDAGraph.decode`'s per-token State copy-in/out (~36 tiny
-  `copy_`) makes graph slower than eager. See the decode findings in
-  `.agent/performance.md` (closed roads section in TODO.md). **Partially fixed: the r/k/v
+  `copy_`) made graph slower than eager. **Fixed by the stateful-singleton
+  redesign**: the wrapper owns one internal State and replays with zero state
+  copies for calls that pass it; foreign States run eager. See the decode
+  findings in `.agent/performance.md` (closed roads in docs/progress.md).
+  **Partially fixed: the r/k/v
   projections are now one batched GEMV (see `gemv_batch_macro` and the
   stacked `rkvWt`); on MX450/0.4B decode 1x1 beats faster3a (~1.24x).**
   The remaining decode gap on 1.5B is the single-row GEMV structure itself
@@ -151,8 +154,9 @@ removed from `docs/` on 2026-08-20).
   1024; `None` = no cap).** Small-T prefill is launch-bound (a constant
   ~2175 kernels regardless of T), and `CUDAGraph` (rwkv_tl/cuda_graph.py)
   captures the whole prefill per exact T (no padding -- the DPLR recurrence
-  advances state per token), replaying with a State copy-in/out so the model
-  stays stateless. Graph beats eager at EVERY T, not just small T: measured
+  advances state per token), replaying against its own internal State so no
+  copy-in/out is needed (calls passing other States run eager). Graph beats
+  eager at EVERY T, not just small T: measured
   on RTX 3060 / 0.1B, T=128 graph 5.15 vs eager 23.06ms, T=256 (16x16) graph
   9.22ms, T=1024 graph 32.27ms (all ~4x faster than eager). The old `T<=64`
   cap was wrong (it made T=128 prefill 17.7ms, slower than faster3a's 7.6ms);

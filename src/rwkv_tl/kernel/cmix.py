@@ -5,6 +5,7 @@ import tilelang.language as T
 
 from ._op import KernelOp, require_bind
 
+
 def _fp16(x):
     """Bridge: a QTensor weight binds as its dequantized fp16 form.
 
@@ -14,6 +15,7 @@ def _fp16(x):
     from rwkv_tl.quant import QTensor
 
     return x.dequant() if isinstance(x, QTensor) else x
+
 
 from ._common import WARP
 from .gemv import gemv_main_macro

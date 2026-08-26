@@ -89,9 +89,13 @@ wrapped). `backend` is REQUIRED: `"tl"` (tilelang, CUDA) or `"torch"`
 - Capture is lazy (T=1 decode; per-T prefill up to `prefill_graph_max_t`,
   default 1024); capture requires in-place `state["x"]` updates (`copy_`,
   not rebind); larger T and capture failures fall back to eager.
-- The wrapper copies the caller's `State` in/out around each replay, so any
-  `State` works and the model stays stateless. `RWKV7TextModel.model` is a
-  plain `RWKV7Model` and does not care whether it is graph-wrapped.
+- The wrapper is STATEFUL BY DESIGN: it owns exactly one internal `State`
+  (`CUDAGraph.state`). Only calls passing that State get graph replay (zero
+  state copies); any other `State` runs the wrapped model eagerly -- there is
+  deliberately no copy-in/out bridge (routing foreign states through one
+  graph is an aliasing hazard). Backends stay stateless and shareable; the
+  graph wrapper is the one stateful singleton on top. `RWKV7TextModel.model`
+  does not care whether it is graph-wrapped.
 - CUDA-Graph is inference-only: replay does not build an autograd graph (see
   the training section below).
 
@@ -107,8 +111,8 @@ All new operators/optimizations must keep autograd compatibility in mind:
   autograd graph (replay does not record gradients, fixed buffers conflict
   with autograd's dynamic graph). Do not route anything training-relevant
   through it. `rwkv7_model(..., use_graph=True)` / `rwkv7(...)` (default)
-  integrate it as the `decode`/`prefill` path via a stateless copy-in/out
-  around a fixed shadow state.
+  integrate it as the `decode`/`prefill` path via its own internal State:
+  calls passing `CUDAGraph.state` replay the graph, others run eager.
 - A fully-fused single kernel is NOT inherently inference-only (unlike CUDA
   Graph) -- any custom CUDA kernel, fused or not, needs an explicit backward
   to support training. But fusing a whole layer makes training hard: you must

@@ -29,13 +29,13 @@ from .cmix import (
 from .gemv import (
     gemv_batch_jit,
     gemv_batch_kernel,
-    gemv_q8_kernel,
     gemv_batch_macro,
     gemv_batch_T_macro,
     gemv_jit,
     gemv_kernel,
     gemv_macro,
     gemv_main_macro,
+    gemv_q8_kernel,
 )
 from .ln import (
     ln_jit,
@@ -62,6 +62,7 @@ __all__ = [
     "gemv_kernel",
     "gemv_macro",
     "gemv_main_macro",
+    "gemv_q8_kernel",
     "ln_jit",
     "ln_kernel",
     "ln_per_row_jit",
