@@ -21,5 +21,5 @@ def test_explicit_vocab_path() -> None:
     vocab = files("rwkv_tl").joinpath("asset", _DEFAULT_VOCAB)
     with vocab.open("r", encoding="utf-8"):
         pass  # packaged file is readable
-    tok = Tokenizer(vocab)
+    tok = Tokenizer(str(vocab))
     assert tok.decode(tok.encode("OK")) == "OK"

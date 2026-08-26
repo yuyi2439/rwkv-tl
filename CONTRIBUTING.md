@@ -64,6 +64,25 @@ usage, `T.gemm` invocation, reduction idiom) over inventing a new pattern.
   fp32 accumulation with bf16 writeback is acceptable (efficiency over
   bit-exactness, per AGENTS.md).
 
+## Building models
+
+The library is decoupled: create the weight, build the model, then wrap the
+text layer (nothing is auto-detected; `backend` is always explicit):
+
+```python
+import rwkv_tl
+from rwkv_tl.core import RWKV7Weight
+
+w = RWKV7Weight("model.pth", device="cuda")   # weight; device/dtype fixed here
+model = rwkv_tl.rwkv7_model(w, backend="tl")  # token-level RWKV7Model (CUDA-Graph by default)
+text = rwkv_tl.RWKV7TextModel(model)          # text-level API
+# or the one-call form:
+text = rwkv_tl.rwkv7(w, backend="tl")
+```
+
+`backend` is `"tl"` (tilelang, CUDA) or `"torch"` (pure-PyTorch,
+CPU-capable); `use_graph=False` disables CUDA-Graph wrapping.
+
 ## Tests and benchmarks
 
 - Code style: the project uses [ruff](https://docs.astral.sh/ruff/) — run
@@ -71,8 +90,14 @@ usage, `T.gemm` invocation, reduction idiom) over inventing a new pattern.
   submitting changes.
 - `pytest test/` for correctness (kernel bit-exactness, forward consistency,
   user API). CPU-only tests cover the text API via the pure-torch backend.
-- `script/check_torch_vs_official.py` cross-checks `RWKV7Torch` logits
-  against the official RWKV-LM v7 demo (requires CUDA and a checkpoint).
-- `script/benchmark_rwkv7.py` for performance; results go in
-  `docs/runs/rtx3060.md` (Chinese, report-style).
+- `script/benchmark_rwkv7.py` for performance measurements; raw benchmark
+  tables are not kept under `docs/`. Every rwkv_tl target is built through
+  `rwkv7_model(w, backend=...)` with `is_torch_compile=False` and measured on
+  `decode`/`prefill` directly, so a sweep measures the eager implementation
+  and never triggers per-case torch.compile recompiles (which can look frozen
+  for minutes). CUDA-Graph wrapping is on by default (`use_graph=True`);
+  pass `use_graph=False` for the eager reference. The correctness gate is
+  opt-in (`--correctness-check`) to keep VRAM low on 2GB GPUs. On
+  memory-constrained GPUs, split large sweeps into separate processes (a
+  single process can accumulate compile-cache pressure and trigger OOMs).
 - Long benchmarks must run as background processes writing to a log file.

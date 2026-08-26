@@ -3,7 +3,7 @@
 import tilelang
 import tilelang.language as T
 
-from ._bound import BoundKernel
+from ._op import KernelOp
 from ._common import WARP
 
 
@@ -254,7 +254,7 @@ def gemv_kernel(M: int, K: int, DTYPE: str, W):
     ``W`` is the project's row-major ``[K, M]`` layout (``x @ W``); it is
     captured at construction.
     """
-    return BoundKernel(
+    return KernelOp(
         gemv_jit,
         (M, K, DTYPE),
         bind={"W": W},
@@ -265,10 +265,152 @@ def gemv_kernel(M: int, K: int, DTYPE: str, W):
 
 def gemv_batch_kernel(M: int, K: int, B: int, DTYPE: str, W):
     """Bound batched GEMV (see ``gemv_kernel``); ``W`` is ``[B, K, M]``."""
-    return BoundKernel(
+    return KernelOp(
         gemv_batch_jit,
         (M, K, B, DTYPE),
         bind={"W": W},
         call=("x",),
         name="gemv_batch_kernel",
     )
+
+
+@tilelang.jit(out_idx=[3])
+def gemv_q8_jit(M: int, K: int, G: int, DTYPE: str, THREADS: int = 64):
+    """W8A16 GEMV: ``out = x @ dequant(Wq, s)``.
+
+    Each lane owns 4 consecutive int8 columns, so a warp reads a full
+    128-byte sector per reduction step (vs 32B with one column per lane).
+
+    Args:
+        M: Output length (columns of ``Wq``); multiple of ``THREADS * 4``.
+        K: Reduction length; multiple of ``G``.
+        G: Quantization group size along K.
+        DTYPE: Activation/output element type.
+        THREADS: Threads per block.
+    """
+    VEC = 4
+
+    @T.prim_func
+    def _impl(
+        x: T.Tensor((K,), DTYPE),
+        Wq: T.Tensor((K, M), "int8"),
+        s: T.Tensor((K // G, M), "float16"),
+        out: T.Tensor((M,), DTYPE),
+    ):
+        with T.Kernel(M // (THREADS * VEC), threads=THREADS) as bx:
+            acc = T.alloc_fragment((THREADS * VEC,), "float32")
+            T.clear(acc)
+            for k in T.serial(K):
+                for i in T.Parallel(THREADS * VEC):
+                    col = bx * THREADS * VEC + i
+                    acc[i] += T.cast(x[k], "float32") * (
+                        T.cast(Wq[k, col], "float32")
+                        * T.cast(s[k // G, col], "float32")
+                    )
+            for i in T.Parallel(THREADS * VEC):
+                out[bx * THREADS * VEC + i] = T.cast(acc[i], DTYPE)
+
+    return _impl
+
+
+def gemv_q8_kernel(M: int, K: int, G: int, DTYPE: str, Wq, s):
+    """Bound W8A16 GEMV (see ``gemv_q8_jit``); weights captured at construction.
+
+    ``Wq`` is the int8 payload ``[K, M]`` and ``s`` the fp16 scales
+    ``[K // G, M]`` (per-group, per-column) of a ``QTensor``.
+    """
+    return KernelOp(
+        gemv_q8_jit,
+        (M, K, G, DTYPE),
+        bind={"Wq": Wq, "s": s},
+        call=("x",),
+        name="gemv_q8_kernel",
+    )
+
+
+# --- W8A16 (int8 weight + fp16 scale) GEMV macros ---------------------------
+# Lane-per-output copies of the fp16 macros above: each reads the int8 payload
+# ``Wq`` and dequantizes against the per-group-per-column fp16 scale ``s``.
+# These exist so a fused decode kernel can keep its layer weight int8-resident
+# (VRAM) while still dequantizing per access; they mirror the fp16 grid layout
+# exactly (no speed change expected -- the decode GEMVs are occupancy-bound).
+
+
+def gemv_main_q8_macro(M: int, K: int, G: int, DTYPE: str, THREADS: int = WARP):
+    """W8A16 ``acc[i] = sum_k x[k] * (Wq[k,col] * s[k//G,col])``; returns acc.
+
+    fp32-accumulating lane-per-output reduction mirroring ``gemv_main_macro``,
+    consumed by callers that fuse an epilogue (e.g. cmix relusq).
+    """
+    assert M % THREADS == 0 and K % G == 0
+
+    @T.macro
+    def _impl(
+        bx,
+        x: T.Tensor((K,), DTYPE),
+        Wq: T.Tensor((K, M), "int8"),
+        s: T.Tensor((K // G, M), "float16"),
+    ):
+        acc = T.alloc_fragment((THREADS,), "float32")
+        T.clear(acc)
+        for k in T.serial(K):
+            for i in T.Parallel(THREADS):
+                col = bx * THREADS + i
+                acc[i] += T.cast(x[k], "float32") * (
+                    T.cast(Wq[k, col], "float32") * T.cast(s[k // G, col], "float32")
+                )
+        return acc
+
+    return _impl
+
+
+def gemv_q8_macro(M: int, K: int, G: int, DTYPE: str, THREADS: int = WARP):
+    """W8A16 GEMV store wrapper over ``gemv_main_q8_macro``."""
+
+    main = gemv_main_q8_macro(M, K, G, DTYPE, THREADS)
+
+    @T.macro
+    def _impl(
+        bx,
+        x: T.Tensor((K,), DTYPE),
+        Wq: T.Tensor((K, M), "int8"),
+        s: T.Tensor((K // G, M), "float16"),
+        *,
+        out: T.Tensor((M,), DTYPE),
+    ):
+        acc = main(bx, x, Wq, s)
+        for i in T.Parallel(THREADS):
+            idx = bx * THREADS + i
+            out[idx] = T.cast(acc[i], DTYPE)
+
+    return _impl
+
+
+def gemv_batch_q8_macro(M: int, K: int, B: int, G: int, DTYPE: str, THREADS: int = WARP):
+    """W8A16 batched GEMV ``out[b,m] = sum_k x[b,k] * (Wq[b,k,m] * s[b,k//G,m])``."""
+
+    assert M % THREADS == 0 and K % G == 0
+
+    @T.macro
+    def _impl(
+        bx,
+        bz,
+        x: T.Tensor((B, K), DTYPE),
+        Wq: T.Tensor((B, K, M), "int8"),
+        s: T.Tensor((B, K // G, M), "float16"),
+        *,
+        out: T.Tensor((B, M), DTYPE),
+    ):
+        acc = T.alloc_fragment((THREADS,), "float32")
+        T.clear(acc)
+        for k in T.serial(K):
+            for i in T.Parallel(THREADS):
+                col = bx * THREADS + i
+                acc[i] += T.cast(x[bz, k], "float32") * (
+                    T.cast(Wq[bz, k, col], "float32")
+                    * T.cast(s[bz, k // G, col], "float32")
+                )
+        for i in T.Parallel(THREADS):
+            out[bz, bx * THREADS + i] = T.cast(acc[i], DTYPE)
+
+    return _impl

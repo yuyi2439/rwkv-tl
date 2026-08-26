@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Benchmark multiple RWKV7 implementations through a shared driver.
 
-Models are built with ``rwkv_tl.make_rwkv7(backend=...)`` (no bespoke builder
-functions) so every target goes through the same entry point:
+Models are built with ``rwkv_tl.rwkv7_model(w, backend=...)`` (no bespoke
+builder functions) so every target goes through the same entry point:
 
 - faster3a_2607: Albatross CUDA implementation (external module).
-- tl-fp16: tilelang fp16 (``rwkv_tl.make_rwkv7(backend="tl")`` with fp16
+- tl-fp16: tilelang fp16 (``rwkv_tl.rwkv7_model(w, backend="tl")`` with fp16
   weights).
 - tl-bf16: tilelang bf16 (backend ``"tl"`` with bf16 weights, keeping the raw
   checkpoint dtype).
@@ -40,7 +40,7 @@ for path in (SCRIPT_ROOT, SRC_ROOT := REPO_ROOT / "src", REPO_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from rwkv_tl import make_rwkv7
+from rwkv_tl import rwkv7_model
 from rwkv_tl.core import RWKV7Model
 from rwkv_tl.core.state import State
 from rwkv_tl.core.weight import RWKV7Weight
@@ -393,11 +393,9 @@ def run_benchmark(args):
                 w = RWKV7Weight(
                     str(args.project_checkpoint), device=rwkv_device, dtype=dtype
                 )
-                model_cls = make_rwkv7(
-                    rwkv_device,
-                    backend=backend_name,
+                model = rwkv7_model(
+                    w, backend=backend_name, is_torch_compile=args.compile
                 )
-                model = model_cls(w, is_torch_compile=args.compile)
                 device = rwkv_device
                 gate_dtype = dtype
             else:
@@ -409,8 +407,9 @@ def run_benchmark(args):
             # faster3a_2607 is not gated.
             if args.correctness_check and target in GATED_TARGETS:
                 assert w is not None and gate_dtype is not None
-                ref_cls = make_rwkv7(rwkv_device, backend="torch", use_graph=False)
-                reference = ref_cls(w, is_torch_compile=False)  # type: ignore[call-arg]
+                reference = rwkv7_model(
+                    w, backend="torch", use_graph=False, is_torch_compile=False
+                )
 
             for B, T in parsed_cases:
                 try:

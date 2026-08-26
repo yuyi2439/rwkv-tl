@@ -1,4 +1,4 @@
-"""Numerical correctness of the neo TMIX decode kernel.
+"""Numerical correctness of the fused TMIX decode kernel.
 
 Compares ``tmix_decode`` (single-token fused time-mix) against the pure-torch
 reference ``rwkv7_torch.time_mix``. Requires ``RWKV_CHECKPOINT_PATH``.
@@ -12,10 +12,10 @@ import os
 import pytest
 import torch
 
-from rwkv_tl.kernel.tmix import tmix_decode
-from rwkv_tl.rwkv7_torch import time_mix as time_mix_ref
 from rwkv_tl.core.state import State
 from rwkv_tl.core.weight import RWKV7Weight
+from rwkv_tl.kernel.tmix import tmix_decode
+from rwkv_tl.rwkv7_torch import time_mix as time_mix_ref
 
 CKPT = os.environ.get("RWKV_CHECKPOINT_PATH")
 if not CKPT:
@@ -27,6 +27,7 @@ RNN_TOL = 0.05
 
 @pytest.fixture(scope="module")
 def model():
+    assert CKPT is not None
     return RWKV7Weight(CKPT, dtype=torch.float16)
 
 

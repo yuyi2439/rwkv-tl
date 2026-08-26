@@ -201,22 +201,16 @@ class RWKV7Torch(RWKV7Model):
     """Pure PyTorch RWKV7 baseline without fused custom kernels.
 
     State is passed in and out explicitly (``State``), so the instance itself
-    is stateless. Accepts a checkpoint path or an ``RWKV7Weight``.
+    is stateless. Takes an already-loaded ``RWKV7Weight`` (same declaration
+    as ``RWKV7Model``).
     """
 
     def __init__(
         self,
-        path_or_weight: str | RWKV7Weight,
+        w: RWKV7Weight,
         *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.float16,
         is_torch_compile: bool = False,
     ) -> None:
-        w = (
-            path_or_weight
-            if isinstance(path_or_weight, RWKV7Weight)
-            else RWKV7Weight(path_or_weight, device=device, dtype=dtype)
-        )
         super().__init__(w)
         self._is_torch_compile = is_torch_compile
 

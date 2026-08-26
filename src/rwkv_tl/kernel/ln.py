@@ -3,7 +3,7 @@
 import tilelang
 import tilelang.language as T
 
-from ._bound import BoundKernel
+from ._op import KernelOp
 
 _LN_EPS = 1e-5
 
@@ -138,7 +138,7 @@ def ln_kernel(C: int, DTYPE: str, W, B):
     ``ln = ln_kernel(C, DTYPE, W, B)`` then ``y = ln(x)`` returns
     ``LN(x; W, B)`` with the weights captured at construction.
     """
-    return BoundKernel(
+    return KernelOp(
         ln_jit,
         (C, DTYPE),
         bind={"W": W, "B": B},
@@ -149,7 +149,7 @@ def ln_kernel(C: int, DTYPE: str, W, B):
 
 def ln_per_row_kernel(LEN: int, C: int, DTYPE: str, W, B):
     """Bound per-row LayerNorm over ``[LEN, C]`` rows (see ``ln_kernel``)."""
-    return BoundKernel(
+    return KernelOp(
         ln_per_row_jit,
         (LEN, C, DTYPE),
         bind={"W": W, "B": B},

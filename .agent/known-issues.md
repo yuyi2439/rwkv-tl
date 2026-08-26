@@ -2,7 +2,8 @@
 
 Read this before touching code with known bugs/regressions, or before
 re-enabling a skipped test. Historical analysis lives here; the authoritative
-numbers are in `docs/runs/rtx3060.md`.
+performance conclusions are in `.agent/performance.md` (raw run records were
+removed from `docs/` on 2026-08-20).
 
 - **Fused prefill (9e81fd1) regressed on sm_86, now FIXED (3d05ebd, 493e3e6).**
   The fused prefill front/back (commit 9e81fd1) was tuned on MX450 (2.1x) but
@@ -19,8 +20,8 @@ numbers are in `docs/runs/rtx3060.md`.
   (vs the 9e81fd1 regression of 30.3/114.8/386.5ms; still ~2x the a8e2ef7
   baseline, remaining cost is the rank-out flat kernel). fp16 suite passes;
   greedy generate output unchanged. Remaining optimization (reported, not
-  fixed): rank-out flat kernel -> packed GEMM (~4x). See
-  `docs/runs/rtx3060.md` "fused prefill 接入（9e81fd1）".
+  fixed): rank-out flat kernel -> packed GEMM (~4x). Preserved conclusions:
+  `.agent/performance.md`.
 - **Project route assessment vs faster3a_2607 (2026-08-12).** After all the
   fused-prefill fixes and DPLR/rank optimizations this session, measured on
   RTX 3060 (T=1..512 sweep): **0.1B/0.4B prefill beats faster3a** (0.1B
@@ -38,8 +39,8 @@ numbers are in `docs/runs/rtx3060.md`.
   Conclusion: rwkv-tl cannot fully surpass faster3a on large models without
   hand-written CUDA kernels (contradicting the tilelang route) or the chunk-
   parallel DPLR (TODO #3). Small models are already competitive/ahead. Full
-  sweep and analysis: `docs/runs/rtx3060.md` "三模型 vs faster3a 完整
-  差距分析".
+  sweep and analysis (raw numbers removed 2026-08-20):
+  `.agent/performance.md`.
 - **sm_75 (MX450) sweep after the rank/DPLR optimizations (2026-08-12).** On
   this laptop 0.1B prefill is now fully ahead of faster3a: T=32 36.7 vs 49.0ms,
   T=128 56.2 vs 87.3ms (halved from 111ms after 9e81fd1), T=512 193 vs 256ms,
@@ -93,7 +94,7 @@ numbers are in `docs/runs/rtx3060.md`.
   when it passes.** Verify upstream status before re-enabling: as of
   v0.1.13 / 2026-08-13 the only related fix is #19383 (target-less PrimFunc
   bad-optional-access), which is a different bug.
-- **Decode regressed with the neo-kernel path (a8e2ef7).** Measured on RTX
+- **Decode regressed with the fused-kernel path (a8e2ef7).** Measured on RTX
   3060 / 0.1B: `tl-fp16` decode went 2.36ms (legacy per-op kernels + graph) to
   eager 3.44ms / graph 4.15ms -- graph is now *slower* than eager. Root cause
   (2026-08-10 profiling): `tmix_decode` launches ~11 sequential kernels per
@@ -106,8 +107,8 @@ numbers are in `docs/runs/rtx3060.md`.
   at 14.8us each. The GEMV kernel itself is NOT slow (microbench ties
   cuBLAS). The `head @ ln_out` cuBLAS GEMV ([65536,C]) adds 0.3-0.8ms.
   Additionally `CUDAGraph.decode`'s per-token State copy-in/out (~36 tiny
-  `copy_`) makes graph slower than eager. See `docs/runs/rtx3060.md`
-  "neo kernels 基线" analysis and TODO #1. **Partially fixed: the r/k/v
+  `copy_`) makes graph slower than eager. See the decode findings in
+  `.agent/performance.md` (closed roads section in TODO.md). **Partially fixed: the r/k/v
   projections are now one batched GEMV (see `gemv_batch_macro` and the
   stacked `rkvWt`); on MX450/0.4B decode 1x1 beats faster3a (~1.24x).**
   The remaining decode gap on 1.5B is the single-row GEMV structure itself
@@ -128,8 +129,8 @@ numbers are in `docs/runs/rtx3060.md`.
   the method runs eagerly. When compiling, the first call caches the compiled
   callable under `self._{fn.__name__}_impl` (i.e. `decode` -> `_decode_impl`).
   The prefill path (`prefill`) is NOT compiled and keeps raw kernels (see
-  `docs/runs/rtx3060.md` for the RTX 3060 measurement that led to this
-  decision).
+  `.agent/performance.md` for the RTX 3060 measurement that led to this
+  decision; raw numbers removed 2026-08-20).
 - The old `operator/` custom-op layer (`torch.ops.rwkv_tl.*`) is **deleted**
   (it wrapped the legacy per-op kernels). torch.compile of the fused decode
   path is not yet validated; if it graph-breaks, revisit after the fused

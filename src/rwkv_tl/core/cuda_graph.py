@@ -12,10 +12,12 @@ Usage::
 
 Capture is lazy (on first call) and per exact prefill length ``T`` up to
 ``prefill_graph_max_t`` (larger ``T`` runs eager: launch overhead amortizes
-and graph memory scales with ``T``). Non-CUDA models, models whose ``prefill``
-rebinds ``state["x"]`` instead of updating it in place (CUDA-Graph replay
-requires fixed tensor addresses), and any capture failure transparently fall
-back to the wrapped model's eager path for the affected op.
+and graph memory scales with ``T``). The wrapper is CUDA-only: wrap
+conditionally with :func:`try_cuda_graph` and never build ``CUDAGraph``
+around a non-CUDA model. Models whose ``prefill`` rebinds ``state["x"]``
+instead of updating it in place (CUDA-Graph replay requires fixed tensor
+addresses), and any capture failure, transparently fall back to the wrapped
+model's eager path for the affected op.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from torch import Tensor
 from .model import RWKV7Model
 from .state import State
 
-__all__ = ["CUDAGraph"]
+__all__ = ["CUDAGraph", "try_cuda_graph"]
 
 
 def _copy_state(dst: State, src: State) -> None:
@@ -51,12 +53,26 @@ def _state_addrs(state: State) -> list[int]:
     return addrs
 
 
+def try_cuda_graph(model: RWKV7Model, use_graph: bool = True) -> RWKV7Model:
+    """Wrap ``model`` in :class:`CUDAGraph` when it runs on CUDA and
+    ``use_graph`` is enabled; otherwise return ``model`` unchanged.
+
+    This is the conditional wrapper: decide by the model's actual device (no
+    ``torch.cuda.is_available()`` probe) whether to accelerate it with
+    CUDA-Graph replay.
+    """
+    if use_graph and model.w.device.type == "cuda":
+        return CUDAGraph(model)
+    return model
+
+
 class CUDAGraph(RWKV7Model):
     """Wrap an ``RWKV7Model`` instance with CUDA-Graph decode/prefill.
 
     Args:
-        model: Any ``RWKV7Model`` instance (its weights must be on CUDA to
-            capture; non-CUDA models are passed through eagerly).
+        model: Any ``RWKV7Model`` instance whose weights are on CUDA. For
+            conditional wrapping (CUDA + ``use_graph``), use
+            :func:`try_cuda_graph`.
         prefill_graph_max_t: Capture prefill as a graph for T in
             ``[2, prefill_graph_max_t]`` (or any T when ``None``); larger T
             runs eager. The default 1024 covers long prompts (a graph is far
@@ -77,15 +93,13 @@ class CUDAGraph(RWKV7Model):
         self.prefill_graph_max_t = prefill_graph_max_t
         self._warmup = warmup
 
-        dev = self.w.device
-        self._cuda = torch.cuda.is_available() and dev.type == "cuda"
-
         # Decode graph state (T=1).
         self._tok: Tensor | None = None
         self._shadow_dec: State | None = None
         self._graph_dec: torch.cuda.CUDAGraph | None = None
         self._logits: Tensor | None = None
         self._dec_attempted = False
+        self._dec_addrs: list[int] | None = None
 
         # Per-T prefill graphs.
         self._bufs: dict[int, Tensor] = {}
@@ -105,17 +119,22 @@ class CUDAGraph(RWKV7Model):
 
     def decode(self, token: Tensor, S: State) -> tuple[Tensor, State]:
         """Advance one token; CUDA-graph replay when captured, eager otherwise."""
-        if not self._cuda:
-            return self.model.decode(token, S)
         if not self._dec_attempted:
             self._dec_attempted = True
-            self._capture_decode()
+            self._capture_decode(S)
         g = self._graph_dec
         if g is None:
             return self.model.decode(token, S)
 
         assert self._tok is not None and self._shadow_dec is not None
-        self._tok[0] = int(token.item()) if isinstance(token, Tensor) else token
+        self._tok.copy_(token if isinstance(token, Tensor) else torch.tensor(token, dtype=torch.long))
+        # Fast path: caller reuses one State (addresses match captured shadow),
+        # graph writes S in place -> skip both copies.
+        if self._dec_addrs is not None and _state_addrs(S) == self._dec_addrs:
+            g.replay()
+            assert self._logits is not None
+            return self._logits.clone(), S
+        # Fallback: copy in -> shadow, replay, copy out -> S (addr mismatch).
         _copy_state(self._shadow_dec, S)
         g.replay()
         _copy_state(S, self._shadow_dec)
@@ -124,8 +143,6 @@ class CUDAGraph(RWKV7Model):
 
     def prefill(self, tokens: Tensor, S: State) -> State:
         """Batch-fill a token sequence; per-T graph replay when captured."""
-        if not self._cuda:
-            return self.model.prefill(tokens, S)
         tok = tokens.reshape(-1)
         T = tok.numel()
         if T < 2 or (
@@ -148,12 +165,28 @@ class CUDAGraph(RWKV7Model):
     #  Capture internals
     # ------------------------------------------------------------------ #
 
-    def _capture_decode(self) -> None:
-        """Capture the wrapped model's ``decode`` as a T=1 CUDA graph."""
-        if not self._cuda:
-            return
+    def _capture_decode(self, S: State | None = None) -> None:
+        """Capture the wrapped model's ``decode`` as a T=1 CUDA graph.
+
+        The graph captures against ``S`` (or a fresh shadow when ``S`` is None)
+        so a caller reusing that exact State can replay with zero copies;
+        ``self._dec_addrs`` records the stable addresses.
+
+        Capturing runs ``decode`` a few times on ``shadow`` (warmup + the
+        captured step), which advances its contents past the caller's current
+        state. We snapshot ``S`` before capture and restore it after so the
+        graph's *first* replay starts from exactly the state the caller had --
+        subsequent replays keep the shadow and ``S`` in lockstep, so the fast
+        path (no copies) stays correct.
+        """
         tok = torch.zeros(1, dtype=torch.long, device="cuda")
-        shadow = State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
+        shadow = S if S is not None else State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
+        # Snapshot S's contents (addresses unchanged) so we can restore after
+        # capture and leave shadow == caller's baseline for the first replay.
+        baseline = None
+        if S is not None:
+            baseline = State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
+            _copy_state(baseline, shadow)
         logits: Tensor | None = None
 
         def run() -> None:
@@ -164,16 +197,18 @@ class CUDAGraph(RWKV7Model):
         g = self._capture_graph(run, shadow, "decode")
         if g is None:
             return
+        # Roll back the capture's side effect so the first replay starts from
+        # the state the caller actually had; fast-path replays then stay in sync.
+        if baseline is not None:
+            _copy_state(shadow, baseline)
         self._tok = tok
         self._shadow_dec = shadow
         self._graph_dec = g
         self._logits = logits
+        self._dec_addrs = _state_addrs(shadow)
 
     def _capture_prefill(self, T: int) -> None:
         """Capture the wrapped model's ``prefill`` for one exact length ``T``."""
-        if not self._cuda:
-            self._graphs[T] = None
-            return
         buf = torch.zeros(T, dtype=torch.long, device="cuda")
         shadow = State(self.L, self.C, self.N, device="cuda", dtype=self.w.dtype)
 

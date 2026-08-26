@@ -5,7 +5,18 @@ import math
 import tilelang
 import tilelang.language as T
 
-from ._bound import BoundKernel, require_bind
+from ._op import KernelOp, require_bind
+
+def _fp16(x):
+    """Bridge: a QTensor weight binds as its dequantized fp16 form.
+
+    Step 4 replaces these call sites with real W8A16 kernel variants
+    selected by ``isinstance(x, QTensor)`` (static, not heuristic).
+    """
+    from rwkv_tl.quant import QTensor
+
+    return x.dequant() if isinstance(x, QTensor) else x
+
 from ._common import HEAD_DIM, SERIAL, WARP
 from .gemv import gemv_batch_macro, gemv_macro
 from .ln import ln_prologue_macro
@@ -318,10 +329,14 @@ def tmix_decode_main_macro(
                 # v gate state: first token stores v, later tokens keep v_first
                 v_first[i] = T.cast(vf, DTYPE)
                 rkv[2, i] = T.cast(v_out, DTYPE)
+                # DeltaLog-style: store delta = w - 1 (w = exp(-sigmoid/+/sqrt2E/0)),
+                # giving fp16 far more resolution near the w~1 (small-decay) end
+                # than storing w itself. DPLR consumes it as state + state*delta.
                 w[i] = T.cast(
                     T.exp(
                         -T.sigmoid(T.cast(w0[i], "float32") + w12) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
-                    ),
+                    )
+                    - T.float32(1.0),
                     DTYPE,
                 )
                 a_val = T.sigmoid(T.cast(a0[i], "float32") + a12)
@@ -371,8 +386,10 @@ def tmix_decode_main_macro(
             p_y[0] = T.float32(0.0)  # pyright: ignore[reportCallIssue]
             for j in T.serial(SERIAL):
                 k_idx = n * SERIAL + j
+                # w now holds delta; state update S' = S*(1+delta) = S + S*delta.
                 s_new = (
-                    rnn[h, v_n, k_idx] * T.cast(w[h * N + k_idx], "float32")
+                    rnn[h, v_n, k_idx]
+                    + rnn[h, v_n, k_idx] * T.cast(w[h * N + k_idx], "float32")
                     + sa * T.cast(B[h * N + k_idx], "float32")
                     + v_val * T.cast(rkv[1, h * N + k_idx], "float32")
                 )
@@ -848,10 +865,12 @@ def _tmix_prefill_front_macro(
             v_out = v_cur + sig_v * (vf - v_cur)
             v_first[t, i] = T.cast(vf, DTYPE)
             rkv[2, t, i] = T.cast(v_out, DTYPE)
+            # DeltaLog-style delta = w - 1; DPLR uses state + state*delta.
             w[t, i] = T.cast(
                 T.exp(
                     -T.sigmoid(T.cast(w0[i], "float32") + w12_v) / T.float32(_SQRT_E)  # pyright: ignore[reportCallIssue]
-                ),
+                )
+                - T.float32(1.0),
                 DTYPE,
             )
             a_val = T.sigmoid(T.cast(a0[i], "float32") + a12_v)
@@ -1053,8 +1072,10 @@ def tmix_prefill_back_macro(
                 sa = p_sa[0]
                 v_val = T.cast(rkv[2, t, h * N + n], "float32")
                 for k in T.serial(N):
+                    # w holds delta: S' = S*(1+delta) = S + S*delta
                     s_new = (
-                        T.cast(st[k], "float32") * T.cast(w[t, h * N + k], "float32")
+                        T.cast(st[k], "float32")
+                        + T.cast(st[k], "float32") * T.cast(w[t, h * N + k], "float32")
                         + sa * T.cast(B[t, h * N + k], "float32")
                         + v_val * T.cast(rkv[1, t, h * N + k], "float32")
                     )
@@ -1213,7 +1234,10 @@ def tmix_decode_kernel(
     are updated in place.
     """
     require_bind(weights, _TMIX_WEIGHTS, "tmix_decode_kernel")
-    return BoundKernel(
+    weights = dict(weights)
+    weights["rkvWt"] = _fp16(weights["rkvWt"])
+    weights["oWt"] = _fp16(weights["oWt"])
+    return KernelOp(
         tmix_decode,
         (C, DTYPE, H, Rv, Rw, Ra, Rg),
         bind=weights,
@@ -1225,7 +1249,7 @@ def tmix_decode_kernel(
 class _TmixPrefill:
     """Prefill front + back bound as one callable: ``y = t(x0, prev_x, rnn, v_first, first)``."""
 
-    def __init__(self, front: BoundKernel, back: BoundKernel) -> None:
+    def __init__(self, front: KernelOp, back: KernelOp) -> None:
         self.front = front
         self.back = back
 
@@ -1252,15 +1276,18 @@ def tmix_prefill_kernel(
     separate kernels (cached by the caller).
     """
     require_bind(weights, _TMIX_WEIGHTS, "tmix_prefill_kernel")
+    weights = dict(weights)
+    weights["rkvWt"] = _fp16(weights["rkvWt"])
+    weights["oWt"] = _fp16(weights["oWt"])
     args = (LEN, C, DTYPE, H, Rv, Rw, Ra, Rg)
-    front = BoundKernel(
+    front = KernelOp(
         _tmix_prefill_front,
         args,
         bind={n: weights[n] for n in _TMIX_FRONT_WEIGHTS},
         call=("x0", "prev_x", "v_first", "first"),
         name="tmix_prefill_front",
     )
-    back = BoundKernel(
+    back = KernelOp(
         _tmix_prefill_back,
         args,
         bind={n: weights[n] for n in _TMIX_BACK_WEIGHTS},

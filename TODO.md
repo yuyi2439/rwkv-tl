@@ -1,168 +1,65 @@
 # TODO
 
 按优先级排列。完成一项就删掉对应条目。
-
-**进度（2026-08-13）**：0.2 API 重构完成——模型进库（`rwkv_tl.rwkv7` /
-`RWKV7TL` / `RWKV7Torch`），kernel 改为权重绑定的 `*_kernel` 工厂
-（粗细粒度都导出），文本级 `generate` / `logits` / `tune_state` + `State`
-save/load，vocab 打包进 wheel，全部接口 stateless。量化（#6）是下一个主线。
+进度与已关闭的死路见 `docs/progress.md`。
 
 ## P0 — decode 性能与可用性（最高优先级）
 
-### #1 手写 GEMV（decode 路径，不走 TensorCore）
-
-decode 是 `[C]×[C,C]`（M=1），TensorCore m16n8k16 对 M=1 利用率仅 1/16，
-`T.gemm`/cuBLAS 对 GEMV 不划算。应加手写 GEMV 路径专门服务 decode：
-`T.vectorized(8)` 向量化加载 + `T.tvm_thread_allreduce` 归约 + `block_rows∈{1,2}`
-双行优化，纯 CUDA Core FMA。参考官方 `~/rwkv/official-tl/kernel.py` 的 GEMV 写法
-及 `~/tilelang/examples/gemv/`。
-
-graph_decoder 的 1.55ms GPU kernel time 里 GEMV 计算是主要成本，手写预计快 30-50%。
-这是当前 decode 路径收益最大的单项优化。
-
-**观察（2026-08-10）**：neo kernels 启用后（a8e2ef7）decode 反而变慢——0.1B
-tl-fp16 从旧基线 2.36ms（逐 op kernel + graph）涨到 graph 4.15ms / eager 3.44ms。
-profiler 定位根因：`tmix_decode` 单层 ~11 个顺序 kernel，r/k/v 三个 GEMV 占 decode
-GPU 时间 60-73%，且链中每个膨胀 2.4-3.8x（55/71/149us vs 微基准 17/19/63us @
-C=768/1024/2048）——因每个读前一 kernel 刚写的 global、无 overlap、occupancy 低
-（24-64 个 32-thread block）。**GEMV 单 kernel 本身不慢**（微基准与 cuBLAS 持平），
-faster3a 用 `row1_exact4` 把 r/k/v 融合成 14.8us/kernel。修复方向：把 r/k/v 三个 GEMV
-合并成一个 batched GEMV kernel、减少单层 kernel 数、HEAD 专精（现在 `[65536,C]`
-cuBLAS GEMV 0.3-0.8ms）。graph 比 eager 慢是 `CUDAGraph.decode` 的 State copy-in/out
-（36 次小 copy_）+ `.item()` 同步，另查。1.5B decode 18.93ms vs faster3a 7.91ms。
-详见 docs/runs/rtx3060.md「neo kernels 基线」。
-
-**进度（2026-08-12）**：r/k/v 已合并为单 batched GEMV（`gemv_batch_macro`）。
-**精确根因已定位**（读 faster3a `rwkv7_v3a_ops.cu`）：它的单行 GEMV
-`linear_orig_row1_exact_f16` 用 128 threads/block + half2 向量化 K + 多 warp
-partial reduce（每 block 算 OutTile=2 输出），我们 `gemv_macro` 是 32 threads
-lane-per-output + K 标量串行读。1.5B 上 faster3a 41.7us/个 vs 我们 94-146us
-（链中膨胀）。修复方向：decode 单行 GEMV 重写为 faster3a 风格（128 threads +
-half2 向量化 + 多 warp reduce），见 docs/runs/rtx3060.md 三模型差距分析。
-
-### #2 batch decode（B>1）
+### #1 batch decode（B>1）
 
 目前 decode 只支持 B=1。RNN 架构无 KV cache 内存爆炸，对 batching 有天然优势。
 改动：State tensor 加 B 维度；`fused_dplr` grid 加 batch 维度；GEMV 变 batched GEMV
-（`[B,C]×[C,C]`）。这让项目从 benchmark 工具变成可用推理引擎。
+（`[B,C]×[C,C]`）。这让项目从 benchmark 工具变成可用推理引擎。batch 化同时
+天然提升 GEMV 的 M 维并行度，是绕开单行 GEMV occupancy 瓶颈的正路。
+
+### #2 头投影 GEMV（decode 第一热点 ~27%）
+
+`[C]×[65536,C]` 每步 ~2ms，是 decode 最大单项。W8A16 手写 GEMV 已上（1.96x，
+见 docs/progress.md）。进一步方向：vocab 分块 + CUDA Graph 内多 kernel 流水；
+或 CUTLASS int8 GEMV 路径直接吃 2x 字节收益。
+
+### #3 tmix rkvWt/oWt 换 W8A16 kernel
+
+tmix 的 rkvWt/oWt 目前走 dequant→fp16（int8 释放，未常驻）。参考 cmix decode
+融合 Q8 的做法，在 tmix decode 里让 rkvWt/oWt int8 常驻显存。注意：现有
+[K,M] lane-per-output GEMV 受 occupancy 限制，int8 带宽收益有限（见
+docs/progress.md 死路记录），先以显存收益为主。
 
 ## P1 — prefill 与大模型验证
 
-### #3 chunk 并行 prefill
+### #4 chunk 并行 prefill
 
-T=128 prefill 落后 faster3a 2.5x，根因是 faster3a 的 wkv_seq kernel 用 chunk 并行 +
-cp.async 流水线，我们的单 kernel 串行 DPLR 在大 T 时计算效率不够。T-bucketing
-（按 T 分桶捕获 graph）只省 launch 开销，不解决计算效率问题，仅作过渡。
+T=128 prefill 落后 faster3a 2.5x。faster3a 的 `wkv_fp16_seq_v2` 也是串行 over T
+但用 (B,H) grid + fp16 register state + cp.async 双缓冲，我们已对齐 register state
+（e0da4c7）。剩余差距在 front 的 4 个 rank 一阶 GEMM + rkv GEMM（faster3a 用
+cuBLAS batched）。真 chunk 并行（FlashRWKV `chunk_rwkv7` / FLA 风格）是唯一
+未试路径；注意 SM120 上 chunk 可能比 recurrent 慢，需实测交叉点。
 
-**量化（2026-08-10）**：1.5B prefill 的 TMIX 仍走旧逐 op 路径，单层 T=64 拆解：
-`fused_dplr_T` 296us（faster3a `wkv_fp16_seq_v2` 仅 47us，**慢 6.3x**——grid `(H,N)`
-=2048 blocks × 32 threads 串行整个 T，occupancy 低、无 chunk 并行）、`fused_rkv_gemm`
-189us（旧 tilelang，faster3a 用 cuBLAS 大 tile）、torch 6-shift lerp + gates ~90us
-（Python 逐 op）。合计 ~530us/层 × 24 = 12.7ms + CMIX。1.5B T=128 落后 faster3a
-1.33x 大部分来自 TMIX 未融合 + DPLR 慢。
+**警示**：在 MX450 上调优的 kernel 必须在 sm_80+ 复测（9e81fd1 曾在 3060
+倒退 2.5-10x）。
 
-**警示（2026-08-12）**：commit 9e81fd1 把 prefill 改为融合 `_tmix_prefill_front/_back`
-（MX450 上快 2.1x），但 **3060 (sm_86) 上 prefill 全面倒退 2.5-10x**——根因是
-`_tmix_prefill_back` 的 oWt 投影写成逐-token 串行手写 GEMV（`for t in serial(LEN)
-for k in serial(C)`，1704us @ 0.1B/T=128，未用 tensor core），而旧 `out_mm` 的
-batched `T.gemm` 只要 63us（27x）。GN 也串行 T。MX450 快是因为其 fp16 cuBLAS 病态
-使串行写法相对可接受。修复：oWt/GN 改 batched T.gemm。**在 MX450 上调优的 kernel
-必须在 sm_80+ 复测**，否则可能像这次一样倒退。
+### #5 1.5B 模型验证（RTX 3060）
 
-真正解法是 chunk-based 并行 prefill：把 T 维切成 chunk（如 16/32），chunk 内并行
-计算 GEMM，chunk 间串行递推 state。参考 FlashRWKV `chunk_rwkv7` 和 FLA 的实现。
-注意 SM120 上 chunk 反而比 recurrent 慢（FlashRWKV 实测），需在我们的硬件上验证
-交叉点。
+1.5B 已加载验证（decode 正确、prefill T=8/32 快 faster3a ~2x，decode 18.93ms
+与 T≥64 prefill 落后）。后续 kernel 改动都应在 1.5B + 3060 上回归。
 
-**调研更新（2026-08-12）**：读了 faster3a `rwkv7_wkv_fp16_v2.cu`——它的
-`wkv_fp16_seq_v2_kernel` **并非真 chunk 并行**，也是串行 over T，但用 (B,H) grid +
-每线程 fp16 register state + cp.async 双缓冲预取。我们已把 DPLR 对齐到 fp16
-register state（commit e0da4c7，1.5B T=256 92→80ms），DPLR 不再是主要差距。
-1.5B 剩余 1.6-1.9x 差距来自 **front 的 4 个 rank 一阶 GEMM（637us/层，tile 浪费：
-R=64/96 时 BLOCK_N=128 半空）+ rkv GEMM 290us**——faster3a 用 cuBLAS batched 处理。
-先优化 rank 一阶 GEMM tile（R 小时用更小 BLOCK_N）再考虑真 chunk。
+## P2 — 融合与训练路径
 
-**进度（2026-08-12 晚）**：rank GEMM tile 已优化（BN=64，commit 9972971，1.5B
-T=128 50.3→45.1ms）。**最终路线评估**：即使 DPLR + rank GEMM 全部优化，1.5B 仍
-输 faster3a 1.3-2.1x（decode 输在单行 GEMV 结构，prefill 输在 GEMM 规模 + 串行
-DPLR latency）。真 chunk 并行是唯一未试的路径，但 faster3a 本身也不是 chunk
-并行——它的优势是手写 CUDA kernel（cp.async、row1_exact、split-K）。详见
-docs/runs/rtx3060.md 三模型差距分析。
+### #6 GroupNorm 融合（单层 11.3%）
 
+`_impl_kernel_3`(GN) 与 DPLR kernel 同为 (H,N) 组织，GN 依赖 DPLR 输出 y 的
+全 head 归约，现拆两 kernel 多一轮 y 读写。融合或 cooperative 归约可省一次
+launch + 读写。低秩 gate 链已融合完成（fused_gates ~5.3x）。
 
-### #4 1.5B 模型验证（RTX 3060）
+### #7 FFN 分策略（fp16 binned / bf16 4-stream）
 
-0.1B/0.4B 太小，不足以暴露真实推理场景的问题。1.5B 是 RWKV7 主力部署尺寸
-（bf16 需 ~3GB，RTX 3060 12GB 可装）。大模型会暴露：SMEM 不足（更大 N 影响
-`fused_gn_rkrk`/`fused_dplr` register pressure）、occupancy 下降（H=64 时 grid 更大）、
-DPLR N 维并行度变化。7.2B 需等量化支持后再测（bf16 ~14.4GB）。
+官方 FFN 按 dtype 分策略：fp16 用 `cmix_sparse_binned`（6-bin）+ finalize
+利用稀疏性；bf16 用 4 stream 并行 split + 归约。我们 FFN 统一路径，
+`[C]×[ffn_rows,C]` 大 GEMV 是 decode 另一瓶颈。
 
-**进度（2026-08-08）**：`rwkv7-g1i-1.5b-20260805-ctx16384.pth`（C=2048, H=32, N=64,
-L=24）已在本机 3060 加载成功（g1i 权重键结构与 g1d 一致，`RWKV7Weight` 零改动），
-decode 8-token 正确性验证通过（max_abs 0.039，argmax 一致）。
-**进度（2026-08-10）**：完整 benchmark 已补测（neo kernels 基线，a8e2ef7）：1.5B
-prefill T=8/32 快 faster3a ~2x，但 decode 1x1（18.93ms）与 T≥64 prefill 落后。
-详见 docs/runs/rtx3060.md。
+### #8 DPLR backward
 
-## P2 — 训练路径
-
-### #5 DPLR backward
-
-长期目标是训练支持，per-op custom op + `register_autograd` 是正确路线。
-第一个 backward 应实现 `fused_dplr` 的反向：DPLR 的时间反向递推是 RWKV 最核心也
-最难的部分。需保存每步 `S_new`（或 `S@A`/`V⊗K`），memory footprint 显著增加，
-可参考 Mamba `selective_scan` backward 的 checkpoint 策略。
-
-其他 op 的 backward（GEMM/LayerNorm/activation）是标准的，可先用 PyTorch autograd
-兜底。elementwise 融合（lerp/gate/l2norm）的反向用 torch 算子组合即可。
-
-## P3 — 后续优化
-
-### #6 量化（权重绑定到 wrapper 之后的主线）
-
-decode 是 memory-bound，量化直接减半 memory bandwidth。weight 用 int8/any4 存储，
-kernel 内做 dequant + compute 融合；DPLR state 保持 fp32。0.2 的 `BoundKernel`
-已经把权重所有权收进 wrapper（构建期绑定），量化权重（int8/any4 + scale）直接
-住进 wrapper，kernel 只看到 dequant 输入或 int8+scale，模型代码零改动。应在 #1
-手写 GEMV 完成后在 GEMV kernel 内融合 dequant，而非单独做量化路径。参考
-rwkv7-quantization（any4 在 RTX 2080 Ti 达 114.7 tok/s）。
-
-### #7 decode 路径深融合（减少 launch）
-
-合并原多项官方借鉴，目标是减少 decode 的 kernel launch 数和中间写回：
-
-- **LayerNorm + 6 lerp 深融合**：官方 `tmix_layernorm_mix6` 把 LayerNorm 和 6 个
-  shifted time-mix 向量压成单 kernel。我们现在是 `LAYER_NORM` + `fused_lerp6_rkv_copy`
-  分两步。
-- **GroupNorm + RKV 残差 + gate 深融合**：官方 `post_state` 一个 kernel 完成 3 个
-  reduce + GroupNorm affine + RKV 残差 + gate 终化。我们现在是 `fused_gn_rkrk` + 后续。
-- **CMIX 残差 + LayerNorm + mix 融合**：官方 `cmix_add_layernorm_mix` 单 kernel。
-- **打包 RKV + 低秩单 kernel**：官方 `_build_rkv_program` 把 6 个输入 × 1 打包权重
-  压成单 kernel，`T.if_then_else` 按行段选输入。
-
-进度（2026-08-08）：
-- 低秩 first-step 已打包为 `fused_rank_gemv`（`[v1t;w1t;a1t;g1t] @ [xv;xw;xa;xg]` 单
-  kernel，替换 4 个 cuBLAS fp16 GEMV，Turing 上它们病态慢）；RKV 三个 GEMV 仍走
-  `fused_rkv_gemm`，未并入。
-- 低秩 gate 的 rank-out second-step + 激活 + v/w/a gate 已融合为 `fused_gates` 单
-  kernel（原 4 matmul + 2 激活 + 3 gate op → 1，实测快 ~5.3x）。
-- GroupNorm + RKV 残差 + oWt 尚未融合。
-
-### #8 FFN 分策略（fp16 binned / bf16 4-stream）
-
-官方 FFN 按 dtype 分策略：fp16 用 `cmix_sparse_binned`（6-bin 分桶）+ `binned_finalize`
-利用稀疏性；bf16 用 4 CUDA stream 并行 split + `cmix_finalize` 归约。我们 FFN 是统一
-路径。FFN 的 `[C]×[ffn_rows,C]` 大 GEMV 是 decode 另一个瓶颈。
-
-### #9 T=1 专精 WKV
-
-官方有通用 `_wkv_out` 和 `_wkv_w0_t1_out`（B1T1，fused static decay bias）两个变体。
-后者针对 decode T=1 去掉分支、静态融合 decay bias。我们的 `fused_dplr` 是通用版，
-decode 走通用路径有冗余分支。
-
-### #10 data_ptr binding cache（CUDA Graph 下跳过 shape 校验）
-
-官方 runtime 缓存 `tuple(tensor.data_ptr())`，CUDA Graph 下地址固定，binding 不变就
-跳过 shape 校验（`_validate`），减少 Python dispatch 开销。我们 CUDA Graph 路径每次
-都走完整校验。
-
+长期训练支持。per-op custom op + `register_autograd`。DPLR 时间反向递推是
+RWKV 最难部分，需保存每步 `S_new`（或 `S@A`/`V⊗K`），memory footprint 大，
+可参考 Mamba `selective_scan` backward 的 checkpoint 策略。其他 op backward
+标准，可先用 PyTorch autograd 兜底。

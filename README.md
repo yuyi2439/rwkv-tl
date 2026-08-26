@@ -16,12 +16,18 @@ in and (optionally) get it back, or let `generate` create a fresh one.
 
 ## User API
 
-Build a model from a checkpoint path (or a pre-loaded `RWKV7Weight`):
+Load a weight, then build the model (nothing is auto-detected; `backend` is
+always explicit):
 
 ```python
-model = rwkv_tl.rwkv7("model.pth")                       # backend auto-selected
-model = rwkv_tl.rwkv7("model.pth", backend="torch")      # pure-PyTorch reference
-model = rwkv_tl.RWKV7TL("model.pth")                     # explicit tilelang class
+import rwkv_tl
+from rwkv_tl.core import RWKV7Weight
+
+w = RWKV7Weight("model.pth", device="cuda")    # weight; device/dtype fixed here
+model = rwkv_tl.rwkv7(w, backend="tl")         # one-call RWKV7TextModel
+# decoupled equivalent:
+model = rwkv_tl.rwkv7_model(w, backend="tl")   # token-level RWKV7Model
+text = rwkv_tl.RWKV7TextModel(model)           # text-level wrapper
 ```
 
 Text in, text out:
@@ -110,22 +116,12 @@ RWKV_CHECKPOINT_PATH=/path/to/rwkv7-g1d-0.1b.pth .venv/bin/python -m pytest test
 
 The user-facing text API and the pure-torch backend also run on CPU.
 
-`script/check_torch_vs_official.py` additionally validates the pure-torch
-backend against the official RWKV-LM v7 demo (pure-torch path) on the same
-checkpoint — logits must agree on argmax and top-5 for batched and per-token
-decode:
-
-```bash
-.venv/bin/python script/check_torch_vs_official.py /path/to/rwkv7-0.1b.pth \
-  --fast-path /path/to/RWKV-LM/RWKV-v7/rwkv_v7_demo.py
-```
-
 ## Performance
 
 Decode and prefill use fused tilelang kernels with fp16 compute and fp32
 accumulation (DPLR state stays fp32), CUDA-Graph accelerated on CUDA by
-default. Current numbers vs the Albatross reference implementation are in
-`docs/runs/rtx3060.md` (RTX 3060, the current target card).
-`script/bench_tl_vs_torch.py` measures tl vs pure-torch on CUDA (prefill
-sweep + decode), and `script/bench_tl_vs_fast.py` compares tl against the
-Albatross faster3a_2607 reference implementation.
+default. On the RTX 3060 (the current target card), small models (0.1B/0.4B)
+are competitive with or ahead of the Albatross reference implementation;
+large-model parity (1.5B) is explicitly not a performance goal.
+`script/benchmark_rwkv7.py` measures tl vs pure-torch and vs the Albatross
+faster3a_2607 reference on CUDA.

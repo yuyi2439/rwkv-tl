@@ -2,6 +2,20 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from rwkv_tl.quant import QTensor, stack_qtensors
+
+
+def _load_wt(W, key: str) -> Tensor | QTensor:
+    """A projection weight in kernel layout ``[in, out]``.
+
+    Quantized checkpoints already store ``QTensor`` in this layout; plain
+    checkpoints store ``[out, in]`` and are transposed here.
+    """
+    v = W[key]
+    if isinstance(v, QTensor):
+        return v
+    return v.T.contiguous()
+
 
 class LNWeight:
     w: Tensor
@@ -95,15 +109,15 @@ class RWKV7ATTWeight:
         self.k_a = W[f"{prefix}.k_a"]
 
         # Transposed [in, out] (see class docstring): checkpoint stores [out, in].
-        self.rkvWt = torch.stack(
-            (
-                W[f"{prefix}.receptance.weight"].T.contiguous(),
-                W[f"{prefix}.key.weight"].T.contiguous(),
-                W[f"{prefix}.value.weight"].T.contiguous(),
-            ),
-            dim=0,
-        )
-        self.oWt = W[f"{prefix}.output.weight"].T.contiguous()
+        # Quantized checkpoints hold QTensor in the same layout already.
+        r = _load_wt(W, f"{prefix}.receptance.weight")
+        k = _load_wt(W, f"{prefix}.key.weight")
+        v = _load_wt(W, f"{prefix}.value.weight")
+        if isinstance(r, QTensor):
+            self.rkvWt = stack_qtensors([r, k, v])
+        else:
+            self.rkvWt = torch.stack((r, k, v), dim=0)
+        self.oWt = _load_wt(W, f"{prefix}.output.weight")
 
 
 class RWKV7FFNWeight:
@@ -122,8 +136,8 @@ class RWKV7FFNWeight:
     def __init__(self, W, prefix: str, ln_pre: LNWeight):
         self.ln_pre = ln_pre
         self.x_k = W[f"{prefix}.x_k"].squeeze()
-        self.kWt = W[f"{prefix}.key.weight"].T.contiguous()
-        self.vWt = W[f"{prefix}.value.weight"].T.contiguous()
+        self.kWt = _load_wt(W, f"{prefix}.key.weight")
+        self.vWt = _load_wt(W, f"{prefix}.value.weight")
 
 
 class RWKV7Block:
@@ -168,10 +182,11 @@ class RWKV7Weight:
             # an explicit device, resolve to the default device so CPU-only
             # machines can load it too.
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        W = torch.load(model_path, map_location=device)
+        W = torch.load(model_path, map_location=device, weights_only=False)
         W = {
             k: (v.to(dtype) if isinstance(v, torch.Tensor) else v) for k, v in W.items()
         }
+        # fp16: [vocab, C] (used via torch.mv); QTensor: [C, vocab] kernel layout.
         self.head = W["head.weight"]
         self.ln_in = LNWeight(W, "blocks.0.ln0")
         self.ln_out = LNWeight(W, "ln_out")

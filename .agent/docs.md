@@ -1,9 +1,9 @@
 # Project docs maintenance
 
 Read this before updating `AGENTS.md`, `.agent/<topic>.md` files, the
-remaining portable skill (`.agent/skill/tilelang-writer`), or `docs/`
-records. These rules are repo-specific, so they live as a topic file, not as
-a portable skill.
+remaining portable skill (`.agent/skill/tilelang-writer`), `README.md` /
+`CONTRIBUTING.md`, or `docs/` records. These rules are repo-specific, so they
+live as a topic file, not as a portable skill.
 
 ## Documentation layers
 
@@ -17,6 +17,12 @@ a portable skill.
 Only `tilelang-writer` remains a skill because it is portable tilelang
 knowledge. Everything repo-specific belongs in `AGENTS.md` or a topic file.
 
+**Human-facing docs (`README.md`, `CONTRIBUTING.md`, `docs/`) are for people
+and must never reference `.agent/` topic files**; any fact they need must be
+stated inline or in `docs/`. `.agent/` files are agent-only and are reached
+through the AGENTS.md topic index. References are one-directional: topic
+files may point at repo paths, never the reverse.
+
 ## 1. Where each finding goes
 
 Decide placement first; a finding lives in exactly one place.
@@ -24,7 +30,7 @@ Decide placement first; a finding lives in exactly one place.
 | Content type | Location |
 |---|---|
 | TileLang / kernel-writing knowledge (how to use `T.gemm`, `T.dynamic`, `T.macro`, tiling, pitfalls) | `.agent/skill/tilelang-writer` |
-| Repo-specific conventions (project layout, `make_rwkv7` backends, CUDA-graph mechanism, state design, kernel dtype binding) | AGENTS.md "Project structure and standards", or `.agent/kernels.md` / `.agent/architecture.md` with an AGENTS.md pointer |
+| Repo-specific conventions (project layout, `rwkv7_model`/`rwkv7` backends, CUDA-graph mechanism, state design, kernel dtype binding) | AGENTS.md "Project structure and standards", or `.agent/kernels.md` / `.agent/architecture.md` with an AGENTS.md pointer |
 | Repo code/documentation standards — how *this repo* writes and documents its code (docstring `Args:` conventions, where parameter/layout requirements go, internal tuning vars as comments, naming rules) | `.agent/kernels.md` (via AGENTS.md pointer) |
 | Requirements about how documentation and skills are written | this file, `.agent/docs.md` |
 | Python-language facts that are project standards (e.g. tilelang DSL files must not use `from __future__ import annotations`) | `.agent/kernels.md` (via AGENTS.md pointer) |
@@ -72,7 +78,7 @@ using tilelang itself — never repo-specific symbols or conventions.
   AGENTS.md; do not duplicate content.
 - Topic files MAY reference repo paths (`docs/`, code, scripts).
 - Main content is English; quoted references (e.g. Chinese section titles in
-  `docs/runs/rtx3060.md`) are fine.
+  `docs/QA.md`) are fine.
 
 ## 4. Maintaining the tilelang-writer skill
 

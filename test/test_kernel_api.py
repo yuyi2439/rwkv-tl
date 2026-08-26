@@ -1,7 +1,7 @@
 """Weight-bound kernel API: argument marshaling and factory param contracts.
 
 The tilelang kernels themselves need CUDA, so these tests exercise the
-``BoundKernel`` wrapper with a fake kernel and verify that every real factory's
+``KernelOp`` wrapper with a fake kernel and verify that every real factory's
 bind/call parameter names exactly cover the kernel's TIR params (no GPU
 required -- ``get_tir`` only builds the program).
 """
@@ -19,7 +19,7 @@ from rwkv_tl.kernel import (
     ln_per_row_jit,
     tmix_decode,
 )
-from rwkv_tl.kernel._bound import BoundKernel, _strip_handle, require_bind
+from rwkv_tl.kernel._op import KernelOp, _strip_handle, require_bind
 from rwkv_tl.kernel.tmix import _tmix_prefill_back, _tmix_prefill_front
 
 
@@ -44,9 +44,9 @@ def _fake_factory(names: list[str], out_idx: list[int]):
     return factory
 
 
-def test_bound_kernel_reorders_args() -> None:
+def test_kernel_op_reorders_args() -> None:
     W, B = object(), object()
-    k = BoundKernel(
+    k = KernelOp(
         _fake_factory(["x_handle", "W_handle", "B_handle", "out_handle"], [3]),
         (),
         bind={"W": W, "B": B},
@@ -56,9 +56,9 @@ def test_bound_kernel_reorders_args() -> None:
     assert k("xval") == ("xval", W, B)
 
 
-def test_bound_kernel_call_param_can_be_bound() -> None:
+def test_kernel_op_call_param_can_be_bound() -> None:
     W = object()
-    k = BoundKernel(
+    k = KernelOp(
         _fake_factory(["x_handle", "W_handle", "out_handle"], [2]),
         (),
         bind={"W": W},
@@ -67,8 +67,8 @@ def test_bound_kernel_call_param_can_be_bound() -> None:
     assert k("xval") == ("xval", W)
 
 
-def test_bound_kernel_rejects_extra_and_missing() -> None:
-    k = BoundKernel(
+def test_kernel_op_rejects_extra_and_missing() -> None:
+    k = KernelOp(
         _fake_factory(["x_handle", "W_handle", "B_handle", "out_handle"], [3]),
         (),
         bind={"W": object(), "B": object()},
@@ -79,7 +79,7 @@ def test_bound_kernel_rejects_extra_and_missing() -> None:
         k("x", z=1)
     with pytest.raises(TypeError, match="at most 1 positional"):
         k("x", "y")
-    k2 = BoundKernel(
+    k2 = KernelOp(
         _fake_factory(["x_handle", "W_handle", "out_handle"], [2]),
         (),
         bind={},

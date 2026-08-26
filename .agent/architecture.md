@@ -1,6 +1,99 @@
 # Architecture direction
 
-Read this when planning architecture changes or new features.
+Read this when planning architecture changes, touching the model API /
+entry-point / CUDA-Graph surface, or designing new features. This file holds
+the core API contract; AGENTS.md keeps only the one-line pointers.
+
+## Core API contract
+
+Firm user-stated API. Verify any detail against the source before writing it.
+
+### Package layout and self-containment
+
+- `src/rwkv_tl/` is the published library: models, the tokenizer (vocab
+  packaged in the wheel), sampling, state, and CUDA-Graph all live in the
+  package. No docstring/comment inside `src/rwkv_tl/` may reference `script/`
+  or `docs/` (docstring conventions: `.agent/kernels.md`).
+- `core/` is dependency-free: it holds only the low-level/inference modules
+  (`model` / `state` / `tokenizer` / `weight` / `cuda_graph`). Code in core
+  MUST NOT reference anything outside core, while external modules may import
+  from core. `CUDAGraph` wraps any `RWKV7Model` (inference layer only).
+- The pure-torch functional ops (`time_mix` / `channel_mix` /
+  `time_mix_batch` / `channel_mix_batch`) live in `rwkv_tl.rwkv7_torch`.
+
+### Text layer: RWKV7TextModel
+
+- `rwkv_tl.text_model.RWKV7TextModel` (outside core) COMPOSES a token-level
+  `RWKV7Model` as `self.model` (no inheritance) plus a decoupled tokenizer,
+  and exposes the full inference surface by delegation (`decode` / `prefill`
+  / `forward` / `w`).
+- Adds `tokenize` / `detokenize` / `generate(str, decoding params,
+  stop=...) -> str` / `chat(messages, ...) -> str` (renders
+  `asset/rwkv_chat_template_v20260805.jinja`). `generate` takes a string
+  prompt, returns only the newly generated text, and stops early when the
+  output contains the `stop` string (the match is truncated away).
+
+### Entry points and model interface
+
+The caller owns the steps: create the `RWKV7Weight` manually
+(`RWKV7Weight(path, device=..., dtype=...)`), then
+`rwkv_tl.rwkv7_model(w, *, backend, use_graph=True, **kwargs)` -> `RWKV7Model`:
+maps the weight to the backend token-level model (optionally CUDA-Graph
+wrapped). `backend` is REQUIRED: `"tl"` (tilelang, CUDA) or `"torch"`
+(pure-PyTorch, CPU-capable). There is no auto-detection --
+`torch.cuda.is_available()` must never pick an implementation (user-stated
+2026-08-20: some devices report CUDA but cannot actually run it).
+- `rwkv_tl.rwkv7(w, *, backend, use_graph=True, **kwargs)` -> `RWKV7TextModel`:
+  one-call convenience for `RWKV7TextModel(rwkv7_model(w, ...))`; the caller
+  still creates the weight manually.
+- Removed over time: the class-factory `make_rwkv7` (2026-08-21, superseded
+  by `rwkv7_model`), the `"auto"` backend (2026-08-20), the `device` /
+  `device_name` factory args (2026-08-20), the tuned variants
+  (`tl-mx450` / `tl-rtx3060` / `tl-tuned`) and the dtype-carrying backend
+  names (`"fp16"` / `"bf16"`, 2026-08-13). Weight precision is controlled
+  exclusively by `RWKV7Weight(dtype=...)`.
+- `rwkv_tl.core.model.RWKV7Model` is the token-only stateless ABC (`decode` /
+  `prefill` / `forward`); `RWKV7TL` / `RWKV7Torch` are the explicit
+  token-level classes, and every backend implements `RWKV7Model`. Application
+  scripts build models via `rwkv7_model()` / `rwkv7()`; do not hard-code a
+  specific model class. The token-class constructors take `w: RWKV7Weight`
+  only (identical declaration to `RWKV7Model.__init__`); they no longer
+  accept a checkpoint path or `device`/`dtype` (2026-08-21).
+- All interfaces are STATELESS: `State` is passed into `decode`/`prefill`;
+  models never own runtime state.
+
+### Dtype plumbing
+
+- `RWKV7Weight(path, dtype=...)` controls weight precision: default
+  `torch.float16` converts the bf16 checkpoint once at load; pass
+  `torch.bfloat16` to keep the raw dtype (reference/experimental variant,
+  sm_80+ only).
+- `State(..., dtype=...)` must match the model dtype. DPLR RNN state is
+  always fp32 (`[H,N,N]`, matches Albatross).
+- Weights are never stored or duplicated above 16 bit/param; fp32 is allowed
+  only for compute internals (kernel accumulation, RNN state, intermediate
+  math). The planned memory-savings direction is quantization (int8/any4
+  weights, dequant fused into the hand-written GEMV); see TODO #5.
+
+### CUDA-Graph mechanism
+
+- `CUDAGraph` (`core/cuda_graph.py`) is THE CUDA-Graph mechanism: wrap a
+  CUDA `RWKV7Model` directly (`CUDAGraph(model)`). It contains only
+  CUDA-Graph logic and must never wrap a non-CUDA model.
+- Conditional wrapping goes through
+  `rwkv_tl.core.cuda_graph.try_cuda_graph(model, use_graph=True)` -> the
+  wrapped model when the model's actual device is CUDA (no
+  `torch.cuda.is_available()` probe) and `use_graph` is enabled, else the
+  original model. `rwkv7_model()` / `rwkv7()` use it themselves
+  (`use_graph=True` default).
+- Capture is lazy (T=1 decode; per-T prefill up to `prefill_graph_max_t`,
+  default 1024); capture requires in-place `state["x"]` updates (`copy_`,
+  not rebind); larger T and capture failures fall back to eager.
+- The wrapper copies the caller's `State` in/out around each replay, so any
+  `State` works and the model stays stateless. `RWKV7TextModel.model` is a
+  plain `RWKV7Model` and does not care whether it is graph-wrapped.
+- CUDA-Graph is inference-only: replay does not build an autograd graph (see
+  the training section below).
 
 ## Long-term: support TRAINING
 
@@ -9,13 +102,13 @@ All new operators/optimizations must keep autograd compatibility in mind:
   kernels called from `rwkv_tl.rwkv7_tl`; training support will need explicit
   backward definitions (a future `torch.library` registration path), not
   autograd through the raw kernel calls.
-- CUDA Graph (`CUDAGraph` in `rwkv_tl/cuda_graph.py`) is INFERENCE-ONLY by
+- CUDA Graph (`CUDAGraph` in `rwkv_tl/core/cuda_graph.py`) is INFERENCE-ONLY by
   design: it captures the forward launch sequence and does not rebuild an
   autograd graph (replay does not record gradients, fixed buffers conflict
   with autograd's dynamic graph). Do not route anything training-relevant
-  through it. `make_rwkv7(..., use_graph=True)` (default) integrates it as the
-  `decode`/`prefill` path via a stateless copy-in/out around a fixed shadow
-  state.
+  through it. `rwkv7_model(..., use_graph=True)` / `rwkv7(...)` (default)
+  integrate it as the `decode`/`prefill` path via a stateless copy-in/out
+  around a fixed shadow state.
 - A fully-fused single kernel is NOT inherently inference-only (unlike CUDA
   Graph) -- any custom CUDA kernel, fused or not, needs an explicit backward
   to support training. But fusing a whole layer makes training hard: you must
@@ -38,22 +131,13 @@ When working on the related area, remind the user whether to proceed.
 
 - **PENDING — measure bf16 vs fp16 on RTX 3060.** Decide which precision the
   base should use on Ampere+: benchmark `tl-bf16` vs `tl-fp16` (both now
-  graph-wrapped via `make_rwkv7(use_graph=True)`) on the RTX 3060 before
+  graph-wrapped via `rwkv7_model(..., use_graph=True)`) on the RTX 3060 before
   settling the default. Requires the RTX 3060 box (not the MX450 laptop).
 
-- **DONE — models live in the library (0.2 refactor).** `rwkv_tl.rwkv7_tl.RWKV7TL`
-  (fused tilelang kernels, fp16/bf16) and `rwkv_tl.rwkv7_torch.RWKV7Torch`
-  (pure torch reference, CPU-capable) are part of the published package; the
-  pure-torch functional ops (`time_mix` / `channel_mix` / `time_mix_batch` /
-  `channel_mix_batch`) live in `rwkv_tl.rwkv7_torch`. `RWKV7TL` binds weights
-  to `BoundKernel` wrappers at construction and compiles kernels lazily.
-  `rwkv_tl.cuda_graph.CUDAGraph` wraps any `RWKV7Model` instance and provides
-  CUDA-Graph decode + per-T prefill. `rwkv_tl.rwkv7(path, ...)` /
-  `make_rwkv7(device, backend=...)` build models; all tilelang backends
-  resolve to `RWKV7TL` (the per-device `tuned` variants were deleted with the
-  fp32-GEMM workaround). The vocab file is packaged in the wheel
-  (`rwkv_tl/asset/rwkv_vocab_v20230424.txt`); `Tokenizer()` uses it by
-  default.
+- **DONE — models live in the library (0.2 refactor).** `RWKV7TL` (fused
+  tilelang kernels, fp16/bf16) and `RWKV7Torch` (pure torch reference,
+  CPU-capable) are part of the published package; see "Core API contract"
+  above for the current surface.
 - **Adopt a stateless operator API.** Future kernel/operator APIs should take
   `initial_state` and return `final_state` explicitly instead of mutating an
   in-place `state` dict. This is clearer, autograd-friendly, and matches the

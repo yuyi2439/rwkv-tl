@@ -1,4 +1,4 @@
-"""Numerical correctness of the neo CMIX kernels (decode + multi).
+"""Numerical correctness of the fused CMIX kernels (decode + prefill).
 
 Compares ``cmix_decode`` (single-token decode) and ``cmix_prefill``
 (prefill) against the eager CMIX reference used by ``make_CMIX_batch``:
@@ -34,7 +34,7 @@ def _cmix_ref(
     x_k: torch.Tensor,
     kWt: torch.Tensor,
     vWt: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager reference matching the CMIX token-shift semantics.
 
     Token-shift source is the previous token's LN output (`x_ln[n-1]`), with

@@ -1,19 +1,4 @@
-"""Weight-bound kernel wrapper.
-
-TileLang kernels take every tensor (weights and activations) as a call
-argument.  RWKV weights are fixed once a checkpoint is loaded, so this module
-provides a thin wrapper that binds them at construction time::
-
-    ln_pre = ln_kernel(C, DTYPE, ln_preW, ln_preB)
-    x_ln = ln_pre(x0)
-
-The factory compiles a plain ``@tilelang.jit`` kernel lazily (on first call)
-and the wrapper reorders the caller's activation/state arguments around the
-bound weights, so the hot loop only passes per-token variables.  The bound
-tensors also give the wrapper single ownership of the weights -- the natural
-hook for a future quantized weight path (int8/any4 storage + scales).
-"""
-
+"""KernelOp: a tilelang kernel with its weights bound at construction."""
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -35,7 +20,7 @@ def require_bind(bind: Mapping[str, Any], names: Sequence[str], name: str) -> No
         raise TypeError(f"{name} unexpected weights: {', '.join(sorted(extra))}")
 
 
-class BoundKernel:
+class KernelOp:
     """A lazily-compiled tilelang kernel with a subset of params bound.
 
     Args:
@@ -117,4 +102,4 @@ class BoundKernel:
 
     def __repr__(self) -> str:
         state = "compiled" if self._kernel is not None else "lazy"
-        return f"BoundKernel({self._name!r}, {state}, call={self._call!r})"
+        return f"KernelOp({self._name!r}, {state}, call={self._call!r})"

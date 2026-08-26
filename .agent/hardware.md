@@ -4,8 +4,9 @@ Read this when doing GPU-specific work or benchmarking.
 
 ## RTX 3060 (sm_86, 12GB)
 
-Validation/comparison target. The authoritative performance record is
-`docs/runs/rtx3060.md`.
+Validation/comparison target. Authoritative performance conclusions:
+`.agent/performance.md` (raw run records were removed from `docs/` on
+2026-08-20).
 
 ## MX450 (sm_75, 2GB)
 

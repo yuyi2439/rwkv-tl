@@ -3,7 +3,18 @@
 import tilelang
 import tilelang.language as T
 
-from ._bound import BoundKernel, require_bind
+from ._op import KernelOp, require_bind
+
+def _fp16(x):
+    """Bridge: a QTensor weight binds as its dequantized fp16 form.
+
+    Step 4 replaces these call sites with real W8A16 kernel variants
+    selected by ``isinstance(x, QTensor)`` (static, not heuristic).
+    """
+    from rwkv_tl.quant import QTensor
+
+    return x.dequant() if isinstance(x, QTensor) else x
+
 from ._common import WARP
 from .gemv import gemv_main_macro
 from .ln import _LN_EPS, ln_per_row_macro
@@ -470,7 +481,10 @@ def cmix_decode_kernel(C: int, DTYPE: str, **weights):
     captured at construction.
     """
     require_bind(weights, _CMIX_WEIGHTS, "cmix_decode_kernel")
-    return BoundKernel(
+    weights = dict(weights)
+    weights["kWt"] = _fp16(weights["kWt"])
+    weights["vWt"] = _fp16(weights["vWt"])
+    return KernelOp(
         cmix_decode,
         (C, DTYPE),
         bind=weights,
@@ -486,10 +500,115 @@ def cmix_prefill_kernel(C: int, DTYPE: str, LEN_block: int, **weights):
     full padded output (callers slice off padding).
     """
     require_bind(weights, _CMIX_WEIGHTS, "cmix_prefill_kernel")
-    return BoundKernel(
+    weights = dict(weights)
+    weights["kWt"] = _fp16(weights["kWt"])
+    weights["vWt"] = _fp16(weights["vWt"])
+    return KernelOp(
         cmix_prefill,
         (C, DTYPE, LEN_block),
         bind=weights,
         call=("x0", "prev_x"),
         name="cmix_prefill_kernel",
+    )
+
+
+##### W8A16 decode (layer weight kept int8-resident)
+
+
+def cmix_decode_main_q8_macro(C: int, G: int, DTYPE: str, THREADS: int = WARP):
+    """Fused single-token cmix main over int8 weights:
+    ``out = x0 + relusq(x @ dequant(kWq, ks)) @ dequant(vWq, vs)``.
+
+    Clone of ``cmix_decode_main_macro`` where the two GEMVs read int8 payloads
+    and fp16 scales (per-group along K, per-column), so the layer weight stays
+    int8-resident (VRAM) without a persistent fp16 copy.
+    """
+    from .gemv import gemv_main_q8_macro
+
+    HID = 4 * C
+    assert C % G == 0 and HID % G == 0
+    assert C % THREADS == 0 and HID % THREADS == 0
+
+    up = gemv_main_q8_macro(HID, C, G, DTYPE, THREADS)
+    down = gemv_main_q8_macro(C, HID, G, DTYPE, THREADS)
+
+    @T.macro
+    def _impl(
+        x: T.Tensor((C,), DTYPE),
+        x0: T.Tensor((C,), DTYPE),
+        kWq: T.Tensor((C, HID), "int8"),
+        ks: T.Tensor((C // G, HID), "float16"),
+        vWq: T.Tensor((HID, C), "int8"),
+        vs: T.Tensor((HID // G, C), "float16"),
+        *,
+        out: T.Tensor((C,), DTYPE),
+    ):
+        """2 kernels."""
+        h = T.alloc_global((HID,), DTYPE)
+
+        # h = relusq(x @ kWt)
+        with T.Kernel(HID // THREADS, threads=THREADS) as bx:
+            acc = up(bx, x, kWq, ks)
+            for i in T.Parallel(THREADS):
+                h[bx * THREADS + i] = T.cast(_relusq(acc[i]), DTYPE)
+
+        # out = x0 + h @ vWt
+        with T.Kernel(C // THREADS, threads=THREADS) as bx:
+            acc = down(bx, h, vWq, vs)
+            for i in T.Parallel(THREADS):
+                idx = bx * THREADS + i
+                out[idx] = T.cast(acc[i] + T.cast(x0[idx], "float32"), DTYPE)
+
+    return _impl
+
+
+@tilelang.jit(out_idx=[9])
+def cmix_decode_q8(C: int, G: int, DTYPE: str):
+    """Fused single-token W8A16 cmix (see ``cmix_decode``); int8 weights.
+
+    ``kWq/ks`` = int8+scale for ``kWt [C, HID]``; ``vWq/vs`` for ``vWt [HID, C]``.
+    """
+    HID = 4 * C
+    prologue = cmix_decode_prologue_macro(C, DTYPE)
+    main = cmix_decode_main_q8_macro(C, G, DTYPE)
+
+    @T.prim_func
+    def _impl(
+        x0: T.Tensor((C,), DTYPE),
+        ln_preW: T.Tensor((C,), DTYPE),
+        ln_preB: T.Tensor((C,), DTYPE),
+        x_k: T.Tensor((C,), DTYPE),
+        kWq: T.Tensor((C, HID), "int8"),
+        ks: T.Tensor((C // G, HID), "float16"),
+        vWq: T.Tensor((HID, C), "int8"),
+        vs: T.Tensor((HID // G, C), "float16"),
+        *,
+        prev_x: T.Tensor((C,), DTYPE),
+        out: T.Tensor((C,), DTYPE),
+    ):
+        """3 kernels."""
+        x = T.alloc_global((C,), DTYPE)
+        prologue(x0, ln_preW, ln_preB, x_k, prev_x=prev_x, out=x)
+
+        main(x, x0, kWq, ks, vWq, vs, out=out)
+
+    return _impl
+
+
+_CMIX_Q8_WEIGHTS = ("ln_preW", "ln_preB", "x_k", "kWq", "ks", "vWq", "vs")
+
+
+def cmix_decode_q8_kernel(C: int, G: int, DTYPE: str, **weights):
+    """Bound W8A16 cmix decode (see ``cmix_decode_q8``); weights captured.
+
+    ``weights`` carry the int8 payloads/scales (``kWq``/``ks``/``vWq``/``vs``)
+    in addition to the unquantized prologue params.
+    """
+    require_bind(weights, _CMIX_Q8_WEIGHTS, "cmix_decode_q8_kernel")
+    return KernelOp(
+        cmix_decode_q8,
+        (C, G, DTYPE),
+        bind=weights,
+        call=("x0", "prev_x"),
+        name="cmix_decode_q8_kernel",
     )

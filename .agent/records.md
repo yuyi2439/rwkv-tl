@@ -2,23 +2,27 @@
 
 Read this when updating benchmark or test validation records.
 
+## Checkpoints
+
+- Checkpoints are located via the `RWKV_CHECKPOINT_PATH` env var /
+  `--project-checkpoint` flag; the directory is machine-specific.
+- Tested checkpoints: rwkv7-g1d-0.1b, rwkv7-g1d-0.4b. Test the
+  originally-used model first, then the others; watch out for OOM.
+
 ## Benchmark records
 
-Benchmark/test results are recorded in
-[docs/runs/rtx3060.md](../docs/runs/rtx3060.md) (the old
-`script/benchmark_rwkv7.md` report and `docs/benchmarks/` were removed/merged
-into `docs/runs/`). Follow these rules strictly:
+Per-run benchmark tables are no longer kept under `docs/` (the RTX 3060 run
+record was removed on 2026-08-20; user-stated: old test data no longer
+needed). Durable conclusions and performance guidance live in
+[performance.md](performance.md). Follow these rules strictly:
 
-- Keep it in Chinese.
-- Keep it concise and report-like: benchmark entry script, environment,
-  measured results, and short explanations that directly interpret those
-  results.
-- Do not put exploratory findings, long reasoning, speculative conclusions, or
-  operational caveats in the run record.
+- Keep conclusions concise, in English, and actionable: what was measured,
+  why, and what changed.
+- Do not preserve raw benchmark tables or historical per-case numbers.
+- Do not put exploratory findings, long reasoning, or speculative conclusions
+  in the conclusions file.
 - Put runtime warnings, environment constraints, and maintenance guidance in
   this records file.
-- When a new benchmark/test run is completed, add the numbers to the run
-  record and keep the narrative short.
 
 ## Test validation records
 

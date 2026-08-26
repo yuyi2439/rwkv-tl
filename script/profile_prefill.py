@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO))
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from rwkv_tl import make_rwkv7
+from rwkv_tl import rwkv7_model
 from rwkv_tl.core.state import State
 from rwkv_tl.core.weight import RWKV7Weight
 
@@ -30,8 +30,7 @@ if not CKPT:
 
 with torch.device("cuda"):
     w = RWKV7Weight(CKPT)
-    model_cls = make_rwkv7(w.device)
-    model = model_cls(w)
+    model = rwkv7_model(w, backend="tl")
 
 # warmup
 with torch.device("cuda"):

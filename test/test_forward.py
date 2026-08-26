@@ -42,6 +42,7 @@ def _run_decode(model, tokens, dtype: torch.dtype = torch.float16) -> torch.Tens
         logits = None
         for t in tokens:
             logits, S = model.decode(torch.as_tensor([t], device=model.w.device), S)
+    assert logits is not None
     return logits.float().cpu()
 
 

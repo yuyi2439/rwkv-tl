@@ -10,6 +10,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import rwkv_tl
+from rwkv_tl.core import RWKV7Weight
 
 
 def parse_args():
@@ -17,6 +18,17 @@ def parse_args():
     parser.add_argument(
         "checkpoint",
         help="Path to RWKV checkpoint (.pth)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("tl", "torch"),
+        required=True,
+        help="tl = tilelang (CUDA), torch = pure PyTorch",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Device to load the weight on",
     )
     parser.add_argument(
         "--system",
@@ -58,7 +70,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    model = rwkv_tl.rwkv7(args.checkpoint)
+    w = RWKV7Weight(args.checkpoint, device=args.device)
+    model = rwkv_tl.rwkv7(w, backend=args.backend)
     messages = [{"role": "system", "content": args.system}]
 
     print("Simple RWKV chat. Empty input exits.")

@@ -8,7 +8,7 @@ the `tilelang-writer` skill covers the how-to knowledge (see AGENTS.md
 
 - The operator set lives in `kernel/{cmix,tmix,gemv,ln}.py`; the PUBLIC API is
   the bound factories: each takes `(C, DTYPE, ...)` **plus the weights** at
-  construction and returns a `BoundKernel` (see `kernel/_bound.py`) whose call
+  construction and returns a `KernelOp` (see `kernel/_op.py`) whose call
   only takes activations/state: `ln_pre = ln_kernel(C, DTYPE, W, B); y =
   ln_pre(x)`.
 - Both granularities are exported from `kernel/__init__.py`: fine-grained

@@ -1,18 +1,24 @@
 """rwkv_tl: RWKV7 operator library and ready-to-use models.
 
-Build a model directly from a checkpoint path::
+The caller owns the steps; nothing is auto-detected. Load a weight first,
+then build the token-level model, then optionally wrap it::
 
     import rwkv_tl
+    from rwkv_tl.core import RWKV7Weight
 
-    model = rwkv_tl.rwkv7("model-0.4b.pth")          # backend auto-selected
-    text = model.generate("Hello", max_new_tokens=64)
-    answer = model.chat([{"role": "user", "content": "Hi!"}])
+    w = RWKV7Weight("model-0.4b.pth", device="cuda")
+    model = rwkv_tl.rwkv7_model(w, backend="tl")   # token-level RWKV7Model
+    text = rwkv_tl.RWKV7TextModel(model)           # text-level wrapper
+    # one-call convenience (same steps, wrapped):
+    text = rwkv_tl.rwkv7(w, backend="tl")
 
-Low-level core modules (``RWKV7Model`` / ``State`` / ``Tokenizer`` /
-``RWKV7Weight`` / ``CUDAGraph``) are NOT re-exported from the top level:
-import them from ``rwkv_tl.core`` when needed. ``rwkv7()`` returns the
-application-layer ``RWKV7TextModel`` (composition over the token model).
-Fused operator factories live in ``rwkv_tl.kernel`` (weight-bound wrappers).
+``rwkv7_model()`` maps a loaded ``RWKV7Weight`` to the backend
+``RWKV7Model`` (optionally CUDA-Graph wrapped); ``rwkv7()`` is the one-call
+form that returns the ``RWKV7TextModel``. Low-level core modules
+(``RWKV7Model`` / ``State`` / ``Tokenizer`` / ``RWKV7Weight`` /
+``CUDAGraph``) are NOT re-exported from the top level: import them from
+``rwkv_tl.core`` when needed. Fused operator factories live in
+``rwkv_tl.kernel`` (weight-bound wrappers).
 """
 
 from __future__ import annotations
@@ -21,23 +27,22 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _version
 from typing import TYPE_CHECKING
 
-import torch
-
-from .core.cuda_graph import CUDAGraph
+from .core.cuda_graph import try_cuda_graph
 from .rwkv7_tl import RWKV7TL
 from .rwkv7_torch import RWKV7Torch
 from .sampling import sample_logits
 from .text_model import RWKV7TextModel
 
 if TYPE_CHECKING:
+    from .core.model import RWKV7Model
     from .core.weight import RWKV7Weight
 
 __all__ = [
     "RWKV7TL",
     "RWKV7TextModel",
     "RWKV7Torch",
-    "make_rwkv7",
     "rwkv7",
+    "rwkv7_model",
     "sample_logits",
 ]
 
@@ -48,69 +53,62 @@ except PackageNotFoundError:  # pragma: no cover - package metadata unavailable
 
 
 def _resolve_cls(backend: str):
-    if backend in ("auto",):
-        return RWKV7TL if torch.cuda.is_available() else RWKV7Torch
     if backend in ("tl",):
         return RWKV7TL
     if backend == "torch":
         return RWKV7Torch
-    raise ValueError(f"unknown backend {backend!r} (expected auto/tl/torch)")
+    raise ValueError(f"unknown backend {backend!r} (expected tl/torch)")
 
 
-def rwkv7(
-    path_or_weight: str | RWKV7Weight,
+def rwkv7_model(
+    w: RWKV7Weight,
     *,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype = torch.float16,
-    backend: str = "auto",
+    backend: str,
     use_graph: bool = True,
     **kwargs,
-) -> RWKV7TextModel:
-    """Build an RWKV7 model from a checkpoint path (or ``RWKV7Weight``).
+) -> RWKV7Model:
+    """Build a token-level ``RWKV7Model`` from an already-loaded weight.
+
+    The caller creates the ``RWKV7Weight`` first (device/dtype are fixed at
+    load); this function only selects the backend implementation and
+    optionally CUDA-Graph-wraps it. Wrap the result in ``RWKV7TextModel``
+    for the text-level API, or use :func:`rwkv7` for the one-call form.
 
     Args:
-        path_or_weight: Checkpoint path or an already-loaded ``RWKV7Weight``.
-        device: Target device for checkpoint loading (None = default).
-        dtype: Weight precision (``torch.float16`` default; pass
-            ``torch.bfloat16`` to keep the raw checkpoint dtype).
-        backend: ``"auto"`` selects tilelang on CUDA and pure torch elsewhere;
-            ``"tl"`` forces tilelang; ``"torch"`` forces the pure-PyTorch
-            reference.
-        use_graph: Wrap in CUDA-Graph acceleration when CUDA is available.
+        w: Already-loaded ``RWKV7Weight``.
+        backend: Required backend name: ``"tl"`` (tilelang, CUDA) or
+            ``"torch"`` (pure-PyTorch, CPU-capable). There is no
+            auto-detection.
+        use_graph: Wrap in CUDA-Graph acceleration when the model is on CUDA.
         **kwargs: Passed to the model constructor (e.g. ``is_torch_compile``,
             ``cmix_len_block``).
     """
-    cls = _resolve_cls(backend)
-    model = cls(path_or_weight, device=device, dtype=dtype, **kwargs)
-    if use_graph and torch.cuda.is_available() and model.w.device.type == "cuda":
-        model = CUDAGraph(model)
-    return RWKV7TextModel(model)
+    model = _resolve_cls(backend)(w, **kwargs)
+    return try_cuda_graph(model, use_graph)
 
 
-def make_rwkv7(
-    device: torch.device,
+def rwkv7(
+    w: RWKV7Weight,
     *,
-    backend: str = "auto",
+    backend: str,
     use_graph: bool = True,
-    device_name: str | None = None,
-) -> type[RWKV7TextModel]:
-    """Build a model implementation class for a device (class-returning form
-    used by benchmark scripts).
+    **kwargs,
+) -> RWKV7TextModel:
+    """Build a ``RWKV7TextModel`` from an already-loaded weight.
+
+    One-call convenience for ``RWKV7TextModel(rwkv7_model(w, ...))``; the
+    caller still creates the ``RWKV7Weight`` manually. For the decoupled
+    two-step path (token model, then wrap), use :func:`rwkv7_model`.
 
     Args:
-        device: Target device.
-        backend: Same backends as :func:`rwkv7`.
-        use_graph: Wrap the returned class so instances are CUDA-Graph
-            accelerated (every CUDA class; non-CUDA passes through).
-        device_name: Accepted for backward compatibility; no longer selects a
-            variant (all CUDA devices use ``RWKV7TL``).
+        w: Already-loaded ``RWKV7Weight``.
+        backend: Required backend name: ``"tl"`` (tilelang, CUDA) or
+            ``"torch"`` (pure-PyTorch, CPU-capable). There is no
+            auto-detection.
+        use_graph: Wrap in CUDA-Graph acceleration when the model is on CUDA.
+        **kwargs: Passed to the model constructor (e.g. ``is_torch_compile``,
+            ``cmix_len_block``).
     """
-    cls = _resolve_cls(backend)
-
-    def _init(self: RWKV7TextModel, w: RWKV7Weight, **kwargs) -> None:
-        model = cls(w, **kwargs)
-        if use_graph and device.type == "cuda":
-            model = CUDAGraph(model)
-        RWKV7TextModel.__init__(self, model)
-
-    return type("RWKV7TextModelFactory", (RWKV7TextModel,), {"__init__": _init})
+    return RWKV7TextModel(
+        rwkv7_model(w, backend=backend, use_graph=use_graph, **kwargs)
+    )

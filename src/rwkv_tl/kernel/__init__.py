@@ -18,10 +18,18 @@ want to build their own fused chains.
 
 from __future__ import annotations
 
-from .cmix import cmix_decode, cmix_decode_kernel, cmix_prefill, cmix_prefill_kernel
+from .cmix import (
+    cmix_decode,
+    cmix_decode_kernel,
+    cmix_decode_q8,
+    cmix_decode_q8_kernel,
+    cmix_prefill,
+    cmix_prefill_kernel,
+)
 from .gemv import (
     gemv_batch_jit,
     gemv_batch_kernel,
+    gemv_q8_kernel,
     gemv_batch_macro,
     gemv_batch_T_macro,
     gemv_jit,
@@ -42,6 +50,8 @@ from .tmix import tmix_decode, tmix_decode_kernel, tmix_prefill_kernel
 __all__ = [
     "cmix_decode",
     "cmix_decode_kernel",
+    "cmix_decode_q8",
+    "cmix_decode_q8_kernel",
     "cmix_prefill",
     "cmix_prefill_kernel",
     "gemv_batch_T_macro",
